@@ -1205,6 +1205,165 @@ def _paper_smc_research_event_row(t, status, now_ts=None):
     return {k: v for k, v in row.items() if v not in (None, "")}
 
 
+def _paper_smc_research_min_lock_shadow_row(t, now_ts=None):
+    if (
+        not isinstance(t, dict)
+        or str(t.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH"
+        or t.get("research_epoch") != "v1_extend_200"
+    ):
+        return None
+
+    actual_r = _safe_float_value(t.get("rr_real"), None)
+    mfe_r = _safe_float_value(t.get("max_profit_r"), None)
+    if actual_r is None or mfe_r is None:
+        return None
+
+    entry_price = _safe_float_value(t.get("entry_real") or t.get("entry"), None)
+    initial_sl = _safe_float_value(
+        t.get("sl_init") or t.get("sl_real") or t.get("sl"), None
+    )
+    actual_close_price = _safe_float_value(t.get("exit_price"), None)
+    triggered_075 = mfe_r >= 0.75
+    triggered_100 = mfe_r >= 1.0
+    cf_075 = max(actual_r, 0.75) if triggered_075 else actual_r
+    cf_100 = max(actual_r, 1.0) if triggered_100 else actual_r
+
+    return {
+        "ts": now_ts or t.get("close_time") or time.time(),
+        "event": "PAPER_SMC_RESEARCH_MIN_LOCK_SHADOW",
+        "symbol": t.get("symbol"),
+        "side": t.get("side"),
+        "trade_id": t.get("id") or t.get("trade_id"),
+        "research_epoch": t.get("research_epoch"),
+        "entry_type": t.get("entry_type"),
+        "close_reason": t.get("close_reason") or t.get("exit_type"),
+        "actual_realized_r": actual_r,
+        "mfe_r": mfe_r,
+        "mae_r": _safe_float_value(t.get("mae_r"), None),
+        "entry_price": entry_price,
+        "initial_sl": initial_sl,
+        "final_sl": _safe_float_value(t.get("sl"), None),
+        "tp": _safe_float_value(t.get("tp"), None),
+        "actual_close_price": actual_close_price,
+        "min_lock_075_triggered": triggered_075,
+        "min_lock_100_triggered": triggered_100,
+        "cf_realized_r_min_lock_075": cf_075,
+        "cf_realized_r_min_lock_100": cf_100,
+        "delta_r_min_lock_075_vs_actual": cf_075 - actual_r,
+        "delta_r_min_lock_100_vs_actual": cf_100 - actual_r,
+        "assumption": "STATIC_MFE_BOUND_NOT_FORWARD_REPLAY",
+    }
+
+
+def _paper_smc_research_min_lock_shadow_write(t, exec_mode):
+    if exec_mode != "paper":
+        return
+    try:
+        row = _paper_smc_research_min_lock_shadow_row(t)
+        if row is None:
+            return
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "paper_smc_research_min_lock_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[PAPER SMC RESEARCH MIN LOCK SHADOW] log failed: {exc}")
+
+
+def _paper_smc_research_sl_gap_calibration_shadow_row(t, now_ts=None):
+    if (
+        not isinstance(t, dict)
+        or str(t.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH"
+        or t.get("research_epoch") != "v1_extend_200"
+        or str(t.get("close_reason") or t.get("exit_type") or "").upper() != "SL"
+    ):
+        return None
+
+    actual_r = _safe_float_value(t.get("rr_real"), None)
+    mae_r = _safe_float_value(t.get("mae_r"), None)
+    configured_gap_r = _safe_float_value(t.get("sl_gap"), None)
+    entry_price = _safe_float_value(t.get("entry_real") or t.get("entry"), None)
+    initial_sl = _safe_float_value(
+        t.get("sl_init") or t.get("sl_real") or t.get("sl"), None
+    )
+    actual_close_price = _safe_float_value(t.get("exit_price"), None)
+    planned_risk_distance = None
+    actual_loss_distance = None
+    price_r = None
+    if entry_price is not None and initial_sl is not None:
+        planned_risk_distance = abs(entry_price - initial_sl)
+        if planned_risk_distance <= 0:
+            planned_risk_distance = None
+    if entry_price is not None and actual_close_price is not None:
+        actual_loss_distance = abs(actual_close_price - entry_price)
+    side = str(t.get("side") or "").upper()
+    if planned_risk_distance is not None and actual_close_price is not None:
+        if side == "LONG":
+            price_r = (actual_close_price - entry_price) / planned_risk_distance
+        elif side == "SHORT":
+            price_r = (entry_price - actual_close_price) / planned_risk_distance
+
+    expected_sl_r = None if configured_gap_r is None else -(1.0 + configured_gap_r)
+    gap_minus_mae_r = None
+    if configured_gap_r is not None and mae_r is not None:
+        gap_minus_mae_r = configured_gap_r - mae_r
+    material_epsilon_r = 0.05
+    possible_overcharge = False
+    if (
+        expected_sl_r is not None
+        and mae_r is not None
+        and actual_r is not None
+    ):
+        possible_overcharge = (
+            abs(expected_sl_r) - mae_r > material_epsilon_r
+            and abs(min(actual_r, 0.0)) - mae_r > material_epsilon_r
+        )
+
+    return {
+        "ts": now_ts or t.get("close_time") or time.time(),
+        "event": "PAPER_SMC_RESEARCH_SL_GAP_CALIBRATION_SHADOW",
+        "symbol": t.get("symbol"),
+        "side": t.get("side"),
+        "trade_id": t.get("id") or t.get("trade_id"),
+        "entry_type": t.get("entry_type"),
+        "research_epoch": t.get("research_epoch"),
+        "execution_tier": t.get("sl_gap_tier") or t.get("execution_tier"),
+        "configured_sl_gap_r": configured_gap_r,
+        "expected_sl_r_with_gap": expected_sl_r,
+        "actual_realized_r": actual_r,
+        "mae_r": mae_r,
+        "entry_price": entry_price,
+        "initial_sl": initial_sl,
+        "actual_close_price": actual_close_price,
+        "planned_risk_distance": planned_risk_distance,
+        "actual_loss_distance": actual_loss_distance,
+        "price_r": price_r,
+        "is_be_stop": None if actual_r is None else abs(actual_r) < 1e-6,
+        "gap_minus_mae_r": gap_minus_mae_r,
+        "possible_overcharge": possible_overcharge,
+        "assumption": "PAPER_SL_GAP_CALIBRATION_ONLY",
+    }
+
+
+def _paper_smc_research_sl_gap_calibration_shadow_write(t, exec_mode):
+    if exec_mode != "paper":
+        return
+    try:
+        row = _paper_smc_research_sl_gap_calibration_shadow_row(t)
+        if row is None:
+            return
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(
+            log_dir, "paper_smc_research_sl_gap_calibration_shadow.jsonl"
+        )
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[PAPER SMC RESEARCH SL GAP CALIBRATION SHADOW] log failed: {exc}")
+
+
 def _paper_smc_research_write(row):
     try:
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -1646,6 +1805,8 @@ def paper_smc_research_observe_close(t, ctx=None, management_context=None):
     row = _paper_smc_research_event_row(t, status)
     if missing:
         row["missing_fields"] = missing
+    _paper_smc_research_min_lock_shadow_write(t, exec_mode)
+    _paper_smc_research_sl_gap_calibration_shadow_write(t, exec_mode)
     _paper_smc_research_write(row)
     _paper_smc_research_closed_since_summary.append(row)
     try:
