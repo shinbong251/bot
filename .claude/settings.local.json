@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(ls $env:USERPROFILE\\\\Desktop)",
+      "PowerShell(ls $env:USERPROFILE\\\\Desktop\\\\bot)",
+      "PowerShell(ls $env:USERPROFILE\\\\Desktop\\\\bot\\\\bot)",
+      "PowerShell(Get-Content \"$env:USERPROFILE\\\\Desktop\\\\bot\\\\bot\\\\trades_v4.csv\" | Select-Object -First 3)",
+      "PowerShell(Get-Content \"$env:USERPROFILE\\\\Desktop\\\\bot\\\\bot\\\\logs\\\\entry_log.csv\" | Select-Object -First 3)",
+      "PowerShell(\\(Get-Content \"$env:USERPROFILE\\\\Desktop\\\\bot\\\\bot\\\\trades_v4.csv\"\\).Count)",
+      "PowerShell(Get-Content \"$env:USERPROFILE\\\\Desktop\\\\bot\\\\bot\\\\logs\\\\entry_log.csv\" | Select-Object -First 3; Write-Host \"---\"; \\(Get-Content \"$env:USERPROFILE\\\\Desktop\\\\bot\\\\bot\\\\logs\\\\entry_log.csv\"\\).Count)",
+      "Bash(python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\(sorted\\(d.keys\\(\\)\\)\\)\")"
+    ]
+  }
+}

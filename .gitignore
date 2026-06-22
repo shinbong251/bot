@@ -1,0 +1,39 @@
+# secrets
+.env
+secrets.json
+credentials.json
+*.pem
+*.key
+
+# logs
+logs/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# runtime / local state
+bot_instance.lock
+*_state.json
+*_state.json.bak*
+*_state.json.tmp*
+*.corrupted.*.json
+*.pre_*.bak
+*.tmp.*
+bot_last_run.log
+*_trades.csv
+trades_v4.csv
+open_trades_v4.json
+
+# mac/apple junk
+._*
