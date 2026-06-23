@@ -32,7 +32,7 @@
     "leverage_cao": "CÃ¡ÂºÂ¢NH BÃƒÂO: Ã„â€˜ÃƒÂ²n bÃ¡ÂºÂ©y cao khuÃ¡ÂºÂ¿ch Ã„â€˜Ã¡ÂºÂ¡i rÃ¡Â»Â§i ro khi stop trÃ†Â°Ã¡Â»Â£t hoÃ¡ÂºÂ·c thÃ¡Â»â€¹ trÃ†Â°Ã¡Â»Âng gap mÃ¡ÂºÂ¡nh",
     "secrets": "API keys vÃƒÂ  tele_token nÃƒÂªn Ã„â€˜Ã¡Â»Æ’ trÃ¡Â»â€˜ng trong file nÃƒÂ y Ã¢â‚¬â€ Ã„â€˜Ã¡ÂºÂ·t trong file .env cÃƒÂ¹ng thÃ†Â° mÃ¡Â»Â¥c"
   },
-  "account_balance": 727.8766145807481,
+  "account_balance": 695.3825753232984,
   "equity_peak": 847.9712249511722,
   "risk_per_trade": 0.01,
   "execution_mode": "paper",
@@ -98,6 +98,7 @@
   "early_cont_shadow_outcome_max_pending": 5000,
   "early_cont_shadow_outcome_log_open": true,
   "paper_filter_confirm_pre_break_low_near": true,
+  "paper_gate_confirm_short_pre_break_low": true,
   "paper_filter_confirm_retest_violated_bos_trap": true,
   "paper_enable_smc_confirm_filter": false,
   "paper_smc_confirm_phase2_mode": "off",
@@ -139,7 +140,6 @@
   "paper_smc_research_qualified_max_open": 3,
   "paper_smc_research_qualified_max_new_trades": 81,
   "_memo_research_cap_effective_vps": "EFFECTIVE_VPS_CAP_FOR_GLOBAL_200: local baseline has 119 total research OPEN before VPS; VPS log did not inherit baseline; set VPS-local max_new_trades=81 so global total stops at 200.",
-  "_memo_TEMP_FREEZE_VPS_COUNTER_CONTINUITY_AUDIT": "TEMP_FREEZE_VPS_COUNTER_CONTINUITY_AUDIT — local baseline 119 total / 19 v1_extend_200 before VPS; VPS has 3 v1_extend_200; freeze new VPS research opens until baseline handoff is fixed.",
   "paper_smc_research_qualified_min_rr": 2,
   "paper_smc_main_enabled": false,
   "paper_smc_main_candidate_types": [

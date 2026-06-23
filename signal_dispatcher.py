@@ -322,6 +322,69 @@ def _is_confirm_pre_break_low_near(signal) -> bool:
     return phase == "PRE_BREAK_LOW" and bos_t == "NEAR"
 
 
+def _is_confirm_short_pre_break_low(signal) -> bool:
+    etype = (signal.get("entry_type") or "").upper()
+    if etype != "CONFIRM":
+        return False
+    side = (signal.get("side") or "").upper()
+    if side != "SHORT":
+        return False
+    phase = _extract_dispatch_phase(signal)
+    if not phase:
+        return False
+    return phase == "PRE_BREAK_LOW"
+
+
+def _log_paper_confirm_pre_break_low_gate(sig, ctx):
+    try:
+        now_ts = time.time()
+        raw_reason = sig.get("reason")
+        if isinstance(raw_reason, (list, tuple)):
+            reason = list(raw_reason)
+        elif raw_reason not in (None, ""):
+            reason = [str(raw_reason)]
+        else:
+            reason = []
+        score = sig.get("score")
+        try:
+            score = float(score) if score not in (None, "") else None
+        except (TypeError, ValueError):
+            score = None
+        planned_rr = sig.get("rr") or sig.get("planned_rr")
+        try:
+            planned_rr = float(planned_rr) if planned_rr not in (None, "") else None
+        except (TypeError, ValueError):
+            planned_rr = None
+        row = {
+            "timestamp": format_vn_time(now_ts),
+            "timestamp_unix": now_ts,
+            "symbol": sig.get("symbol", ""),
+            "side": sig.get("side", ""),
+            "entry_type": sig.get("entry_type", ""),
+            "phase": _extract_dispatch_phase(sig),
+            "reason": reason,
+            "decision": "BLOCK_NEW_CONFIRM_PRE_BREAK_LOW_SHORT",
+            "gate_version": "v1_paper_only",
+        }
+        if score is not None:
+            row["score"] = score
+        if planned_rr is not None:
+            row["planned_rr"] = planned_rr
+        market_regime = sig.get("market_regime")
+        if market_regime not in (None, ""):
+            row["market_regime"] = market_regime
+        market_state = sig.get("market_state")
+        if market_state not in (None, ""):
+            row["market_state"] = market_state
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "paper_confirm_pre_break_low_gate.jsonl")
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        print(f"[PAPER GATE] confirm_pre_break_low_gate log failed: {exc}")
+
+
 def _safe_dict(value):
     if isinstance(value, dict):
         return value
@@ -6514,6 +6577,21 @@ def dispatch_to_executor(signals, ctx):
                     f"bos={_extract_live_bos_type(sig) or 'missing'} score={round(sig.get('score', 0), 1)} - {reason}"
                 )
                 _log_paper_signal_observation(sig, reason, ctx)
+                continue
+            policy_accepted.append(sig)
+        candidate_signals = policy_accepted
+
+    if ctx.execution_mode == "paper" and config.get("paper_gate_confirm_short_pre_break_low", True):
+        policy_accepted = []
+        for sig in candidate_signals:
+            if _is_confirm_short_pre_break_low(sig):
+                reason = "paper_gate_confirm_short_pre_break_low"
+                print(
+                    f"[PAPER GATE] Blocked: {sig['symbol']} {sig.get('side', '')} "
+                    f"etype={sig.get('entry_type', '')} phase={_extract_dispatch_phase(sig) or 'missing'} "
+                    f"bos={_extract_live_bos_type(sig) or 'missing'} score={round(sig.get('score', 0), 1)} - {reason}"
+                )
+                _log_paper_confirm_pre_break_low_gate(sig, ctx)
                 continue
             policy_accepted.append(sig)
         candidate_signals = policy_accepted

@@ -85,6 +85,7 @@ def load_config():
         "early_cont_shadow_outcome_max_pending": 5000,
         "early_cont_shadow_outcome_log_open": True,
         "paper_filter_confirm_pre_break_low_near": True,
+        "paper_gate_confirm_short_pre_break_low": True,
         "paper_enable_smc_confirm_filter": False,
         "paper_smc_confirm_phase2_mode": "strict_conflict",
         "paper_enable_smc_research_lane": True,

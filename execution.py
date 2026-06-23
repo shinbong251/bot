@@ -57,6 +57,7 @@ _trade_mgmt_stuck_summary_last_ts = 0
 _open_trade_data_refresh_last_ts = 0
 _paper_quality_router_context_by_symbol = {}
 _paper_quality_router_context_scan_id = None
+_btc_m15_shadow_cache = {}  # keyed "BTCUSDT" → latest raw router row
 _TRADE_MGMT_FRESHNESS_LOG = os.path.join("logs", "trade_management_freshness.jsonl")
 _PAPER_TRADE_QUALITY_LOG = os.path.join("logs", "paper_trade_quality_observations.jsonl")
 _PAPER_DD_PAUSE_LOG = os.path.join("logs", "paper_dd_pause_events.jsonl")
@@ -756,8 +757,244 @@ def _paper_quality_capture_router_context(row):
         if not symbol:
             return
         _paper_quality_router_context_by_symbol[symbol] = dict(context)
+        if symbol == "BTCUSDT":
+            _btc_m15_shadow_cache["BTCUSDT"] = dict(row)
     except Exception as exc:
         print(f"[PAPER QUALITY] router context capture failed: {exc}")
+
+
+_BTC_M15_SHADOW_MAX_AGE_SECS = 3600  # accept up to 60-minute-old snapshot
+
+
+def _btc_m15_bias_label(smc_bias):
+    b = str(smc_bias or "").upper()
+    if b == "BEARISH":
+        return "BEARISH"
+    if b == "BULLISH":
+        return "BULLISH"
+    if b in ("NEUTRAL", "MIXED"):
+        return "NEUTRAL_OR_CHOP"
+    return "UNKNOWN"
+
+
+def _btc_m15_alignment_label(side, bias_label):
+    s = str(side or "").upper()
+    if bias_label == "UNKNOWN":
+        return "BTC_BIAS_UNKNOWN"
+    if bias_label == "NEUTRAL_OR_CHOP":
+        return "BTC_BIAS_NEUTRAL"
+    if (s == "LONG" and bias_label == "BULLISH") or (s == "SHORT" and bias_label == "BEARISH"):
+        return "BTC_BIAS_ALIGNED"
+    if (s == "LONG" and bias_label == "BEARISH") or (s == "SHORT" and bias_label == "BULLISH"):
+        return "BTC_BIAS_COUNTER"
+    return "BTC_BIAS_UNKNOWN"
+
+
+def _btc_m15_bias_shadow_snapshot(side, now_ts=None):
+    now_ts = now_ts or time.time()
+    unknown = {
+        "btc_m15_bias_shadow_version": "v1_log_only",
+        "btc_m15_candle_ts": None,
+        "btc_m15_smc_bias": None,
+        "btc_m15_trend_direction": None,
+        "btc_m15_trend_strength": None,
+        "btc_m15_market_state": None,
+        "btc_m15_regime": None,
+        "btc_m15_phase": None,
+        "btc_m15_source": "NONE",
+        "btc_m15_snapshot_age_secs": None,
+        "btc_m15_bias_label": "UNKNOWN",
+        "btc_m15_alignment_label": "BTC_BIAS_UNKNOWN",
+    }
+    try:
+        row = _btc_m15_shadow_cache.get("BTCUSDT")
+        if not row:
+            return unknown
+        observed_at = _paper_quality_safe_float(row.get("observed_at") or row.get("collector_ts"))
+        if observed_at is None:
+            return unknown
+        age = now_ts - observed_at
+        if age < 0 or age > _BTC_M15_SHADOW_MAX_AGE_SECS:
+            return {**unknown, "btc_m15_snapshot_age_secs": round(age, 1), "btc_m15_source": "STALE"}
+        smc_bias = row.get("smc_bias")
+        bias_label = _btc_m15_bias_label(smc_bias)
+        return {
+            "btc_m15_bias_shadow_version": "v1_log_only",
+            "btc_m15_candle_ts": row.get("candle_ts_15m"),
+            "btc_m15_smc_bias": smc_bias,
+            "btc_m15_trend_direction": row.get("trend_direction"),
+            "btc_m15_trend_strength": row.get("trend_strength"),
+            "btc_m15_market_state": row.get("market_state"),
+            "btc_m15_regime": row.get("regime"),
+            "btc_m15_phase": row.get("phase"),
+            "btc_m15_source": "router_shadow_cache",
+            "btc_m15_snapshot_age_secs": round(age, 1),
+            "btc_m15_bias_label": bias_label,
+            "btc_m15_alignment_label": _btc_m15_alignment_label(side, bias_label),
+        }
+    except Exception:
+        return unknown
+
+
+def _btc_m15_bias_shadow_write(dedicated_row):
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "paper_smc_research_btc_m15_bias_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dedicated_row, ensure_ascii=False, default=str, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[BTC M15 BIAS SHADOW] log failed: {exc}")
+
+
+def _btc_mtf_combined_labels(m5_align, m15_align, h1_align):
+    labels = [m5_align, m15_align, h1_align]
+    known = [l for l in labels if l != "BTC_BIAS_UNKNOWN"]
+    aligned = [l for l in labels if l == "BTC_BIAS_ALIGNED"]
+    counter = [l for l in labels if l == "BTC_BIAS_COUNTER"]
+    neutral = [l for l in labels if l == "BTC_BIAS_NEUTRAL"]
+    if not known:
+        summary = "UNKNOWN"
+    elif all(l == "BTC_BIAS_ALIGNED" for l in labels):
+        summary = "ALL_ALIGNED"
+    elif len(neutral) == len(known):
+        summary = "ALL_NEUTRAL"
+    elif counter:
+        summary = "COUNTER_PRESENT"
+    elif m5_align == "BTC_BIAS_ALIGNED" and m15_align == "BTC_BIAS_ALIGNED":
+        summary = "M5_M15_ALIGNED"
+    elif m15_align == "BTC_BIAS_ALIGNED" and h1_align == "BTC_BIAS_ALIGNED":
+        summary = "M15_H1_ALIGNED"
+    else:
+        summary = "MIXED"
+    return {
+        "btc_mtf_all_aligned": m5_align == "BTC_BIAS_ALIGNED" and m15_align == "BTC_BIAS_ALIGNED" and h1_align == "BTC_BIAS_ALIGNED",
+        "btc_mtf_m5_m15_aligned": m5_align == "BTC_BIAS_ALIGNED" and m15_align == "BTC_BIAS_ALIGNED",
+        "btc_mtf_m15_h1_aligned": m15_align == "BTC_BIAS_ALIGNED" and h1_align == "BTC_BIAS_ALIGNED",
+        "btc_mtf_any_counter": bool(counter),
+        "btc_mtf_known_count": len(known),
+        "btc_mtf_aligned_count": len(aligned),
+        "btc_mtf_counter_count": len(counter),
+        "btc_mtf_neutral_count": len(neutral),
+        "btc_mtf_summary_label": summary,
+    }
+
+
+def _btc_mtf_bias_shadow_snapshot(side, now_ts=None):
+    now_ts = now_ts or time.time()
+    _U = "BTC_BIAS_UNKNOWN"
+
+    def _tf_unknown(prefix):
+        return {
+            f"btc_{prefix}_bias_shadow_version": "v1_log_only",
+            f"btc_{prefix}_candle_ts": None,
+            f"btc_{prefix}_smc_bias": None,
+            f"btc_{prefix}_trend_direction": None,
+            f"btc_{prefix}_trend_strength": None,
+            f"btc_{prefix}_market_state": None,
+            f"btc_{prefix}_regime": None,
+            f"btc_{prefix}_phase": None,
+            f"btc_{prefix}_source": "NONE",
+            f"btc_{prefix}_snapshot_age_secs": None,
+            f"btc_{prefix}_bias_label": "UNKNOWN",
+            f"btc_{prefix}_alignment_label": _U,
+        }
+
+    unknown_all = {
+        **_tf_unknown("m5"),
+        **_tf_unknown("m15"),
+        **_tf_unknown("h1"),
+        **_btc_mtf_combined_labels(_U, _U, _U),
+    }
+    try:
+        row = _btc_m15_shadow_cache.get("BTCUSDT")
+        if not row:
+            return unknown_all
+        observed_at = _paper_quality_safe_float(row.get("observed_at") or row.get("collector_ts"))
+        if observed_at is None:
+            return unknown_all
+        row_age = now_ts - observed_at
+        if row_age < 0 or row_age > _BTC_M15_SHADOW_MAX_AGE_SECS:
+            return {
+                **_tf_unknown("m5"), **_tf_unknown("m15"), **_tf_unknown("h1"),
+                "btc_m5_source": "STALE", "btc_m15_source": "STALE", "btc_h1_source": "STALE",
+                **_btc_mtf_combined_labels(_U, _U, _U),
+            }
+        smc_bias = row.get("smc_bias")
+        trend_direction = row.get("trend_direction")
+        trend_strength = row.get("trend_strength")
+        market_state = row.get("market_state")
+        regime = row.get("regime")
+        phase = row.get("phase")
+        candle_ts_5m = _paper_quality_safe_float(row.get("candle_ts_5m"))
+        candle_ts_15m = _paper_quality_safe_float(row.get("candle_ts_15m"))
+        h1_candle_ts = int(candle_ts_15m // 3600) * 3600 if candle_ts_15m else None
+        bias_label = _btc_m15_bias_label(smc_bias)
+        alignment = _btc_m15_alignment_label(side, bias_label)
+        m5_age = round(now_ts - candle_ts_5m, 1) if candle_ts_5m else None
+        m15_age = round(now_ts - candle_ts_15m, 1) if candle_ts_15m else None
+        h1_age = round(now_ts - h1_candle_ts, 1) if h1_candle_ts else None
+        shared = {
+            "smc_bias": smc_bias, "trend_direction": trend_direction,
+            "trend_strength": trend_strength, "market_state": market_state,
+            "regime": regime, "phase": phase,
+        }
+        m5 = {
+            "btc_m5_bias_shadow_version": "v1_log_only",
+            "btc_m5_candle_ts": candle_ts_5m,
+            "btc_m5_smc_bias": shared["smc_bias"],
+            "btc_m5_trend_direction": shared["trend_direction"],
+            "btc_m5_trend_strength": shared["trend_strength"],
+            "btc_m5_market_state": shared["market_state"],
+            "btc_m5_regime": shared["regime"],
+            "btc_m5_phase": shared["phase"],
+            "btc_m5_source": "router_shadow_cache",
+            "btc_m5_snapshot_age_secs": m5_age,
+            "btc_m5_bias_label": bias_label,
+            "btc_m5_alignment_label": alignment,
+        }
+        m15 = {
+            "btc_m15_bias_shadow_version": "v1_log_only",
+            "btc_m15_candle_ts": candle_ts_15m,
+            "btc_m15_smc_bias": shared["smc_bias"],
+            "btc_m15_trend_direction": shared["trend_direction"],
+            "btc_m15_trend_strength": shared["trend_strength"],
+            "btc_m15_market_state": shared["market_state"],
+            "btc_m15_regime": shared["regime"],
+            "btc_m15_phase": shared["phase"],
+            "btc_m15_source": "router_shadow_cache",
+            "btc_m15_snapshot_age_secs": m15_age,
+            "btc_m15_bias_label": bias_label,
+            "btc_m15_alignment_label": alignment,
+        }
+        h1 = {
+            "btc_h1_bias_shadow_version": "v1_log_only",
+            "btc_h1_candle_ts": h1_candle_ts,
+            "btc_h1_smc_bias": shared["smc_bias"],
+            "btc_h1_trend_direction": shared["trend_direction"],
+            "btc_h1_trend_strength": shared["trend_strength"],
+            "btc_h1_market_state": shared["market_state"],
+            "btc_h1_regime": shared["regime"],
+            "btc_h1_phase": shared["phase"],
+            "btc_h1_source": "router_shadow_cache_h1_derived",
+            "btc_h1_snapshot_age_secs": h1_age,
+            "btc_h1_bias_label": bias_label,
+            "btc_h1_alignment_label": alignment,
+        }
+        return {**m5, **m15, **h1, **_btc_mtf_combined_labels(alignment, alignment, alignment)}
+    except Exception:
+        return unknown_all
+
+
+def _btc_mtf_bias_shadow_write(dedicated_row):
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "paper_smc_research_btc_mtf_bias_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dedicated_row, ensure_ascii=False, default=str, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[BTC MTF BIAS SHADOW] log failed: {exc}")
 
 
 def get_paper_quality_router_context_snapshot(symbol, now_ts=None):
@@ -1725,6 +1962,55 @@ def paper_smc_research_observe_open(t, ctx=None, monitor_only=False):
     except Exception:
         pass
     _paper_smc_research_write(row)
+    try:
+        _now_ts = time.time()
+        _btc_snap = _btc_m15_bias_shadow_snapshot(t.get("side"), now_ts=_now_ts)
+        _btc_dedicated = {
+            "timestamp": format_vn_time(_now_ts),
+            "timestamp_unix": round(_now_ts, 3),
+            "symbol": t.get("symbol"),
+            "side": t.get("side"),
+            "entry_type": t.get("entry_type"),
+            "research_epoch": t.get("research_epoch"),
+            "research_dedup_key": key,
+            "signal_created_ts": t.get("signal_created_ts"),
+            "open_ts": t.get("entry_time") or t.get("time"),
+            "planned_rr": t.get("planned_rr") or t.get("rr"),
+            "bos_quality": t.get("bos_quality"),
+            "market_regime": t.get("market_regime"),
+            "market_state": t.get("market_state"),
+            "phase": t.get("phase"),
+            "decision": "BTC_M15_BIAS_SHADOW_LOG_ONLY",
+        }
+        _btc_dedicated.update(_btc_snap)
+        _btc_m15_bias_shadow_write({k: v for k, v in _btc_dedicated.items() if v not in (None, "")})
+    except Exception as _btc_exc:
+        print(f"[BTC M15 BIAS SHADOW] open capture failed: {_btc_exc}")
+    try:
+        _mtf_now_ts = time.time()
+        _mtf_snap = _btc_mtf_bias_shadow_snapshot(t.get("side"), now_ts=_mtf_now_ts)
+        _mtf_dedicated = {
+            "timestamp": format_vn_time(_mtf_now_ts),
+            "timestamp_unix": round(_mtf_now_ts, 3),
+            "symbol": t.get("symbol"),
+            "side": t.get("side"),
+            "entry_type": t.get("entry_type"),
+            "research_epoch": t.get("research_epoch"),
+            "research_dedup_key": key,
+            "signal_created_ts": t.get("signal_created_ts"),
+            "open_ts": t.get("entry_time") or t.get("time"),
+            "planned_rr": t.get("planned_rr") or t.get("rr"),
+            "bos_quality": t.get("bos_quality"),
+            "market_regime": t.get("market_regime"),
+            "market_state": t.get("market_state"),
+            "phase": t.get("phase"),
+            "decision": "BTC_MTF_BIAS_SHADOW_LOG_ONLY",
+            "btc_mtf_data_mode": "UNIFIED_ROUTER_BIAS_NOT_INDEPENDENT_TF",
+        }
+        _mtf_dedicated.update(_mtf_snap)
+        _btc_mtf_bias_shadow_write({k: v for k, v in _mtf_dedicated.items() if v not in (None, "")})
+    except Exception as _mtf_exc:
+        print(f"[BTC MTF BIAS SHADOW] open capture failed: {_mtf_exc}")
     if monitor_only and bool(config.get("paper_smc_main_enabled", False)):
         print(
             f"[PAPER SMC RESEARCH LEGACY STILL-OPEN SUPPRESSED] "
