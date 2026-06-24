@@ -138,7 +138,7 @@
   "paper_smc_research_summary_interval_secs": 3600,
   "paper_smc_research_qualified_enabled": true,
   "paper_smc_research_qualified_max_open": 3,
-  "paper_smc_research_qualified_max_new_trades": 81,
+  "paper_smc_research_qualified_max_new_trades": 131,
   "_memo_research_cap_effective_vps": "EFFECTIVE_VPS_CAP_FOR_GLOBAL_200: local baseline has 119 total research OPEN before VPS; VPS log did not inherit baseline; set VPS-local max_new_trades=81 so global total stops at 200.",
   "paper_smc_research_qualified_min_rr": 2,
   "paper_smc_main_enabled": false,
@@ -201,5 +201,7 @@
   "scan_feature_snapshot_enabled": true,
   "scan_feature_snapshot_log_path": "logs/scan_feature_snapshots.jsonl",
   "scan_feature_snapshot_max_per_scan": 100,
-  "scan_feature_snapshot_candle_window": 10
+  "scan_feature_snapshot_candle_window": 10,
+  "research_cap_target": 250,
+  "research_epoch": "v1_extend_250"
 }
