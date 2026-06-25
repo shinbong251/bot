@@ -1,4 +1,4 @@
-﻿"""
+"""
 Signal dispatch layer.
 
 Signal generation runs ONCE in scan_phase() (execution.py).
@@ -4725,6 +4725,86 @@ def _dispatch_paper_smc_research_lane(ctx):
 _LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisions.jsonl")
 
 
+def _live_smc_research_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _live_smc_research_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_live_smc_research_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _live_smc_research_failure_extra(trade, exc=None):
+    trade = trade if isinstance(trade, dict) else {}
+    failure = trade.get("_open_failure")
+    if not isinstance(failure, dict):
+        failure = {}
+
+    extra = {
+        "fail_stage": failure.get("fail_stage") or ("open_trade_exception" if exc else "open_trade"),
+        "fail_reason": failure.get("fail_reason") or ("open_trade raised exception" if exc else "open_trade returned falsy"),
+        "live_mode": bool(config.get("live_mode", False)),
+        "live_smc_research_enabled": bool(config.get("live_smc_research_enabled", False)),
+        "live_confirm_enabled": bool(config.get("live_confirm_enabled", False)),
+        "live_confirm_enabled_blocked": False,
+        "entry": trade.get("entry"),
+        "sl": trade.get("sl"),
+        "tp": trade.get("tp"),
+        "rr": trade.get("rr"),
+        "symbol": str(trade.get("symbol") or ""),
+        "side": str(trade.get("side") or "").upper(),
+        "entry_type": trade.get("entry_type"),
+        "dedup_key": trade.get("research_dedup_key") or trade.get("dedup_key"),
+        "client_order_id": trade.get("client_order_id") or trade.get("exchange_client_id"),
+        "exchange_order_id": trade.get("exchange_order_id"),
+        "exchange_fill_price": trade.get("exchange_fill_price"),
+    }
+    if exc is not None:
+        extra["exception_type"] = type(exc).__name__
+        extra["exception_message"] = str(exc)
+    for key in (
+        "exception_type",
+        "exception_message",
+        "qty",
+        "tier",
+        "raw_qty",
+        "rounded_qty",
+        "notional",
+        "min_notional",
+        "rounded_price",
+        "sl_distance",
+        "sl_distance_pct",
+        "leverage",
+        "margin",
+        "free_balance",
+        "required_leverage",
+        "final_leverage",
+        "target_leverage",
+        "allowed_leverage",
+        "margin_required",
+        "leverage_mode",
+        "leverage_source",
+        "exchange_max_leverage",
+        "safety_gate_reject_reason",
+        "exchange_response",
+        "open_trades",
+        "remaining_secs",
+        "current_total_risk",
+        "add_risk",
+        "max_portfolio_risk",
+        "current_symbol_risk",
+        "max_symbol_risk",
+        "open_live_count",
+        "pending_live_count",
+        "effective_live_count",
+        "max_live_trades",
+    ):
+        if key in failure:
+            extra[key] = failure.get(key)
+    return _live_smc_research_json_safe(extra)
+
+
 def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=None):
     try:
         row = {
@@ -4818,20 +4898,32 @@ def _dispatch_live_smc_research_lane(ctx):
 
         _live_smc_research_log(candidate, "OPEN_ATTEMPT", trade=trade)
 
-        success = open_trade(copy.deepcopy(trade), ctx)
+        trade_for_open = copy.deepcopy(trade)
+        try:
+            success = open_trade(trade_for_open, ctx)
+        except Exception as exc:
+            _live_smc_research_log(
+                candidate,
+                "OPEN_FAILED",
+                "open_trade raised exception",
+                trade=trade_for_open,
+                extra=_live_smc_research_failure_extra(trade_for_open, exc=exc),
+            )
+            raise
         if success:
             _live_smc_research_dedup_keys.add(dedup_key)
             _live_smc_research_log(
                 candidate,
                 "OPEN_ACCEPTED",
-                trade=trade,
+                trade=trade_for_open,
             )
         else:
             _live_smc_research_log(
                 candidate,
                 "OPEN_FAILED",
                 "open_trade returned falsy",
-                trade=trade,
+                trade=trade_for_open,
+                extra=_live_smc_research_failure_extra(trade_for_open),
             )
 
 

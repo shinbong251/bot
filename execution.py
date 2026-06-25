@@ -1,4 +1,4 @@
-﻿import time, json, math, os, threading
+import time, json, math, os, threading
 from datetime import datetime
 import csv
 from config import ACCOUNT_BALANCE, RISK_PER_TRADE, EQUITY_PEAK, config, DEBUG, _strip_secrets_for_save
@@ -3716,6 +3716,62 @@ def exit_optimization(t, price, df15, prefix=None, management_context=None):
 
     return None
 
+def _record_open_failure(t: dict, stage: str, reason: str, exc: Exception = None, **details) -> None:
+    if not isinstance(t, dict):
+        return
+    if not (
+        t.get("execution_mode") == "live"
+        and (
+            t.get("entry_type") == "CONFIRM_SMC_RESEARCH"
+            or t.get("strategy_family") == "confirm_smc_research"
+        )
+    ):
+        return
+    failure = {
+        "fail_stage": stage,
+        "fail_reason": str(reason),
+    }
+    if exc is not None:
+        failure["exception_type"] = type(exc).__name__
+        failure["exception_message"] = str(exc)
+    for key, value in details.items():
+        if value is not None:
+            failure[key] = value
+    t["_open_failure"] = failure
+
+
+def _execution_plan_failure_details(prep: dict = None) -> dict:
+    if not isinstance(prep, dict):
+        return {}
+    plan = prep.get("plan")
+    details = {
+        "qty": prep.get("qty"),
+        "leverage": prep.get("leverage"),
+        "margin": prep.get("margin"),
+        "free_balance": prep.get("free_balance"),
+    }
+    if isinstance(plan, dict):
+        details.update({
+            "tier": plan.get("tier"),
+            "raw_qty": plan.get("raw_qty"),
+            "rounded_qty": plan.get("rounded_qty"),
+            "notional": plan.get("notional"),
+            "min_notional": plan.get("min_notional"),
+            "rounded_price": plan.get("rounded_price"),
+            "sl_distance": plan.get("sl_distance"),
+            "sl_distance_pct": plan.get("sl_distance_pct"),
+            "required_leverage": plan.get("required_leverage"),
+            "final_leverage": plan.get("final_leverage"),
+            "target_leverage": plan.get("target_leverage"),
+            "allowed_leverage": plan.get("allowed_leverage"),
+            "margin_required": plan.get("margin_required"),
+            "leverage_mode": plan.get("leverage_mode"),
+            "leverage_source": plan.get("leverage_source"),
+            "exchange_max_leverage": plan.get("exchange_max_leverage"),
+        })
+    return details
+
+
 def open_trade(t, ctx=None):
     global ACCOUNT_BALANCE, EQUITY_PEAK, early_count, confirm_count_this_cycle
 
@@ -3757,11 +3813,13 @@ def open_trade(t, ctx=None):
     existing = [x for x in _trades if x["symbol"] == symbol and x["status"] == "OPEN"]
     if existing:
         print(f"[BLOCK] DUPLICATE_TRADE {symbol} open_trades={len(existing)}")
+        _record_open_failure(t, "duplicate_trade_guard", "duplicate_trade", open_trades=len(existing))
         return
 
     # ===== [U3] CORRELATION FILTER =====
     if not check_correlation(_trades, t["side"]):
         print(f"[BLOCK] PORTFOLIO_EXPOSURE_LIMIT {symbol} side={t['side']} reason=correlation_limit")
+        _record_open_failure(t, "correlation_filter", "correlation_limit")
         return
 
     # ===== SCORE-BASED POSITION SIZING =====
@@ -3770,6 +3828,7 @@ def open_trade(t, ctx=None):
             base_risk = _get_live_config_float("live_risk_per_trade")
         except ValueError as _risk_cfg_err:
             print(f"[LIVE SAFETY BLOCK] {symbol} reason={_risk_cfg_err}")
+            _record_open_failure(t, "live_config", str(_risk_cfg_err), exc=_risk_cfg_err)
             return False
     else:
         base_risk = t.get("base_risk_percent", RISK_PER_TRADE)
@@ -3785,6 +3844,7 @@ def open_trade(t, ctx=None):
             t["risk_percent"] = base_risk * 0.5
         else:
             print(f"[BLOCK] LOW_SCORE {symbol} score={round(score, 2)}")
+            _record_open_failure(t, "score_filter", "low_score", score=score)
             return
 
     elif 7 <= score < 8:
@@ -3801,10 +3861,22 @@ def open_trade(t, ctx=None):
     if symbol in _entry_cooldown and now - _entry_cooldown[symbol] < ENTRY_COOLDOWN:
         if DEBUG:
             print(f"[PIPELINE DROP] symbol={symbol} stage=ENTRY→OPEN reason=entry_cooldown remaining={round(ENTRY_COOLDOWN-(now-_entry_cooldown[symbol]))}s")
+        _record_open_failure(
+            t,
+            "entry_cooldown",
+            "entry_cooldown",
+            remaining_secs=round(ENTRY_COOLDOWN - (now - _entry_cooldown[symbol]), 3),
+        )
         return
     if symbol in _cooldown and now - _cooldown[symbol] < LOSS_COOLDOWN:
         if DEBUG:
             print(f"[PIPELINE DROP] symbol={symbol} stage=ENTRY→OPEN reason=loss_cooldown remaining={round(LOSS_COOLDOWN-(now-_cooldown[symbol]))}s")
+        _record_open_failure(
+            t,
+            "loss_cooldown",
+            "loss_cooldown",
+            remaining_secs=round(LOSS_COOLDOWN - (now - _cooldown[symbol]), 3),
+        )
         return
 
     # ===== MINIMUM RISK GUARD =====
@@ -3813,14 +3885,24 @@ def open_trade(t, ctx=None):
     _risk_dist = abs(_entry_price - _sl_price)
     if _entry_price > 0 and _risk_dist / _entry_price < 0.001:
         print(f"[BLOCK] RISK_LIMIT_EXCEEDED {symbol} entry={_entry_price} sl={_sl_price} risk_ratio={round(_risk_dist/_entry_price,6)}")
+        _record_open_failure(
+            t,
+            "minimum_risk_guard",
+            "risk_distance_too_small",
+            entry=_entry_price,
+            sl=_sl_price,
+            risk_ratio=round(_risk_dist / _entry_price, 8),
+        )
         return
 
     # ===== INVALID SL PLACEMENT GUARD =====
     if t["side"] == "LONG" and _sl_price >= _entry_price:
         print(f"[BLOCK] INVALID_STATE {symbol} side=LONG entry={_entry_price} sl={_sl_price}")
+        _record_open_failure(t, "invalid_sl_guard", "long_sl_not_below_entry", entry=_entry_price, sl=_sl_price)
         return
     if t["side"] == "SHORT" and _sl_price <= _entry_price:
         print(f"[BLOCK] INVALID_STATE {symbol} side=SHORT entry={_entry_price} sl={_sl_price}")
+        _record_open_failure(t, "invalid_sl_guard", "short_sl_not_above_entry", entry=_entry_price, sl=_sl_price)
         return
 
     # ===== RISK =====
@@ -3833,6 +3915,7 @@ def open_trade(t, ctx=None):
             _portfolio_risk_cap = _get_live_config_float("live_max_portfolio_risk")
         except ValueError as _risk_cfg_err:
             print(f"[LIVE SAFETY BLOCK] {symbol} reason={_risk_cfg_err}")
+            _record_open_failure(t, "live_config", str(_risk_cfg_err), exc=_risk_cfg_err)
             return False
     else:
         _portfolio_risk_cap = MAX_TOTAL_RISK
@@ -3843,6 +3926,7 @@ def open_trade(t, ctx=None):
 
     if current_total_risk > _portfolio_risk_cap * 0.9:
         if t["score"] < 8:
+            _record_open_failure(t, "portfolio_risk_guard", "portfolio_risk_loaded_low_score", current_total_risk=current_total_risk)
             return
 
     _confirm_count = ctx.confirm_count_this_cycle if ctx is not None else confirm_count_this_cycle
@@ -3860,6 +3944,14 @@ def open_trade(t, ctx=None):
                 print(f"[RISK SOFT CAP] {symbol} scaled risk → {risk_percent:.4f}")
         else:
             print(f"[BLOCK] RISK_LIMIT_EXCEEDED {symbol} current={round(current_total_risk,4)} add={round(risk_percent,4)} max={_portfolio_risk_cap}")
+            _record_open_failure(
+                t,
+                "portfolio_risk_guard",
+                "portfolio_risk_limit",
+                current_total_risk=current_total_risk,
+                add_risk=risk_percent,
+                max_portfolio_risk=_portfolio_risk_cap,
+            )
             return
 
     t["risk_percent"] = risk_percent
@@ -3872,10 +3964,19 @@ def open_trade(t, ctx=None):
 
     if symbol_risk + risk_percent > MAX_RISK_PER_SYMBOL:
         print(f"[BLOCK] RISK_LIMIT_EXCEEDED {symbol} current_symbol_risk={round(symbol_risk,4)} add={round(risk_percent,4)} max={MAX_RISK_PER_SYMBOL}")
+        _record_open_failure(
+            t,
+            "symbol_risk_guard",
+            "symbol_risk_limit",
+            current_symbol_risk=symbol_risk,
+            add_risk=risk_percent,
+            max_symbol_risk=MAX_RISK_PER_SYMBOL,
+        )
         return
 
     if len([x for x in _trades if x["symbol"] == symbol and x["status"] == "OPEN"]) >= MAX_TRADES_PER_SYMBOL:
         print(f"[BLOCK] DUPLICATE_TRADE {symbol} max_trades_per_symbol={MAX_TRADES_PER_SYMBOL}")
+        _record_open_failure(t, "max_trades_per_symbol_guard", "max_trades_per_symbol", max_trades_per_symbol=MAX_TRADES_PER_SYMBOL)
         return
 
     if _exec_mode == "live":
@@ -3890,6 +3991,7 @@ def open_trade(t, ctx=None):
         )
         if not _allowed:
             print(f"[LIVE SAFETY BLOCK] {symbol} reason={_reason}")
+            _record_open_failure(t, "live_runtime_safety_gate", _reason, safety_gate_reject_reason=_reason)
             return False
 
     stats["entry"] += 1
@@ -3929,6 +4031,7 @@ def open_trade(t, ctx=None):
         if DEBUG:
             print(f"[SIGNAL_SPAM] {t['symbol']} {t['side']} → skip (cooldown 15min)")
             print(f"[PIPELINE DROP] symbol={symbol} stage=ENTRY→OPEN reason=signal_cooldown_15min side={t['side']}")
+        _record_open_failure(t, "signal_cooldown", "signal_cooldown_15min")
         return
 
     _balance = ctx.account_balance if ctx is not None else ACCOUNT_BALANCE
@@ -3940,6 +4043,7 @@ def open_trade(t, ctx=None):
     if _exec_mode == "live":
         with _lock:
             if not _create_live_slot_reservation(ctx, _trades, t, _exec_mode):
+                _record_open_failure(t, "live_slot_reservation", "live_slot_reservation_reject")
                 return False
             _live_slot_reserved = True
 
@@ -3978,7 +4082,8 @@ def open_trade(t, ctx=None):
         _tn = _resolve_exchange_executor(_exec_mode)
         try:
             _eb = _tn.get_execution_balance()
-        except Exception:
+        except Exception as _balance_exc:
+            _record_open_failure(t, "execution_balance", "execution_balance_exception", exc=_balance_exc)
             if _exec_mode == "live" and _live_slot_reserved:
                 with _lock:
                     _release_live_slot_reservation(
@@ -4002,6 +4107,7 @@ def open_trade(t, ctx=None):
                         ctx, _trades, t, _exec_mode, "execution_balance_unavailable"
                     )
                 _live_slot_reserved = False
+            _record_open_failure(t, "execution_balance", "execution_balance_unavailable")
             return False
         if _eb is not None:
             _side_str = "BUY" if t["side"] == "LONG" else "SELL"
@@ -4026,8 +4132,14 @@ def open_trade(t, ctx=None):
                         with _lock:
                             _release_live_slot_reservation(
                                 ctx, _trades, t, _exec_mode, "live_runtime_safety_gate_reject"
-                            )
+                        )
                         _live_slot_reserved = False
+                    _record_open_failure(
+                        t,
+                        "live_runtime_safety_gate_pre_validate",
+                        _reason,
+                        safety_gate_reject_reason=_reason,
+                    )
                     return False
             try:
                 _prep = _tn.validate_and_prepare(
@@ -4039,7 +4151,8 @@ def open_trade(t, ctx=None):
                     balance=_eb,
                     risk_percent=t["risk_percent"],
                 )
-            except Exception:
+            except Exception as _prep_exc:
+                _record_open_failure(t, "validate_and_prepare", "validate_and_prepare_exception", exc=_prep_exc)
                 if _exec_mode == "live" and _live_slot_reserved:
                     with _lock:
                         _release_live_slot_reservation(
@@ -4048,6 +4161,12 @@ def open_trade(t, ctx=None):
                     _live_slot_reserved = False
                 raise
             if not _prep["valid"]:
+                _record_open_failure(
+                    t,
+                    "validate_and_prepare",
+                    _prep.get("reason", "validate_and_prepare_failed"),
+                    **_execution_plan_failure_details(_prep),
+                )
                 if _exec_mode == "live":
                     print(
                         f"[LIVE SAFETY BLOCK] {symbol} validate_and_prepare failed — "
@@ -4089,6 +4208,15 @@ def open_trade(t, ctx=None):
                                     ctx, _trades, t, _exec_mode, "live_runtime_safety_gate_reject"
                                 )
                                 _live_slot_reserved = False
+                            _record_open_failure(
+                                t,
+                                "live_slot_post_insert_gate",
+                                "live_runtime_safety_gate_reject",
+                                open_live_count=open_live_count,
+                                pending_live_count=pending_live_count,
+                                effective_live_count=effective_live_count,
+                                max_live_trades=max_live,
+                            )
                             return False
                     _trades.append(t)
                     if _exec_mode == "live" and _live_slot_reserved:
@@ -4134,6 +4262,13 @@ def open_trade(t, ctx=None):
                                 )
                                 _live_slot_reserved = False
                         save_open_trades(_trades, _state_file)
+                        _record_open_failure(
+                            t,
+                            "live_runtime_safety_gate_pre_order",
+                            _reason,
+                            safety_gate_reject_reason=_reason,
+                            **_execution_plan_failure_details(_prep),
+                        )
                         return False
                 _entry_client_order_id = None
                 if _exec_mode == "live" and hasattr(_tn, "_bot_client_order_id"):
@@ -4149,6 +4284,14 @@ def open_trade(t, ctx=None):
                         client_order_id=_entry_client_order_id,
                     )
                 except Exception as _entry_exc:
+                    _record_open_failure(
+                        t,
+                        "place_market_order_exception",
+                        str(_entry_exc),
+                        exc=_entry_exc,
+                        client_order_id=_entry_client_order_id,
+                        **_execution_plan_failure_details(_prep),
+                    )
                     if _exec_mode == "live" and _entry_client_order_id:
                         _mark_live_entry_uncertain(
                             t,
@@ -4168,6 +4311,14 @@ def open_trade(t, ctx=None):
                                 if t in _trades:
                                     _trades.remove(t)
                             save_open_trades(_trades, _state_file)
+                            _record_open_failure(
+                                t,
+                                "entry_uncertain_not_found",
+                                "market_order_exception_not_found_after_query",
+                                exc=_entry_exc,
+                                client_order_id=_entry_client_order_id,
+                                **_execution_plan_failure_details(_prep),
+                            )
                             return False
                         else:
                             save_open_trades(_trades, _state_file)
@@ -4214,6 +4365,14 @@ def open_trade(t, ctx=None):
                             if t in _trades:
                                 _trades.remove(t)
                         save_open_trades(_trades, _state_file)
+                        _record_open_failure(
+                            t,
+                            "entry_uncertain_not_found",
+                            "market_order_not_found_after_query",
+                            exchange_response=_entry_result,
+                            client_order_id=_uncertain_cid,
+                            **_execution_plan_failure_details(_prep),
+                        )
                         return False
                     else:
                         save_open_trades(_trades, _state_file)
@@ -4241,6 +4400,14 @@ def open_trade(t, ctx=None):
                             )
                             _live_slot_reserved = False
                     save_open_trades(_trades, _state_file)
+                    _record_open_failure(
+                        t,
+                        "place_market_order",
+                        _entry_result.get("error", "market_order_failed"),
+                        exchange_response=_entry_result,
+                        client_order_id=_entry_result.get("client_order_id") or _entry_client_order_id,
+                        **_execution_plan_failure_details(_prep),
+                    )
                     return False
 
                 t["exchange_qty"] = _entry_result.get("fill_qty") or _prep["qty"]
@@ -4368,6 +4535,13 @@ def open_trade(t, ctx=None):
                                 if t in _trades:
                                     _trades.remove(t)
                             save_open_trades(_trades, _state_file)
+                            _record_open_failure(
+                                t,
+                                "place_stop_loss_retry",
+                                _sl_result.get("error", "stop_loss_retry_failed"),
+                                exchange_response=_sl_result,
+                                **_execution_plan_failure_details(_prep),
+                            )
                             return False
 
                         print(
