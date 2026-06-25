@@ -5765,10 +5765,11 @@ def update_trades(fast_mode=False, ctx=None):
                                 # Will retry next scan; exchange_sl_sync_pending is set.
                                 _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_FAILED"
                             else:
-                                # Unexpected None in live mode — mark done defensively
-                                # so we don't loop forever, but flag it clearly.
+                                # None in live = sync anchor missing (no exchange_sl_id
+                                # or exchange_qty). Treat as SYNC_FAILED: do NOT mark
+                                # done — retry next scan until exchange confirms True.
                                 _lml_log_event = "MIN_LOCK_075_LIVE_NO_SYNC_CTX"
-                                t["min_lock_075_done"] = True
+                                t["exchange_sl_sync_pending"] = t.get("sl")
 
                             save_open_trades(_trades, _state_file)
 
