@@ -5019,6 +5019,9 @@ def compute_smc_context(df15, df1h, df4h, side, bos_type, bos_level, ctx):
             "smc_bias": smc_bias,
             "range_context": range_context,
             "invalid_context": flags,
+            "btc_h4_bias_raw": h4_bias if h4_bias is not None else "NONE",
+            "btc_h1_ema_raw": h1_bias if h1_bias is not None else "NONE",
+            "btc_h1_structure_ok": "NOT_AVAILABLE_V1",
         }
     except Exception:
         return dict(defaults)

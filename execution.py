@@ -805,6 +805,10 @@ def _btc_m15_bias_shadow_snapshot(side, now_ts=None):
         "btc_m15_snapshot_age_secs": None,
         "btc_m15_bias_label": "UNKNOWN",
         "btc_m15_alignment_label": "BTC_BIAS_UNKNOWN",
+        "btc_h4_bias_raw": "NONE",
+        "btc_h1_ema_raw": "NONE",
+        "btc_h1_structure_ok": "NOT_AVAILABLE_V1",
+        "btc_bias_metadata_version": "v2_raw_h1_h4_log_only",
     }
     try:
         row = _btc_m15_shadow_cache.get("BTCUSDT")
@@ -831,6 +835,10 @@ def _btc_m15_bias_shadow_snapshot(side, now_ts=None):
             "btc_m15_snapshot_age_secs": round(age, 1),
             "btc_m15_bias_label": bias_label,
             "btc_m15_alignment_label": _btc_m15_alignment_label(side, bias_label),
+            "btc_h4_bias_raw": row.get("btc_h4_bias_raw", "NONE"),
+            "btc_h1_ema_raw": row.get("btc_h1_ema_raw", "NONE"),
+            "btc_h1_structure_ok": row.get("btc_h1_structure_ok", "NOT_AVAILABLE_V1"),
+            "btc_bias_metadata_version": "v2_raw_h1_h4_log_only",
         }
     except Exception:
         return unknown
@@ -905,6 +913,10 @@ def _btc_mtf_bias_shadow_snapshot(side, now_ts=None):
         **_tf_unknown("m15"),
         **_tf_unknown("h1"),
         **_btc_mtf_combined_labels(_U, _U, _U),
+        "btc_h4_bias_raw": "NONE",
+        "btc_h1_ema_raw": "NONE",
+        "btc_h1_structure_ok": "NOT_AVAILABLE_V1",
+        "btc_bias_metadata_version": "v2_raw_h1_h4_log_only",
     }
     try:
         row = _btc_m15_shadow_cache.get("BTCUSDT")
@@ -919,6 +931,10 @@ def _btc_mtf_bias_shadow_snapshot(side, now_ts=None):
                 **_tf_unknown("m5"), **_tf_unknown("m15"), **_tf_unknown("h1"),
                 "btc_m5_source": "STALE", "btc_m15_source": "STALE", "btc_h1_source": "STALE",
                 **_btc_mtf_combined_labels(_U, _U, _U),
+                "btc_h4_bias_raw": "NONE",
+                "btc_h1_ema_raw": "NONE",
+                "btc_h1_structure_ok": "NOT_AVAILABLE_V1",
+                "btc_bias_metadata_version": "v2_raw_h1_h4_log_only",
             }
         smc_bias = row.get("smc_bias")
         trend_direction = row.get("trend_direction")
@@ -981,7 +997,14 @@ def _btc_mtf_bias_shadow_snapshot(side, now_ts=None):
             "btc_h1_bias_label": bias_label,
             "btc_h1_alignment_label": alignment,
         }
-        return {**m5, **m15, **h1, **_btc_mtf_combined_labels(alignment, alignment, alignment)}
+        return {
+            **m5, **m15, **h1,
+            **_btc_mtf_combined_labels(alignment, alignment, alignment),
+            "btc_h4_bias_raw": row.get("btc_h4_bias_raw", "NONE"),
+            "btc_h1_ema_raw": row.get("btc_h1_ema_raw", "NONE"),
+            "btc_h1_structure_ok": row.get("btc_h1_structure_ok", "NOT_AVAILABLE_V1"),
+            "btc_bias_metadata_version": "v2_raw_h1_h4_log_only",
+        }
     except Exception:
         return unknown_all
 
@@ -1399,6 +1422,8 @@ def _paper_smc_research_event_row(t, status, now_ts=None):
         "entry": t.get("entry_real", t.get("entry")),
         "sl": t.get("sl_init", t.get("sl")),
         "research_dedup_key": _paper_smc_research_key(t),
+        "research_join_key": _paper_smc_research_key(t),
+        "trade_id": t.get("id") or t.get("trade_id"),
         "original_reason": t.get("original_reason"),
         "score_v2_structural_shadow": t.get("score_v2_structural_shadow"),
         "structural_decision_shadow": t.get("structural_decision_shadow"),
@@ -1471,6 +1496,8 @@ def _paper_smc_research_min_lock_shadow_row(t, now_ts=None):
         "symbol": t.get("symbol"),
         "side": t.get("side"),
         "trade_id": t.get("id") or t.get("trade_id"),
+        "research_dedup_key": _paper_smc_research_key(t),
+        "research_join_key": _paper_smc_research_key(t),
         "research_epoch": t.get("research_epoch"),
         "entry_type": t.get("entry_type"),
         "close_reason": t.get("close_reason") or t.get("exit_type"),
@@ -1563,6 +1590,8 @@ def _paper_smc_research_sl_gap_calibration_shadow_row(t, now_ts=None):
         "symbol": t.get("symbol"),
         "side": t.get("side"),
         "trade_id": t.get("id") or t.get("trade_id"),
+        "research_dedup_key": _paper_smc_research_key(t),
+        "research_join_key": _paper_smc_research_key(t),
         "entry_type": t.get("entry_type"),
         "research_epoch": t.get("research_epoch"),
         "execution_tier": t.get("sl_gap_tier") or t.get("execution_tier"),
@@ -1973,6 +2002,8 @@ def paper_smc_research_observe_open(t, ctx=None, monitor_only=False):
             "entry_type": t.get("entry_type"),
             "research_epoch": t.get("research_epoch"),
             "research_dedup_key": key,
+            "research_join_key": key,
+            "trade_id": t.get("id"),
             "signal_created_ts": t.get("signal_created_ts"),
             "open_ts": t.get("entry_time") or t.get("time"),
             "planned_rr": t.get("planned_rr") or t.get("rr"),
@@ -1997,6 +2028,8 @@ def paper_smc_research_observe_open(t, ctx=None, monitor_only=False):
             "entry_type": t.get("entry_type"),
             "research_epoch": t.get("research_epoch"),
             "research_dedup_key": key,
+            "research_join_key": key,
+            "trade_id": t.get("id"),
             "signal_created_ts": t.get("signal_created_ts"),
             "open_ts": t.get("entry_time") or t.get("time"),
             "planned_rr": t.get("planned_rr") or t.get("rr"),

@@ -211,6 +211,9 @@ def _empty_row(
         "liquidity_context": None,
         "smc_zone": None,
         "smc_bias": None,
+        "btc_h4_bias_raw": "NONE",
+        "btc_h1_ema_raw": "NONE",
+        "btc_h1_structure_ok": "NOT_AVAILABLE_V1",
         "invalid_context": [],
         "exhaustion": None,
         "exhaustion_score": None,
@@ -302,6 +305,9 @@ def classify_regime(
     liquidity_sweep = smc.get("liquidity_sweep", "NONE") if isinstance(smc, dict) else "NONE"
     smc_bias = smc.get("smc_bias", "UNKNOWN") if isinstance(smc, dict) else "UNKNOWN"
     invalid_context = _as_list(smc.get("invalid_context", []) if isinstance(smc, dict) else [])
+    btc_h4_bias_raw = smc.get("btc_h4_bias_raw", "NONE") if isinstance(smc, dict) else "NONE"
+    btc_h1_ema_raw = smc.get("btc_h1_ema_raw", "NONE") if isinstance(smc, dict) else "NONE"
+    btc_h1_structure_ok = smc.get("btc_h1_structure_ok", "NOT_AVAILABLE_V1") if isinstance(smc, dict) else "NOT_AVAILABLE_V1"
 
     conflict_flags = []
     regime = "CHOP_NO_TRADE"
@@ -417,6 +423,9 @@ def classify_regime(
         "liquidity_context": liquidity_sweep,
         "smc_zone": smc.get("smc_zone") if isinstance(smc, dict) else None,
         "smc_bias": smc_bias,
+        "btc_h4_bias_raw": btc_h4_bias_raw,
+        "btc_h1_ema_raw": btc_h1_ema_raw,
+        "btc_h1_structure_ok": btc_h1_structure_ok,
         "invalid_context": invalid_context,
         "exhaustion": exhaustion,
         "exhaustion_score": _safe_float(exhaustion_score),
