@@ -5637,6 +5637,68 @@ def update_trades(fast_mode=False, ctx=None):
                                     new_sl=t["sl"],
                                 )
 
+            # ===== PAPER SMC RESEARCH MIN-LOCK 0.75R =====
+            try:
+                if (
+                    _exec_mode == "paper"
+                    and _paper_smc_research_trade_matches(t)
+                    and not t.get("min_lock_075_done")
+                    and float(t.get("max_profit_r", 0)) >= 0.75
+                ):
+                    _ml075_entry_real = t.get("entry_real") or t.get("entry")
+                    _ml075_sl_init = t.get("sl_init")
+                    if _ml075_entry_real is None or _ml075_sl_init is None:
+                        pass
+                    else:
+                        _ml075_initial_risk = abs(float(_ml075_entry_real) - float(_ml075_sl_init))
+                        if _ml075_initial_risk > 0:
+                            _ml075_current_sl = t["sl"]
+                            if t["side"] == "LONG":
+                                _ml075_floor = float(_ml075_entry_real) + _ml075_initial_risk * 0.75
+                                _ml075_should_move = _ml075_floor > _ml075_current_sl
+                            else:
+                                _ml075_floor = float(_ml075_entry_real) - _ml075_initial_risk * 0.75
+                                _ml075_should_move = _ml075_floor < _ml075_current_sl
+                            if _ml075_should_move:
+                                t["sl"] = _ml075_floor
+                            t["min_lock_075_done"] = True
+                            save_open_trades(_trades, _state_file)
+                            try:
+                                _ml075_r_now = (
+                                    (p - float(_ml075_entry_real)) / _ml075_initial_risk
+                                    if t["side"] == "LONG"
+                                    else (float(_ml075_entry_real) - p) / _ml075_initial_risk
+                                )
+                                _ml075_log_row = {
+                                    "ts": time.time(),
+                                    "timestamp": datetime.now().astimezone().isoformat(),
+                                    "event": "PAPER_SMC_RESEARCH_MIN_LOCK_075",
+                                    "version": "v1_paper_research_only",
+                                    "reason": "MIN_LOCK_075_TRIGGERED",
+                                    "symbol": t.get("symbol"),
+                                    "side": t.get("side"),
+                                    "entry_type": t.get("entry_type"),
+                                    "research_join_key": _paper_smc_research_key(t),
+                                    "research_dedup_key": t.get("research_dedup_key"),
+                                    "entry": float(_ml075_entry_real),
+                                    "initial_risk": _ml075_initial_risk,
+                                    "old_sl": _ml075_current_sl,
+                                    "new_sl": t["sl"],
+                                    "sl_moved": _ml075_should_move,
+                                    "current_r": round(_ml075_r_now, 4),
+                                    "mfe_r": t.get("max_profit_r"),
+                                }
+                                _ml075_log_path = os.path.join("logs", "paper_smc_research_min_lock_075_events.jsonl")
+                                os.makedirs("logs", exist_ok=True)
+                                with open(_ml075_log_path, "a", encoding="utf-8") as _ml075_fh:
+                                    _ml075_fh.write(json.dumps(_ml075_log_row, ensure_ascii=False) + "\n")
+                            except Exception as _ml075_log_ex:
+                                print(f"[WARN] MIN_LOCK_075 log failed: {_ml075_log_ex}")
+                            if _ml075_should_move:
+                                print(f"[MIN_LOCK_075] {t.get('symbol')} {t.get('side')} SL → {_ml075_floor} (0.75R floor)")
+            except Exception as _ml075_ex:
+                print(f"[WARN] MIN_LOCK_075 block failed: {_ml075_ex}")
+
             # ===== PARTIAL + BE =====
             _be_just_set = False
             if t["side"]=="LONG":
