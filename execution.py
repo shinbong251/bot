@@ -2702,6 +2702,14 @@ def _check_live_runtime_safety_gate(
     ctx=None,
     post_insert: bool = False,
 ) -> tuple:
+    # CONFIRM_SMC_RESEARCH trades bypass the CONFIRM safety gate entirely.
+    # They route to a dedicated research gate that omits exhaustion_cls /
+    # bos_type checks (which research trades do not carry).
+    if t.get("entry_type") == "CONFIRM_SMC_RESEARCH":
+        return executor.check_live_research_safety_gate(
+            t, ctx=ctx, open_trades=open_trades,
+        )
+
     open_count, pending, effective = _live_slot_snapshot(open_trades, ctx, exclude_trade=exclude_trade)
     max_live = _get_max_live_trades()
     if post_insert and effective > max_live:
@@ -5698,6 +5706,118 @@ def update_trades(fast_mode=False, ctx=None):
                                 print(f"[MIN_LOCK_075] {t.get('symbol')} {t.get('side')} SL → {_ml075_floor} (0.75R floor)")
             except Exception as _ml075_ex:
                 print(f"[WARN] MIN_LOCK_075 block failed: {_ml075_ex}")
+
+            # ===== LIVE SMC RESEARCH MIN-LOCK 0.75R =====
+            # Applies only to CONFIRM_SMC_RESEARCH trades in live mode when
+            # live_smc_research_enabled is true.  Exchange SL sync is attempted
+            # via _sync_testnet_trailing_sl; min_lock_075_done is only marked
+            # when the exchange confirms the update (sync_result=True) to prevent
+            # silent non-protection.  A failed sync logs SYNC_FAILED and retries
+            # next scan without moving the done flag.
+            try:
+                if (
+                    _exec_mode == "live"
+                    and config.get("live_smc_research_enabled", False)
+                    and _paper_smc_research_trade_matches(t)
+                    and not t.get("min_lock_075_done")
+                    and float(t.get("max_profit_r", 0)) >= 0.75
+                ):
+                    _lml_entry_real = t.get("entry_real") or t.get("entry")
+                    _lml_sl_init = t.get("sl_init")
+                    if _lml_entry_real is not None and _lml_sl_init is not None:
+                        _lml_initial_risk = abs(
+                            float(_lml_entry_real) - float(_lml_sl_init)
+                        )
+                        if _lml_initial_risk > 0:
+                            _lml_current_sl = t["sl"]
+                            if t["side"] == "LONG":
+                                _lml_floor = (
+                                    float(_lml_entry_real) + _lml_initial_risk * 0.75
+                                )
+                                _lml_should_move = _lml_floor > _lml_current_sl
+                            else:
+                                _lml_floor = (
+                                    float(_lml_entry_real) - _lml_initial_risk * 0.75
+                                )
+                                _lml_should_move = _lml_floor < _lml_current_sl
+
+                            if _lml_should_move:
+                                t["sl"] = _lml_floor
+
+                            _lml_r_now = (
+                                (p - float(_lml_entry_real)) / _lml_initial_risk
+                                if t["side"] == "LONG"
+                                else (float(_lml_entry_real) - p) / _lml_initial_risk
+                            )
+
+                            # Attempt exchange SL sync — same mechanism as trailing stop.
+                            # Returns True=synced, False=failed, None=no exchange (live
+                            # should never return None; guard is defensive).
+                            _lml_sync_result = _sync_testnet_trailing_sl(
+                                t, ctx, old_sl=_lml_current_sl
+                            )
+
+                            if _lml_sync_result is True:
+                                _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_OK"
+                                t["min_lock_075_done"] = True
+                            elif _lml_sync_result is False:
+                                # Do NOT mark done — exchange still has old SL.
+                                # Will retry next scan; exchange_sl_sync_pending is set.
+                                _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_FAILED"
+                            else:
+                                # Unexpected None in live mode — mark done defensively
+                                # so we don't loop forever, but flag it clearly.
+                                _lml_log_event = "MIN_LOCK_075_LIVE_NO_SYNC_CTX"
+                                t["min_lock_075_done"] = True
+
+                            save_open_trades(_trades, _state_file)
+
+                            try:
+                                _lml_log_row = {
+                                    "ts": time.time(),
+                                    "timestamp": datetime.now().astimezone().isoformat(),
+                                    "event": "LIVE_SMC_RESEARCH_MIN_LOCK_075",
+                                    "version": "v1_live_research",
+                                    "reason": _lml_log_event,
+                                    "symbol": t.get("symbol"),
+                                    "side": t.get("side"),
+                                    "entry_type": t.get("entry_type"),
+                                    "research_join_key": _paper_smc_research_key(t),
+                                    "research_dedup_key": t.get("research_dedup_key"),
+                                    "entry": float(_lml_entry_real),
+                                    "initial_risk": _lml_initial_risk,
+                                    "old_sl": _lml_current_sl,
+                                    "new_sl": t["sl"],
+                                    "sl_moved": _lml_should_move,
+                                    "current_r": round(_lml_r_now, 4),
+                                    "mfe_r": t.get("max_profit_r"),
+                                    "sync_result": str(_lml_sync_result),
+                                    "min_lock_075_done": t.get("min_lock_075_done"),
+                                }
+                                _lml_log_path = os.path.join(
+                                    "logs",
+                                    "live_smc_research_min_lock_075_events.jsonl",
+                                )
+                                os.makedirs("logs", exist_ok=True)
+                                with open(_lml_log_path, "a", encoding="utf-8") as _lml_fh:
+                                    _lml_fh.write(
+                                        json.dumps(_lml_log_row, ensure_ascii=False) + "\n"
+                                    )
+                            except Exception as _lml_log_ex:
+                                print(f"[WARN] LIVE_MIN_LOCK_075 log failed: {_lml_log_ex}")
+
+                            if _lml_sync_result is True and _lml_should_move:
+                                print(
+                                    f"[LIVE_MIN_LOCK_075] {t.get('symbol')} "
+                                    f"{t.get('side')} SL → {_lml_floor} (0.75R floor, sync OK)"
+                                )
+                            elif _lml_sync_result is False:
+                                print(
+                                    f"[LIVE_MIN_LOCK_075] {t.get('symbol')} "
+                                    f"{t.get('side')} SL sync FAILED — will retry next scan"
+                                )
+            except Exception as _lml_ex:
+                print(f"[WARN] LIVE_MIN_LOCK_075 block failed: {_lml_ex}")
 
             # ===== PARTIAL + BE =====
             _be_just_set = False

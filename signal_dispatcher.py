@@ -26,6 +26,7 @@ _paper_smc_research_dedup_keys = set()
 _paper_smc_research_qualified_dedup_keys = set()
 _paper_smc_research_qualified_first_seen_ts = {}
 _paper_smc_main_dedup_keys = set()
+_live_smc_research_dedup_keys = set()
 _paper_smc_main_gate_shadow_scan_counter = 0
 _paper_structural_modifier_research_logged = set()
 _paper_boundary_guard_event_dedup = set()
@@ -4715,6 +4716,123 @@ def _dispatch_paper_smc_research_lane(ctx):
             )
 
 
+# =====================================================================
+# LIVE SMC RESEARCH DISPATCH LANE
+# =====================================================================
+
+_LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisions.jsonl")
+
+
+def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=None):
+    try:
+        row = {
+            "ts": time.time(),
+            "decision": decision,
+            "reason": reason,
+            "symbol": str(candidate.get("symbol") or ""),
+            "side": str(candidate.get("side") or "").upper(),
+            "dedup_key": str(candidate.get("dedup_key") or ""),
+        }
+        if trade is not None:
+            row["entry"] = trade.get("entry")
+            row["sl"] = trade.get("sl")
+            row["tp"] = trade.get("tp")
+            row["rr"] = trade.get("rr")
+            row["score"] = trade.get("score")
+            row["entry_type"] = trade.get("entry_type")
+        if isinstance(extra, dict):
+            row.update(extra)
+        os.makedirs("logs", exist_ok=True)
+        with open(_LIVE_SMC_RESEARCH_DECISION_LOG, "a", encoding="utf-8") as _fh:
+            _fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as _log_ex:
+        print(f"[WARN] _live_smc_research_log failed: {_log_ex}")
+
+
+def _live_smc_research_open_count(ctx):
+    return sum(
+        1 for t in (getattr(ctx, "trades", None) or [])
+        if t.get("status") == "OPEN" and (
+            t.get("entry_type") == "CONFIRM_SMC_RESEARCH"
+            or t.get("strategy_family") == "confirm_smc_research"
+        )
+    )
+
+
+def _dispatch_live_smc_research_lane(ctx):
+    if ctx is None:
+        return
+    if getattr(ctx, "execution_mode", None) not in ("live", "paper_live"):
+        return
+    if not config.get("live_smc_research_enabled", False):
+        return
+
+    from execution import open_trade
+    try:
+        from entry import get_confirm_structural_outcome_candidates_snapshot
+        candidates = get_confirm_structural_outcome_candidates_snapshot()
+    except Exception as exc:
+        print(f"[LIVE SMC RESEARCH] candidate snapshot failed: {exc}")
+        return
+
+    max_open = max(0, int(config.get("max_live_research_trades", 1)))
+    now_ts = time.time()
+
+    for candidate in candidates:
+        symbol = str(candidate.get("symbol") or "")
+        dedup_key = str(candidate.get("dedup_key") or "")
+
+        if not symbol:
+            continue
+
+        # Max open guard (fast-path before any further checks)
+        open_now = _live_smc_research_open_count(ctx)
+        if open_now >= max_open:
+            _live_smc_research_log(
+                candidate,
+                "MAX_OPEN_REACHED",
+                f"open={open_now} max={max_open}",
+            )
+            break
+
+        # Dedup guard (session-level key, separate from paper set)
+        if dedup_key and dedup_key in _live_smc_research_dedup_keys:
+            continue
+
+        # Per-symbol open lock (any OPEN trade in live ctx blocks same symbol)
+        symbol_locked = _paper_smc_research_symbol_open(ctx, symbol)
+        if symbol_locked:
+            _live_smc_research_log(
+                candidate,
+                "SYMBOL_LOCKED",
+                f"symbol={symbol} already open in live ctx",
+            )
+            continue
+
+        trade = _paper_smc_research_trade(candidate)
+        if not trade.get("symbol") or trade.get("side") not in {"LONG", "SHORT"}:
+            _live_smc_research_log(candidate, "SAFETY_REJECT", "invalid_geometry")
+            continue
+
+        _live_smc_research_log(candidate, "OPEN_ATTEMPT", trade=trade)
+
+        success = open_trade(copy.deepcopy(trade), ctx)
+        if success:
+            _live_smc_research_dedup_keys.add(dedup_key)
+            _live_smc_research_log(
+                candidate,
+                "OPEN_ACCEPTED",
+                trade=trade,
+            )
+        else:
+            _live_smc_research_log(
+                candidate,
+                "OPEN_FAILED",
+                "open_trade returned falsy",
+                trade=trade,
+            )
+
+
 def _paper_smc_main_candidate_type(candidate):
     candidate_type = str(candidate.get("candidate_type") or "").upper()
     if candidate_type:
@@ -6840,6 +6958,10 @@ def dispatch_to_executor(signals, ctx):
             and not config.get("paper_smc_research_qualified_enabled", False)
         ):
             _dispatch_paper_smc_research_lane(ctx)
+
+    # Live research lane — isolated from paper research; gates on execution_mode
+    # and live_smc_research_enabled internally.  Safe to call for any ctx.
+    _dispatch_live_smc_research_lane(ctx)
 
     if _selected:
         print(

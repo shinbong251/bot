@@ -55,6 +55,8 @@ def load_config():
         "max_live_trades": 3,
         "live_risk_per_trade": 0.003,
         "live_max_portfolio_risk": 0.009,
+        "live_smc_research_enabled": False,
+        "max_live_research_trades": 1,
         "use_exchange_max_leverage": True,
         "leverage_cache_ttl_secs": 21600,
         "enable_early_v2": True,

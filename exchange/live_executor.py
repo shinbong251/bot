@@ -105,6 +105,9 @@ _LIVE_ALLOWED_EXHAUSTION   = {"HEALTHY"}
 _LIVE_ALLOWED_BOS_TYPES    = {"NEAR"}
 _LIVE_SYMBOL_RE            = re.compile(r"^[A-Z0-9]{2,20}USDT$")
 
+# Separate allowlist for the live research gate — does NOT overlap with CONFIRM gate.
+_LIVE_RESEARCH_ALLOWED_TYPES = {"CONFIRM_SMC_RESEARCH"}
+
 # =====================================================================
 # CONFIG LOADER
 # =====================================================================
@@ -127,6 +130,28 @@ def _get_live_max_concurrent() -> int:
         print(f"[LIVE] invalid max_live_trades={raw!r}; using disabled limit 0")
         return 0
     return max(0, max_live)
+
+
+def _get_live_max_research_trades() -> int:
+    cfg = _load_config()
+    raw = cfg.get("max_live_research_trades", 1)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _count_live_research_open(open_trades) -> int:
+    if not open_trades:
+        return 0
+    count = 0
+    for t in open_trades:
+        if t.get("status") == "OPEN" and (
+            t.get("entry_type") == "CONFIRM_SMC_RESEARCH"
+            or t.get("strategy_family") == "confirm_smc_research"
+        ):
+            count += 1
+    return count
 
 
 def _log_leverage_diagnostic(symbol: str, stage: str, reason: str, **fields) -> None:
@@ -410,6 +435,135 @@ def check_live_safety_gate(
         cap = get_max_leverage(sym)
         if lev > cap:
             return False, f"leverage {lev}x exceeds tier cap {cap}x for {sym}"
+
+    return True, "OK"
+
+
+# =====================================================================
+# LIVE RESEARCH SAFETY GATE (CONFIRM_SMC_RESEARCH only)
+# =====================================================================
+
+def check_live_research_safety_gate(
+    trade: dict,
+    ctx=None,
+    open_trades: list = None,
+) -> tuple:
+    """
+    Research-specific live safety gate for CONFIRM_SMC_RESEARCH trades only.
+
+    Separate from check_live_safety_gate() — does NOT require exhaustion_cls
+    or bos_type (research trades do not carry those fields).
+
+    Returns (allowed: bool, reason: str).
+
+    Hard limits enforced:
+      live_mode              must be true in config
+      live_smc_research_enabled must be true in config
+      execution_mode         must be live or paper_live
+      entry_type             must be CONFIRM_SMC_RESEARCH
+      symbol                 must be well-formed USDT futures, not TIER5
+      side                   must be LONG or SHORT
+      entry, sl, tp          must be present and numeric and positive
+      SL geometry            LONG: sl < entry < tp; SHORT: tp < entry < sl
+      planned_rr             must be >= 2.0 (from rr field or computed)
+      bos_quality            if present, must not be WEAK
+      volume_confirmation    if present, must not be EXPANSION
+      open live research     must be < max_live_research_trades
+    """
+    cfg = _load_config()
+
+    if not cfg.get("live_mode", False):
+        return False, "live_mode is not true — live research blocked"
+    if not cfg.get("live_smc_research_enabled", False):
+        return False, "live_smc_research_enabled is not true — live research blocked"
+
+    exec_mode = getattr(ctx, "execution_mode", None) if ctx is not None else None
+    if exec_mode not in ("live", "paper_live"):
+        return False, f"execution_mode={exec_mode!r} not in (live, paper_live)"
+
+    et = (trade.get("entry_type") or "").upper()
+    if et not in _LIVE_RESEARCH_ALLOWED_TYPES:
+        return False, (
+            f"entry_type {et!r} not in live research allowed set "
+            f"{_LIVE_RESEARCH_ALLOWED_TYPES}"
+        )
+
+    sym = (trade.get("symbol") or "").upper()
+    if not _live_symbol_is_well_formed(sym):
+        return False, f"symbol {sym!r} malformed for live execution"
+    if _live_symbol_is_tier5(sym):
+        return False, "execution_tier='TIER5' excluded from live"
+
+    side = (trade.get("side") or "").upper()
+    if side not in ("LONG", "SHORT"):
+        return False, f"side {side!r} must be LONG or SHORT"
+
+    try:
+        entry = float(trade.get("entry_real") or trade.get("entry"))
+        if entry <= 0:
+            raise ValueError(f"entry={entry} non-positive")
+    except (TypeError, ValueError) as _e:
+        return False, f"entry missing or invalid: {_e}"
+
+    try:
+        sl = float(trade.get("sl"))
+        if sl <= 0:
+            raise ValueError(f"sl={sl} non-positive")
+    except (TypeError, ValueError) as _e:
+        return False, f"sl missing or invalid: {_e}"
+
+    try:
+        tp = float(trade.get("tp"))
+        if tp <= 0:
+            raise ValueError(f"tp={tp} non-positive")
+    except (TypeError, ValueError) as _e:
+        return False, f"tp missing or invalid: {_e}"
+
+    if side == "LONG":
+        if not (sl < entry < tp):
+            return False, (
+                f"LONG geometry violated: required sl < entry < tp, "
+                f"got sl={sl} entry={entry} tp={tp}"
+            )
+    else:
+        if not (tp < entry < sl):
+            return False, (
+                f"SHORT geometry violated: required tp < entry < sl, "
+                f"got tp={tp} entry={entry} sl={sl}"
+            )
+
+    rr_raw = trade.get("rr")
+    try:
+        rr_val = float(rr_raw) if rr_raw is not None else None
+    except (TypeError, ValueError):
+        rr_val = None
+    if rr_val is None:
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
+        if sl_dist <= 0:
+            return False, "cannot compute RR — sl_dist=0"
+        rr_val = tp_dist / sl_dist
+    if rr_val < 2.0:
+        return False, f"planned_rr={rr_val:.2f} < 2.0 required for live research"
+
+    bos_quality = (trade.get("bos_quality") or "").upper()
+    if bos_quality == "WEAK":
+        return False, "bos_quality=WEAK rejected in live research gate"
+
+    vol_conf = (trade.get("volume_confirmation") or "").upper()
+    if vol_conf == "EXPANSION":
+        return False, "volume_confirmation=EXPANSION rejected in live research gate"
+
+    _ot = open_trades if open_trades is not None else (
+        getattr(ctx, "trades", None) or []
+    )
+    max_research = _get_live_max_research_trades()
+    open_research = _count_live_research_open(_ot)
+    if open_research >= max_research:
+        return False, (
+            f"live_research_open={open_research} >= "
+            f"max_live_research_trades={max_research}"
+        )
 
     return True, "OK"
 
