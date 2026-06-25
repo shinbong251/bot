@@ -4723,6 +4723,12 @@ def _dispatch_paper_smc_research_lane(ctx):
 # =====================================================================
 
 _LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisions.jsonl")
+_LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS = 15 * 60
+_live_smc_research_terminal_failures = {}
+
+
+def _live_smc_research_min_open_score():
+    return 7
 
 
 def _live_smc_research_json_safe(value):
@@ -4805,6 +4811,205 @@ def _live_smc_research_failure_extra(trade, exc=None):
     return _live_smc_research_json_safe(extra)
 
 
+def _live_smc_research_prefilter_extra(stage, reason, trade, ctx=None, detail=None):
+    trade = trade if isinstance(trade, dict) else {}
+    extra = {
+        "live_mode": bool(config.get("live_mode", False)),
+        "live_smc_research_enabled": bool(config.get("live_smc_research_enabled", False)),
+        "live_confirm_enabled": bool(config.get("live_confirm_enabled", False)),
+        "prefilter_stage": stage,
+        "prefilter_reason": reason,
+        "entry": trade.get("entry"),
+        "sl": trade.get("sl"),
+        "tp": trade.get("tp"),
+        "rr": trade.get("rr"),
+        "score": trade.get("score"),
+        "symbol": str(trade.get("symbol") or ""),
+        "side": str(trade.get("side") or "").upper(),
+        "entry_type": trade.get("entry_type"),
+        "dedup_key": trade.get("research_dedup_key") or trade.get("dedup_key"),
+        "execution_mode": getattr(ctx, "execution_mode", None) if ctx is not None else None,
+        "client_order_id": None,
+        "exchange_order_id": None,
+    }
+    if detail:
+        extra["prefilter_detail"] = str(detail)
+    return _live_smc_research_json_safe(extra)
+
+
+def _live_smc_research_terminal_identity(candidate, trade=None):
+    trade = trade if isinstance(trade, dict) else {}
+    symbol = str(trade.get("symbol") or candidate.get("symbol") or "")
+    side = str(trade.get("side") or candidate.get("side") or "").upper()
+    entry_type = str(trade.get("entry_type") or candidate.get("entry_type") or "CONFIRM_SMC_RESEARCH")
+    dedup_key = str(
+        trade.get("research_dedup_key")
+        or trade.get("dedup_key")
+        or candidate.get("dedup_key")
+        or ""
+    ).strip()
+    signal_ts = _first_nonblank(
+        trade.get("signal_created_ts"),
+        candidate.get("signal_created_ts"),
+        candidate.get("source_timestamp"),
+        candidate.get("source_row_time"),
+        candidate.get("timestamp"),
+        candidate.get("collector_ts"),
+    )
+    signal_key = dedup_key or str(signal_ts or "")
+    return "|".join([symbol, side, entry_type, signal_key])
+
+
+def _live_smc_research_terminal_failure_key(candidate, trade, stage, reason):
+    return "|".join([
+        _live_smc_research_terminal_identity(candidate, trade),
+        str(stage or ""),
+        str(reason or ""),
+    ])
+
+
+def _live_smc_research_terminal_failure_suppressed(candidate, trade, stage, reason, decision, now_ts=None):
+    now_ts = time.time() if now_ts is None else now_ts
+    expired = [
+        key for key, row in _live_smc_research_terminal_failures.items()
+        if now_ts - float(row.get("ts", 0)) >= _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS
+    ]
+    for key in expired:
+        _live_smc_research_terminal_failures.pop(key, None)
+
+    key = _live_smc_research_terminal_failure_key(candidate, trade, stage, reason)
+    existing = _live_smc_research_terminal_failures.get(key)
+    if existing and now_ts - float(existing.get("ts", 0)) < _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS:
+        return True
+    _live_smc_research_terminal_failures[key] = {
+        "ts": now_ts,
+        "decision": decision,
+        "stage": str(stage or ""),
+        "reason": str(reason or ""),
+        "identity": _live_smc_research_terminal_identity(candidate, trade),
+    }
+    return False
+
+
+def _live_smc_research_active_terminal_failure(candidate, trade, now_ts=None):
+    now_ts = time.time() if now_ts is None else now_ts
+    identity = _live_smc_research_terminal_identity(candidate, trade)
+    for row in list(_live_smc_research_terminal_failures.values()):
+        if row.get("identity") != identity:
+            continue
+        if now_ts - float(row.get("ts", 0)) < _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS:
+            return row
+    return None
+
+
+def _live_smc_research_gate_reason_code(reason):
+    text = str(reason or "")
+    lower = text.lower()
+    if "live_mode is not true" in lower:
+        return "live_mode_disabled"
+    if "live_smc_research_enabled is not true" in lower:
+        return "live_smc_research_disabled"
+    if "execution_mode=" in lower:
+        return "execution_mode_not_live"
+    if "entry_type" in lower:
+        return "entry_type_not_confirm_smc_research"
+    if "symbol" in lower and "malformed" in lower:
+        return "invalid_required_field"
+    if "tier5" in lower:
+        return "research_predicate_fail"
+    if "missing or invalid" in lower:
+        return "invalid_required_field"
+    if "geometry violated" in lower:
+        return "invalid_geometry"
+    if "planned_rr=" in lower or "cannot compute rr" in lower:
+        return "rr_below_min"
+    if "bos_quality=weak" in lower or "volume_confirmation=expansion" in lower:
+        return "research_predicate_fail"
+    if "live_research_open=" in lower:
+        return "max_live_research_trades"
+    return "live_research_gate_reject"
+
+
+def _live_smc_research_prefilter(candidate, trade, ctx):
+    if not isinstance(trade, dict):
+        return False, "trade_build", "invalid_trade", "trade builder did not return dict"
+
+    if not config.get("live_smc_research_enabled", False):
+        return False, "config", "live_smc_research_disabled", "live_smc_research_enabled is not true"
+
+    exec_mode = getattr(ctx, "execution_mode", None) if ctx is not None else None
+    if exec_mode not in ("live", "paper_live"):
+        return False, "execution_mode", "execution_mode_not_live", f"execution_mode={exec_mode!r}"
+
+    if str(trade.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+        return False, "entry_type", "entry_type_not_confirm_smc_research", trade.get("entry_type")
+
+    symbol = str(trade.get("symbol") or "")
+    side = str(trade.get("side") or "").upper()
+    if not symbol:
+        return False, "required_fields", "missing_required_field", "symbol"
+    if side not in {"LONG", "SHORT"}:
+        return False, "required_fields", "invalid_required_field", f"side={side!r}"
+
+    values = {}
+    for field in ("entry", "sl", "tp"):
+        raw = trade.get(field)
+        if raw is None:
+            return False, "required_fields", "missing_required_field", field
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return False, "required_fields", "invalid_required_field", f"{field}={raw!r}"
+        if value <= 0:
+            return False, "required_fields", "invalid_required_field", f"{field}={value}"
+        values[field] = value
+
+    if side == "LONG" and not (values["sl"] < values["entry"] < values["tp"]):
+        return False, "geometry", "invalid_geometry", "LONG requires sl < entry < tp"
+    if side == "SHORT" and not (values["tp"] < values["entry"] < values["sl"]):
+        return False, "geometry", "invalid_geometry", "SHORT requires tp < entry < sl"
+
+    rr_raw = trade.get("rr")
+    if rr_raw is None:
+        return False, "rr", "rr_missing", "rr is missing"
+    try:
+        rr_val = float(rr_raw)
+    except (TypeError, ValueError):
+        return False, "rr", "rr_missing", f"rr={rr_raw!r}"
+    if rr_val < 2.0:
+        return False, "rr", "rr_below_min", f"rr={rr_val}"
+
+    score_raw = trade.get("score")
+    try:
+        score_val = float(score_raw)
+    except (TypeError, ValueError):
+        score_val = 0.0
+    min_score = _live_smc_research_min_open_score()
+    if score_val < min_score:
+        return False, "score", "low_score", f"score={score_val} < {min_score}"
+
+    bos_quality = str(trade.get("bos_quality") or "").upper()
+    if bos_quality == "WEAK":
+        return False, "research_predicate", "research_predicate_fail", "bos_quality=WEAK"
+    volume_confirmation = str(trade.get("volume_confirmation") or "").upper()
+    if volume_confirmation == "EXPANSION":
+        return False, "research_predicate", "research_predicate_fail", "volume_confirmation=EXPANSION"
+
+    try:
+        from exchange import live_executor as _live_executor
+        allowed, gate_reason = _live_executor.check_live_research_safety_gate(
+            trade,
+            ctx=ctx,
+            open_trades=getattr(ctx, "trades", None) if ctx is not None else None,
+        )
+    except Exception as exc:
+        return False, "live_research_gate", "live_research_gate_reject", f"{type(exc).__name__}: {exc}"
+    if not allowed:
+        return False, "live_research_gate", _live_smc_research_gate_reason_code(gate_reason), gate_reason
+
+    return True, "ok", "ok", ""
+
+
 def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=None):
     try:
         row = {
@@ -4857,7 +5062,6 @@ def _dispatch_live_smc_research_lane(ctx):
         print(f"[LIVE SMC RESEARCH] candidate snapshot failed: {exc}")
         return
 
-    max_open = max(0, int(config.get("max_live_research_trades", 1)))
     now_ts = time.time()
 
     for candidate in candidates:
@@ -4866,16 +5070,6 @@ def _dispatch_live_smc_research_lane(ctx):
 
         if not symbol:
             continue
-
-        # Max open guard (fast-path before any further checks)
-        open_now = _live_smc_research_open_count(ctx)
-        if open_now >= max_open:
-            _live_smc_research_log(
-                candidate,
-                "MAX_OPEN_REACHED",
-                f"open={open_now} max={max_open}",
-            )
-            break
 
         # Dedup guard (session-level key, separate from paper set)
         if dedup_key and dedup_key in _live_smc_research_dedup_keys:
@@ -4892,8 +5086,38 @@ def _dispatch_live_smc_research_lane(ctx):
             continue
 
         trade = _paper_smc_research_trade(candidate)
-        if not trade.get("symbol") or trade.get("side") not in {"LONG", "SHORT"}:
-            _live_smc_research_log(candidate, "SAFETY_REJECT", "invalid_geometry")
+
+        prefilter_ok, prefilter_stage, prefilter_reason, prefilter_detail = _live_smc_research_prefilter(
+            candidate,
+            trade,
+            ctx,
+        )
+        if not prefilter_ok:
+            if not _live_smc_research_terminal_failure_suppressed(
+                candidate,
+                trade,
+                prefilter_stage,
+                prefilter_reason,
+                "PREFILTER_REJECT",
+                now_ts=now_ts,
+            ):
+                _live_smc_research_log(
+                    candidate,
+                    "PREFILTER_REJECT",
+                    prefilter_reason,
+                    trade=trade,
+                    extra=_live_smc_research_prefilter_extra(
+                        prefilter_stage,
+                        prefilter_reason,
+                        trade,
+                        ctx=ctx,
+                        detail=prefilter_detail,
+                    ),
+                )
+            continue
+
+        active_failure = _live_smc_research_active_terminal_failure(candidate, trade, now_ts=now_ts)
+        if active_failure:
             continue
 
         _live_smc_research_log(candidate, "OPEN_ATTEMPT", trade=trade)
@@ -4902,13 +5126,24 @@ def _dispatch_live_smc_research_lane(ctx):
         try:
             success = open_trade(trade_for_open, ctx)
         except Exception as exc:
-            _live_smc_research_log(
+            _failure_extra = _live_smc_research_failure_extra(trade_for_open, exc=exc)
+            _fail_stage = _failure_extra.get("fail_stage")
+            _fail_reason = _failure_extra.get("fail_reason")
+            if not _live_smc_research_terminal_failure_suppressed(
                 candidate,
+                trade_for_open,
+                _fail_stage,
+                _fail_reason,
                 "OPEN_FAILED",
-                "open_trade raised exception",
-                trade=trade_for_open,
-                extra=_live_smc_research_failure_extra(trade_for_open, exc=exc),
-            )
+                now_ts=now_ts,
+            ):
+                _live_smc_research_log(
+                    candidate,
+                    "OPEN_FAILED",
+                    "open_trade raised exception",
+                    trade=trade_for_open,
+                    extra=_failure_extra,
+                )
             raise
         if success:
             _live_smc_research_dedup_keys.add(dedup_key)
@@ -4918,13 +5153,24 @@ def _dispatch_live_smc_research_lane(ctx):
                 trade=trade_for_open,
             )
         else:
-            _live_smc_research_log(
+            _failure_extra = _live_smc_research_failure_extra(trade_for_open)
+            _fail_stage = _failure_extra.get("fail_stage")
+            _fail_reason = _failure_extra.get("fail_reason")
+            if not _live_smc_research_terminal_failure_suppressed(
                 candidate,
+                trade_for_open,
+                _fail_stage,
+                _fail_reason,
                 "OPEN_FAILED",
-                "open_trade returned falsy",
-                trade=trade_for_open,
-                extra=_live_smc_research_failure_extra(trade_for_open),
-            )
+                now_ts=now_ts,
+            ):
+                _live_smc_research_log(
+                    candidate,
+                    "OPEN_FAILED",
+                    "open_trade returned falsy",
+                    trade=trade_for_open,
+                    extra=_failure_extra,
+                )
 
 
 def _paper_smc_main_candidate_type(candidate):
