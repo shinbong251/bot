@@ -1124,6 +1124,8 @@ def live_execution_filter(signal, ctx):
         return False, "EARLY_CONT blocked in live mode"
     if et not in LIVE_ALLOWED_ENTRY_TYPES:
         return False, f"entry_type {et!r} not allowed in live mode (CONFIRM only)"
+    if et == "CONFIRM" and not config.get("live_confirm_enabled", False):
+        return False, "live_confirm_enabled=False — CONFIRM live disabled"
 
     if (
         getattr(ctx, "execution_mode", None) == "live"
