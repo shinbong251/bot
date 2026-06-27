@@ -112,6 +112,7 @@ def load_config():
         "paper_smc_research_summary_enabled": True,
         "paper_smc_research_summary_interval_secs": 3600,
         "paper_smc_research_qualified_enabled": False,
+        "paper_smc_research_cap_enabled": False,
         "paper_smc_research_qualified_max_open": 3,
         "paper_smc_research_qualified_max_new_trades": 131,
         "paper_smc_research_qualified_min_rr": 2.0,

@@ -4027,6 +4027,10 @@ def _paper_smc_research_qualified_decision_log(
     open_trade_ts=None,
     open_count_at_decision=None,
     max_open=None,
+    cap_enabled=None,
+    cap_block_skipped=None,
+    max_new=None,
+    opened_total=None,
     first_seen_ts=None,
     current_seen_ts=None,
     slot_wait_secs=None,
@@ -4089,9 +4093,19 @@ def _paper_smc_research_qualified_decision_log(
             "reason": reason,
             "opened_trade_id": opened_trade_id,
             "paper_smc_research_qualified_max_open": max_open,
+            "paper_smc_research_cap_enabled": cap_enabled,
+            "paper_smc_research_cap_disabled": (
+                None if cap_enabled is None else not bool(cap_enabled)
+            ),
+            "paper_smc_research_cap_block_skipped": cap_block_skipped,
+            "cap_block_skipped": cap_block_skipped,
+            "paper_smc_research_qualified_max_new_trades": max_new,
+            "paper_smc_research_qualified_opened_total": opened_total,
+            "qualified_opened_total": opened_total,
             "open_count_at_decision": open_count_at_decision,
             "open_count": open_count_at_decision,
             "max_open": max_open,
+            "max_new": max_new,
             "first_seen_ts": first_seen_ts,
             "current_seen_ts": current_seen_ts,
             "slot_wait_secs": slot_wait_secs,
@@ -4200,6 +4214,7 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
         max_open = max(0, int(config.get("paper_smc_research_qualified_max_open", 3)))
     except (TypeError, ValueError):
         max_open = 0
+    cap_enabled = bool(config.get("paper_smc_research_cap_enabled", True))
 
     for candidate in candidates:
         candidate = copy.deepcopy(candidate)
@@ -4220,6 +4235,9 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 fields=fields,
                 now_ts=now_ts,
                 qualified_eval_ts=qualified_eval_ts,
+                cap_enabled=cap_enabled,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             continue
 
@@ -4236,6 +4254,9 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                     candidate, ctx, now_ts
                 ),
                 qualified_eval_ts=qualified_eval_ts,
+                cap_enabled=cap_enabled,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             continue
 
@@ -4245,8 +4266,9 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 qualified_eval_ts,
             )
             current_seen_ts = qualified_eval_ts
+        cap_block_skipped = (not cap_enabled) and opened_total >= max_new
 
-        if opened_total >= max_new:
+        if cap_enabled and opened_total >= max_new:
             _paper_smc_research_qualified_decision_log(
                 candidate,
                 True,
@@ -4255,6 +4277,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 fields=fields,
                 now_ts=now_ts,
                 qualified_eval_ts=qualified_eval_ts,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=False,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             continue
 
@@ -4276,6 +4302,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 qualified_eval_ts=qualified_eval_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
                 first_seen_ts=first_seen_ts,
                 current_seen_ts=current_seen_ts,
                 slot_wait_secs=(
@@ -4308,6 +4338,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 qualified_eval_ts=qualified_eval_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             continue
 
@@ -4347,6 +4381,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 dispatch_ts=dispatch_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             continue
 
@@ -4392,6 +4430,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 open_trade_ts=open_trade_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
             )
             _paper_smc_research_emit_qualified_latency_waterfall(
                 candidate,
@@ -4425,6 +4467,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 dispatch_ts=dispatch_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
             )
         else:
             _paper_smc_research_qualified_decision_log(
@@ -4439,6 +4485,10 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 dispatch_ts=dispatch_ts,
                 open_count_at_decision=open_count_at_decision,
                 max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
             )
 
 

@@ -1473,6 +1473,7 @@ def _paper_smc_research_event_row(t, status, now_ts=None):
         row["r_multiple"] = t.get("rr_real")
         row["mfe_r"] = t.get("max_profit_r")
         row["mae_r"] = t.get("mae_r")
+        row["close_ts"] = t.get("close_time") or now_ts
     current_r = _paper_smc_research_current_r(t)
     if current_r is not None:
         row["current_r"] = current_r
@@ -1640,6 +1641,151 @@ def _paper_smc_research_sl_gap_calibration_shadow_write(t, exec_mode):
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception as exc:
         print(f"[PAPER SMC RESEARCH SL GAP CALIBRATION SHADOW] log failed: {exc}")
+
+
+def _paper_smc_research_gap_calibration_fields(t, shadow_row=None):
+    if not isinstance(t, dict):
+        return {}
+    if str(t.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+        return {}
+
+    raw_r = _safe_float_value(t.get("rr_real"), None)
+    if raw_r is None:
+        return {}
+
+    close_reason = str(t.get("close_reason") or t.get("exit_type") or "").upper()
+    configured_gap_r = _safe_float_value(t.get("sl_gap"), None)
+    shadow_row = shadow_row if isinstance(shadow_row, dict) else {}
+    shadow_possible_overcharge = shadow_row.get("possible_overcharge")
+    is_gap_loss = close_reason == "SL" and configured_gap_r is not None and configured_gap_r > 0 and raw_r < -1.0
+    if not is_gap_loss and close_reason == "SL":
+        is_gap_loss = abs(raw_r + 1.5) < 1e-9 or abs(raw_r + 1.3) < 1e-9
+    gap_loss_tier = t.get("sl_gap_tier") or t.get("execution_tier") or shadow_row.get("execution_tier")
+
+    cap_1_0 = raw_r
+    cap_1_2 = raw_r
+    method = "raw_realized_r_passthrough_v1"
+    reason = "not_paper_sl_gap_loss"
+    if is_gap_loss and raw_r <= -1.2:
+        cap_1_0 = max(raw_r, -1.0)
+        cap_1_2 = max(raw_r, -1.2)
+        method = "cap_gap_loss_at_minus_1r_v1"
+        reason = "paper_sl_gap_loss_beyond_normal_sl"
+    elif close_reason == "SL":
+        reason = "sl_not_beyond_gap_calibration_threshold"
+
+    fields = {
+        "raw_realized_r": raw_r,
+        "calibrated_realized_r": cap_1_0,
+        "adjusted_realized_r": cap_1_0,
+        "calibrated_gap_cap_r": -1.0,
+        "calibrated_r_cap_1_0": cap_1_0,
+        "calibrated_r_cap_1_2": cap_1_2,
+        "gap_overcharge_r": round(cap_1_0 - raw_r, 6),
+        "gap_calibration_method": method,
+        "gap_calibration_reason": reason,
+        "possible_overcharge": bool(shadow_possible_overcharge) if shadow_possible_overcharge is not None else bool(is_gap_loss and raw_r <= -1.4),
+        "raw_sl_gap_r": configured_gap_r,
+        "configured_sl_gap_r": configured_gap_r,
+        "is_gap_loss": bool(is_gap_loss),
+        "gap_loss_tier": gap_loss_tier,
+    }
+    for key in (
+        "expected_sl_r_with_gap",
+        "mae_r",
+        "gap_minus_mae_r",
+        "price_r",
+    ):
+        if key in shadow_row and shadow_row.get(key) not in (None, ""):
+            fields[key] = shadow_row.get(key)
+    return {k: v for k, v in fields.items() if v not in (None, "")}
+
+
+def _paper_smc_research_pf(values):
+    gains = sum(v for v in values if v > 0)
+    losses = -sum(v for v in values if v < 0)
+    if losses <= 0:
+        return None if gains <= 0 else float("inf")
+    return round(gains / losses, 4)
+
+
+def _paper_smc_research_wr(values):
+    if not values:
+        return None
+    return round(sum(1 for v in values if v > 0) / len(values), 4)
+
+
+def _paper_smc_research_gap_calibrated_summary_row(rows, now_ts=None, notes=None):
+    closed = [
+        r for r in rows or []
+        if isinstance(r, dict)
+        and r.get("event_type") in ("RESEARCH_CLOSED", "RESEARCH_CLOSE_MISSING_CONTEXT")
+    ]
+    raw_values = []
+    cap_1_0_values = []
+    cap_1_2_values = []
+    gap_loss_count = 0
+    possible_overcharge_count = 0
+    gap_overcharge_total = 0.0
+    research_epochs = set()
+    segments = set()
+    for row in closed:
+        raw_r = _safe_float_value(row.get("raw_realized_r", row.get("r_multiple")), None)
+        if raw_r is None:
+            continue
+        cap_1_0 = _safe_float_value(row.get("calibrated_r_cap_1_0", row.get("calibrated_realized_r")), raw_r)
+        cap_1_2 = _safe_float_value(row.get("calibrated_r_cap_1_2"), raw_r)
+        raw_values.append(raw_r)
+        cap_1_0_values.append(cap_1_0)
+        cap_1_2_values.append(cap_1_2)
+        if row.get("is_gap_loss"):
+            gap_loss_count += 1
+        if row.get("possible_overcharge"):
+            possible_overcharge_count += 1
+        gap_overcharge_total += _safe_float_value(row.get("gap_overcharge_r"), 0.0) or 0.0
+        if row.get("research_epoch") not in (None, ""):
+            research_epochs.add(str(row.get("research_epoch")))
+        if row.get("research_is_post_50") is True:
+            segments.add("post_extension")
+        elif row.get("research_is_post_50") is False:
+            segments.add("pre_extension")
+    if not raw_values:
+        return None
+    return {
+        "ts": now_ts or time.time(),
+        "event": "PAPER_SMC_RESEARCH_GAP_CALIBRATED_SUMMARY",
+        "research_epoch": ",".join(sorted(research_epochs)) if research_epochs else None,
+        "segment": ",".join(sorted(segments)) if segments else None,
+        "n_closed": len(raw_values),
+        "raw_net_r": round(sum(raw_values), 4),
+        "calibrated_net_r_cap_1_0": round(sum(cap_1_0_values), 4),
+        "calibrated_net_r_cap_1_2": round(sum(cap_1_2_values), 4),
+        "raw_pf": _paper_smc_research_pf(raw_values),
+        "calibrated_pf_cap_1_0": _paper_smc_research_pf(cap_1_0_values),
+        "calibrated_pf_cap_1_2": _paper_smc_research_pf(cap_1_2_values),
+        "raw_wr": _paper_smc_research_wr(raw_values),
+        "gap_loss_count": gap_loss_count,
+        "gap_overcharge_count": sum(1 for row in closed if _safe_float_value(row.get("gap_overcharge_r"), 0.0) > 0),
+        "gap_overcharge_r_total": round(gap_overcharge_total, 4),
+        "possible_overcharge_count": possible_overcharge_count,
+        "notes": notes or "calibrated promotion audit layer; raw paper results unchanged",
+    }
+
+
+def _paper_smc_research_gap_calibrated_summary_write(rows, exec_mode, now_ts=None, notes=None):
+    if exec_mode != "paper":
+        return
+    try:
+        row = _paper_smc_research_gap_calibrated_summary_row(rows, now_ts=now_ts, notes=notes)
+        if row is None:
+            return
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "paper_smc_research_gap_calibrated_summary.jsonl")
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[PAPER SMC RESEARCH GAP CALIBRATED SUMMARY] log failed: {exc}")
 
 
 def _paper_smc_research_write(row):
@@ -2137,8 +2283,17 @@ def paper_smc_research_observe_close(t, ctx=None, management_context=None):
     if missing:
         row["missing_fields"] = missing
     _paper_smc_research_min_lock_shadow_write(t, exec_mode)
+    shadow_row = _paper_smc_research_sl_gap_calibration_shadow_row(t)
+    calibration_fields = _paper_smc_research_gap_calibration_fields(t, shadow_row=shadow_row)
+    if calibration_fields:
+        row.update(calibration_fields)
     _paper_smc_research_sl_gap_calibration_shadow_write(t, exec_mode)
     _paper_smc_research_write(row)
+    _paper_smc_research_gap_calibrated_summary_write(
+        [row],
+        exec_mode,
+        notes="per-close calibrated accounting; raw r_multiple and rr_real unchanged",
+    )
     _paper_smc_research_closed_since_summary.append(row)
     try:
         from signal_dispatcher import paper_boundary_guard_observe_close
