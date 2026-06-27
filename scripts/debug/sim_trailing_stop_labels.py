@@ -48,6 +48,12 @@ class FakeExecutor:
         return copy.deepcopy(self.result)
 
 
+class DummyDedup:
+    @staticmethod
+    def build_key(*parts):
+        return "|".join(str(part) for part in parts)
+
+
 def load_execution_functions(fake, messages):
     with open(EXECUTION_PATH, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=EXECUTION_PATH)
@@ -73,9 +79,23 @@ def load_execution_functions(fake, messages):
         "time": time,
         "_resolve_exchange_executor": lambda _mode: fake,
         "send_telegram": lambda msg, **kwargs: messages.append((msg, kwargs)),
+        "telegram_dedup": DummyDedup,
+        "_immediately_triggerable_alert_last_sent": {},
+        "_IMMEDIATELY_TRIGGERABLE_ALERT_TTL_SECS": 300.0,
     }
     exec(compile(module, EXECUTION_PATH, "exec"), scope)
     return scope
+
+
+def run_two_skip_case(mode, trade, current_price):
+    fake = FakeExecutor({"success": True, "new_order_id": "NEW_STOP_ID", "cancel_ok": True, "error": None})
+    messages = []
+    scope = load_execution_functions(fake, messages)
+    sync_fn = scope["_sync_testnet_trailing_sl"]
+    t = copy.deepcopy(trade)
+    first = sync_fn(t, Ctx(mode), old_sl=100.0, current_price=current_price)
+    second = sync_fn(t, Ctx(mode), old_sl=100.0, current_price=current_price)
+    return t, first, second, messages, fake.calls
 
 
 def base_trade():
@@ -180,7 +200,16 @@ def main():
     check("SHORT skip persists reason", short_t.get("exchange_sl_sync_skipped_reason") == "immediately_triggerable", str(short_t))
     check("SHORT skip persists pending stop", short_t.get("exchange_sl_sync_pending") == 95.0, str(short_t))
     check("SHORT skip sends TRAIL not CRITICAL", "[LIVE TRAIL]" in short_text and "CRITICAL" not in short_text, short_text)
+    check("SHORT skip routes to management", short_messages[0][1].get("channel") == "management", str(short_messages))
+    check("SHORT skip routes away from alerts", short_messages[0][1].get("channel") != "alerts", str(short_messages))
     check("SHORT local hit_sl remains true", 95.0 >= short_t["sl"], str(short_t))
+
+    duplicate_t, duplicate_first, duplicate_second, duplicate_messages, duplicate_calls = run_two_skip_case(
+        "live", short_triggerable, current_price=95.0
+    )
+    check("duplicate immediately-triggerable returns False both times", duplicate_first is False and duplicate_second is False, str(duplicate_t))
+    check("duplicate immediately-triggerable same trade/target sends once", len(duplicate_messages) == 1, str(duplicate_messages))
+    check("duplicate immediately-triggerable still makes no exchange call", not duplicate_calls, str(duplicate_calls))
 
     short_normal = base_trade()
     short_normal["side"] = "SHORT"

@@ -53,6 +53,8 @@ _paper_smc_research_closed_seen = set()
 _paper_smc_research_summary_last_ts = time.time()
 _paper_smc_research_closed_since_summary = []
 _paper_smc_research_live_warned = set()
+_immediately_triggerable_alert_last_sent = {}
+_IMMEDIATELY_TRIGGERABLE_ALERT_TTL_SECS = 300.0
 _trade_mgmt_check_log_last = {}
 _trade_mgmt_freshness_state = {}
 _trade_mgmt_stuck_summary_last_ts = 0
@@ -1548,6 +1550,133 @@ def _paper_smc_research_min_lock_shadow_write(t, exec_mode):
         print(f"[PAPER SMC RESEARCH MIN LOCK SHADOW] log failed: {exc}")
 
 
+def _research_partial_tp_safe_float(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return out
+    except (TypeError, ValueError):
+        return default
+
+
+def _research_partial_tp_model_values(current_r, max_profit_r):
+    if current_r is None:
+        return {}
+    if max_profit_r is None:
+        return {
+            "model_30_70_r": None,
+            "model_40_60_r": None,
+            "model_50_50_r": None,
+            "model_60_40_r": None,
+        }
+    if max_profit_r < 1.0:
+        return {
+            "model_30_70_r": current_r,
+            "model_40_60_r": current_r,
+            "model_50_50_r": current_r,
+            "model_60_40_r": current_r,
+        }
+    return {
+        "model_30_70_r": 0.3 + 0.7 * current_r,
+        "model_40_60_r": 0.4 + 0.6 * current_r,
+        "model_50_50_r": 0.5 + 0.5 * current_r,
+        "model_60_40_r": 0.6 + 0.4 * current_r,
+    }
+
+
+def _research_partial_tp_shadow_row(t, source, calibrated_fields=None, now_ts=None):
+    if (
+        not isinstance(t, dict)
+        or str(t.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH"
+        or source not in ("paper", "live")
+    ):
+        return None
+
+    calibrated_fields = calibrated_fields if isinstance(calibrated_fields, dict) else {}
+    raw_r = _research_partial_tp_safe_float(
+        t.get("actual_realized_r", t.get("realized_r", t.get("rr_real", t.get("r_multiple")))),
+        None,
+    )
+    calibrated_r = _research_partial_tp_safe_float(
+        calibrated_fields.get(
+            "calibrated_r_cap_1_0",
+            calibrated_fields.get("calibrated_realized_r", t.get("calibrated_r_cap_1_0")),
+        ),
+        None,
+    )
+    current_r = calibrated_r if source == "paper" and calibrated_r is not None else raw_r
+    if current_r is None:
+        return None
+
+    max_profit_r = _research_partial_tp_safe_float(
+        t.get("max_profit_r", t.get("max_r", t.get("mfe_r"))),
+        None,
+    )
+    models = _research_partial_tp_model_values(current_r, max_profit_r)
+    reason = None
+    if max_profit_r is None:
+        reason = "max_profit_r_missing"
+
+    row = {
+        "ts": now_ts or t.get("close_time") or time.time(),
+        "symbol": t.get("symbol"),
+        "side": t.get("side"),
+        "source": source,
+        "trade_id": t.get("id") or t.get("trade_id"),
+        "entry_time": t.get("entry_time") or t.get("time"),
+        "close_time": t.get("close_time"),
+        "entry": t.get("entry_real", t.get("entry")),
+        "exit": t.get("exit_price"),
+        "exit_type": t.get("close_reason") or t.get("exit_type"),
+        "realized_r_current": current_r,
+        "calibrated_realized_r_current": calibrated_r,
+        "max_profit_r": max_profit_r,
+        "max_r": max_profit_r,
+        "mfe_r": max_profit_r,
+        "reached_1r": bool(max_profit_r is not None and max_profit_r >= 1.0),
+        "trail_phase": t.get("trail_phase"),
+        "tp_hit": bool(t.get("tp_hit")),
+        "time_to_1r": t.get("time_to_1r"),
+        "time_above_1r": t.get("time_spent_above_1r", t.get("time_above_1r")),
+        "reason": reason,
+    }
+    row.update(models)
+    improved = {}
+    for suffix, field in (
+        ("30_70", "model_30_70_r"),
+        ("40_60", "model_40_60_r"),
+        ("50_50", "model_50_50_r"),
+        ("60_40", "model_60_40_r"),
+    ):
+        model_r = models.get(field)
+        delta_field = f"delta_{suffix}_vs_current"
+        row[delta_field] = None if model_r is None else model_r - current_r
+        improved[suffix] = bool(model_r is not None and model_r > current_r)
+    row["improved_by_partial"] = improved
+    return row
+
+
+def _research_partial_tp_shadow_write(t, source, calibrated_fields=None):
+    try:
+        row = _research_partial_tp_shadow_row(
+            t,
+            source,
+            calibrated_fields=calibrated_fields,
+        )
+        if row is None:
+            return
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "research_partial_tp_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[RESEARCH PARTIAL TP SHADOW] log failed: {exc}")
+
+
 def _paper_smc_research_sl_gap_calibration_shadow_row(t, now_ts=None):
     if (
         not isinstance(t, dict)
@@ -2288,6 +2417,7 @@ def paper_smc_research_observe_close(t, ctx=None, management_context=None):
     if calibration_fields:
         row.update(calibration_fields)
     _paper_smc_research_sl_gap_calibration_shadow_write(t, exec_mode)
+    _research_partial_tp_shadow_write(t, exec_mode, calibrated_fields=calibration_fields)
     _paper_smc_research_write(row)
     _paper_smc_research_gap_calibrated_summary_write(
         [row],
@@ -3544,20 +3674,27 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
     now = time.time()
     entry_real = _safe_float_value(t.get("entry_real") or t.get("entry"), 0.0)
     sl_init = _safe_float_value(t.get("sl_init"), _safe_float_value(t.get("sl"), 0.0))
-    exit_price_source = "exchange_fill"
-    exit_price = _safe_float_value(
-        t.get("exchange_exit_price")
-        or t.get("exchange_close_price")
-        or t.get("exit_price"),
+    exchange_fill_price = _safe_float_value(
+        t.get("exchange_exit_price") or t.get("exchange_close_price"),
         0.0,
     )
-    if exit_price <= 0:
+    local_exit_price = _safe_float_value(t.get("exit_price"), 0.0)
+    confirmed_sl = _safe_float_value(t.get("exchange_sl_price_confirmed"), 0.0)
+    local_sl = _safe_float_value(t.get("sl"), 0.0)
+
+    if exchange_fill_price > 0:
+        exit_price_source = "exchange_fill"
+        exit_price = exchange_fill_price
+    elif local_exit_price > 0:
+        exit_price_source = "sl_plus_slippage_estimate"
+        exit_price = local_exit_price
+    elif confirmed_sl > 0:
         exit_price_source = "confirmed_sl"
-        exit_price = _safe_float_value(t.get("exchange_sl_price_confirmed"), 0.0)
-    if exit_price <= 0:
-        exit_price_source = "stored_sl"
-        exit_price = _safe_float_value(t.get("sl"), 0.0)
-    if exit_price <= 0:
+        exit_price = confirmed_sl
+    elif local_sl > 0:
+        exit_price_source = "local_sl"
+        exit_price = local_sl
+    else:
         exit_price_source = "entry_fallback"
         exit_price = entry_real
         print(
@@ -4862,12 +4999,26 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None, current_price=None):
                 f"{_trail_label} {t['symbol']} stop sync skipped: immediately triggerable; "
                 f"current_price={_current_price} proposed_stop={_proposed_stop}"
             )
-            send_telegram(
-                f"{_trail_label} {t['symbol']} stop sync skipped: immediately triggerable; "
-                "local close path will handle if hit",
-                prefix=ctx.mode_prefix,
-                channel="alerts",
+            _trade_key = (
+                t.get("id")
+                or t.get("trade_id")
+                or f"{t.get('symbol')}:{t.get('side')}:{t.get('entry_time') or t.get('time')}"
             )
+            _dedup_key = (str(_trade_key), round(float(_proposed_stop), 8))
+            _last_sent = _immediately_triggerable_alert_last_sent.get(_dedup_key, 0.0)
+            if _now - _last_sent >= _IMMEDIATELY_TRIGGERABLE_ALERT_TTL_SECS:
+                _immediately_triggerable_alert_last_sent[_dedup_key] = _now
+                send_telegram(
+                    f"{_trail_label} {t['symbol']} stop sync skipped: immediately triggerable; "
+                    "local close path will handle if hit",
+                    prefix=ctx.mode_prefix,
+                    channel="management",
+                    dedup_key=telegram_dedup.build_key(
+                        "immediately_triggerable_stop_sync_skip",
+                        _trade_key,
+                        round(float(_proposed_stop), 8),
+                    ),
+                )
             return False
     print(
         f"{_trail_label} {t['symbol']} Updating stop: "
@@ -5011,6 +5162,15 @@ def _close_live_exchange_position_for_local_exit(t: dict, ctx, exit_type: str) -
             entry_side=side_str,
             qty=qty,
         )
+        fill_price = _safe_numeric_value(
+            result.get("fill_price")
+            or result.get("avgPrice")
+            or ((result.get("raw") or {}).get("avgPrice") if isinstance(result.get("raw"), dict) else None)
+        )
+        if fill_price is not None and fill_price > 0:
+            t["exchange_exit_price"] = fill_price
+            t["exchange_exit_price_ts"] = time.time()
+            t["exchange_exit_source"] = "emergency_close_position"
         if not result.get("success"):
             verifier = getattr(live_executor, "is_position_closed", None)
             already_closed = verifier(symbol) if verifier else None
@@ -7254,6 +7414,8 @@ def update_trades(fast_mode=False, ctx=None):
                 print(f"[EXIT] {t['symbol']} {t['status']} {round(t['rr_real'],2)}R")
                 #print(f"[EXIT DEBUG] {t['symbol']} entry={round(entry_real, 6)} sl_used={round(t.get('sl', 0), 6)} exit_price={round(t.get('exit_price', 0), 6)}")
                 #print(f"[EXIT REASON + PRICE] {t['symbol']} {t['side']} exit_type={t.get('exit_type')} exit_price={round(t.get('exit_price', 0), 6)} rr={t.get('rr_real')} entry={round(entry_real, 6)}")
+                if _exec_mode == "live" and _paper_smc_research_trade_matches(t):
+                    _research_partial_tp_shadow_write(t, "live")
                 _paper_quality_write_observation(t, "CLOSED", _exec_mode)
                 save_trade(t, _trades_csv)
                 save_tier_log(t)    
