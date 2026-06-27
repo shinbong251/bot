@@ -1,4 +1,4 @@
-import time, json, math, os, threading
+import time, json, math, os, threading, re
 from datetime import datetime
 import csv
 from config import ACCOUNT_BALANCE, RISK_PER_TRADE, EQUITY_PEAK, config, DEBUG, _strip_secrets_for_save
@@ -29,6 +29,8 @@ early_count = 0
 confirm_count_this_cycle = 0
 MAX_CONFIRM_PER_CYCLE = 3
 _paper_trail_update_last_sent = {}
+_LIVE_SAFETY_BLOCK_TELEGRAM_TTL_SECS = 15 * 60
+_live_safety_block_telegram_last_sent = {}
 
 SIGNAL_TYPE_SUMMARY_ORDER = ("CONFIRM", "SWING_RETEST", "REVERSAL_CONFIRM", "EARLY_CONT")
 STRATEGY_OBSERVABILITY_FIELDS = [
@@ -2707,7 +2709,10 @@ def _check_live_runtime_safety_gate(
     # bos_type checks (which research trades do not carry).
     if t.get("entry_type") == "CONFIRM_SMC_RESEARCH":
         return executor.check_live_research_safety_gate(
-            t, ctx=ctx, open_trades=open_trades,
+            t,
+            ctx=ctx,
+            open_trades=open_trades,
+            exclude_trade=t if post_insert else None,
         )
 
     open_count, pending, effective = _live_slot_snapshot(open_trades, ctx, exclude_trade=exclude_trade)
@@ -2861,6 +2866,51 @@ def _send_live_reconcile_preserve_alert(
         f"reason={reason}{age_line}\n"
         f"exchange_position_status={exchange_position_status}\n"
         f"action=local_state_preserved",
+        prefix=prefix,
+        channel="alerts",
+    )
+    return True
+
+
+def _live_safety_block_reason_code(reason: str) -> str:
+    text = str(reason or "unknown").strip().lower()
+    first_line = text.splitlines()[0] if text else "unknown"
+    if first_line.startswith("validate failed:"):
+        first_line = first_line.split(":", 1)[1].strip()
+    for marker, code in (
+        ("live_research_open=", "max_live_research_trades"),
+        ("max_live_research_trades", "max_live_research_trades"),
+        ("execution_balance_unavailable", "execution_balance_unavailable"),
+        ("live_runtime_safety_gate_reject", "live_runtime_safety_gate_reject"),
+        ("qty floors to 0", "qty_floor_zero"),
+        ("below stepsize", "qty_floor_zero"),
+        ("minnotional", "min_notional"),
+        ("minqty", "min_qty"),
+        ("live_risk_per_trade", "live_risk_per_trade_config"),
+        ("live_max_portfolio_risk", "live_max_portfolio_risk_config"),
+    ):
+        if marker in first_line:
+            return code
+    code = re.sub(r"[^a-z0-9]+", "_", first_line).strip("_")
+    return (code or "unknown")[:80]
+
+
+def _send_live_safety_block_telegram(symbol: str, reason: str, prefix=None) -> bool:
+    code = _live_safety_block_reason_code(reason)
+    sym = str(symbol or "UNKNOWN").upper()
+    key = f"{sym}:{code}"
+    now = time.time()
+    last_sent = _live_safety_block_telegram_last_sent.get(key, 0)
+    if now - last_sent < _LIVE_SAFETY_BLOCK_TELEGRAM_TTL_SECS:
+        print(
+            f"[LIVE SAFETY BLOCK] telegram suppressed symbol={sym} "
+            f"reason_code={code} age={round(now - last_sent, 1)}s "
+            f"ttl={_LIVE_SAFETY_BLOCK_TELEGRAM_TTL_SECS}s"
+        )
+        return False
+    _live_safety_block_telegram_last_sent[key] = now
+    send_telegram(
+        f"[LIVE SAFETY BLOCK] {sym}\nreason={reason}",
         prefix=prefix,
         channel="alerts",
     )
@@ -4096,10 +4146,10 @@ def open_trade(t, ctx=None):
                 f"[LIVE SAFETY BLOCK] {symbol} execution_balance unavailable — "
                 f"skipped before local state insertion. exchange=unreachable"
             )
-            send_telegram(
-                f"[LIVE SAFETY BLOCK] {symbol}\nreason=execution_balance_unavailable",
+            _send_live_safety_block_telegram(
+                symbol,
+                "execution_balance_unavailable",
                 prefix=_mode_prefix,
-                channel="alerts",
             )
             if _live_slot_reserved:
                 with _lock:
@@ -4123,11 +4173,7 @@ def open_trade(t, ctx=None):
                 )
                 if not _allowed:
                     print(f"[LIVE SAFETY BLOCK] {symbol} before validate reason={_reason}")
-                    send_telegram(
-                        f"[LIVE SAFETY BLOCK] {symbol}\nreason={_reason}",
-                        prefix=_mode_prefix,
-                        channel="alerts",
-                    )
+                    _send_live_safety_block_telegram(symbol, _reason, prefix=_mode_prefix)
                     if _live_slot_reserved:
                         with _lock:
                             _release_live_slot_reservation(
@@ -4172,10 +4218,10 @@ def open_trade(t, ctx=None):
                         f"[LIVE SAFETY BLOCK] {symbol} validate_and_prepare failed — "
                         f"trade not inserted into local state. reason={_prep['reason']}"
                     )
-                    send_telegram(
-                        f"[LIVE SAFETY BLOCK] {symbol}\nvalidate failed: {_prep['reason']}",
+                    _send_live_safety_block_telegram(
+                        symbol,
+                        f"validate failed: {_prep['reason']}",
                         prefix=_mode_prefix,
-                        channel="alerts",
                     )
                     if _live_slot_reserved:
                         with _lock:
@@ -4248,11 +4294,7 @@ def open_trade(t, ctx=None):
                     )
                     if not _allowed:
                         print(f"[LIVE SAFETY BLOCK] {symbol} before market order reason={_reason}")
-                        send_telegram(
-                            f"[LIVE SAFETY BLOCK] {symbol}\nreason={_reason}",
-                            prefix=_mode_prefix,
-                            channel="alerts",
-                        )
+                        _send_live_safety_block_telegram(symbol, _reason, prefix=_mode_prefix)
                         with _lock:
                             if t in _trades:
                                 _trades.remove(t)

@@ -141,11 +141,13 @@ def _get_live_max_research_trades() -> int:
         return 1
 
 
-def _count_live_research_open(open_trades) -> int:
+def _count_live_research_open(open_trades, exclude_trade=None) -> int:
     if not open_trades:
         return 0
     count = 0
     for t in open_trades:
+        if exclude_trade is not None and t is exclude_trade:
+            continue
         if t.get("status") == "OPEN" and (
             t.get("entry_type") == "CONFIRM_SMC_RESEARCH"
             or t.get("strategy_family") == "confirm_smc_research"
@@ -447,6 +449,7 @@ def check_live_research_safety_gate(
     trade: dict,
     ctx=None,
     open_trades: list = None,
+    exclude_trade: dict = None,
 ) -> tuple:
     """
     Research-specific live safety gate for CONFIRM_SMC_RESEARCH trades only.
@@ -558,7 +561,7 @@ def check_live_research_safety_gate(
         getattr(ctx, "trades", None) or []
     )
     max_research = _get_live_max_research_trades()
-    open_research = _count_live_research_open(_ot)
+    open_research = _count_live_research_open(_ot, exclude_trade=exclude_trade)
     if open_research >= max_research:
         return False, (
             f"live_research_open={open_research} >= "
