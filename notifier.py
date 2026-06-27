@@ -94,6 +94,11 @@ def _paper_first_value(t, *keys, default=None):
             return value
     return default
 
+def _paper_close_reason_text(reason, rr_value):
+    if str(reason or "").upper() == "SL" and _safe_float(rr_value, 0.0) > 0:
+        return "Chốt lời bằng SL"
+    return reason
+
 def _paper_score_text(value):
     score = _safe_float(value, None)
     if score is None:
@@ -215,7 +220,8 @@ def format_paper_smc_close(t, engine=None, row=None, close_reason=None):
     rr_value = _safe_float(rr, 0.0)
     mfe = _safe_float(_paper_first_value(t, "max_profit_r", default=row.get("mfe_r")), 0.0)
     giveback = _paper_first_value(t, "giveback_r", default=row.get("giveback_r"))
-    reason = normalize_message_text(close_reason or row.get("close_reason") or t.get("close_reason") or t.get("exit_type") or "UNKNOWN")
+    reason = close_reason or row.get("close_reason") or t.get("close_reason") or t.get("exit_type") or "UNKNOWN"
+    reason = normalize_message_text(_paper_close_reason_text(reason, rr_value))
     close_price = _paper_first_value(t, "exit_price", default=row.get("close_price", "UNKNOWN"))
     symbol = t.get("symbol") or row.get("symbol")
     side = t.get("side") or row.get("side") or ""

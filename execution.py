@@ -4829,7 +4829,7 @@ def apply_adaptive_trailing_floor(t):
 
     return False
 
-def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
+def _sync_testnet_trailing_sl(t, ctx, old_sl=None, current_price=None):
     # Returns: None (paper/no-op), True (sync confirmed), False (sync failed)
     if ctx is None or ctx.execution_mode not in ("testnet", "live"):
         return None
@@ -4845,6 +4845,30 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
     _old_sl_str = round(old_sl, 6) if old_sl is not None else "?"
     _trail_label = "[LIVE TRAIL]" if ctx.execution_mode == "live" else "[TESTNET TRAIL]"
     _critical_label = "[LIVE CRITICAL]" if ctx.execution_mode == "live" else "[TESTNET CRITICAL]"
+    _current_price = _safe_numeric_value(current_price)
+    _proposed_stop = _safe_numeric_value(new_sl)
+    if _current_price is not None and _proposed_stop is not None:
+        _side = str(t.get("side") or "").upper()
+        _immediately_triggerable = (
+            (_side == "LONG" and _current_price <= _proposed_stop)
+            or (_side == "SHORT" and _current_price >= _proposed_stop)
+        )
+        if _immediately_triggerable:
+            _now = time.time()
+            t["exchange_sl_sync_skipped_reason"] = "immediately_triggerable"
+            t["exchange_sl_sync_skipped_ts"] = _now
+            t["exchange_sl_sync_pending"] = new_sl
+            print(
+                f"{_trail_label} {t['symbol']} stop sync skipped: immediately triggerable; "
+                f"current_price={_current_price} proposed_stop={_proposed_stop}"
+            )
+            send_telegram(
+                f"{_trail_label} {t['symbol']} stop sync skipped: immediately triggerable; "
+                "local close path will handle if hit",
+                prefix=ctx.mode_prefix,
+                channel="alerts",
+            )
+            return False
     print(
         f"{_trail_label} {t['symbol']} Updating stop: "
         f"{_old_sl_str} -> {round(new_sl, 6)}"
@@ -4862,6 +4886,8 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
         t.pop("exchange_sl_sync_pending", None)
         t.pop("exchange_sl_sync_error", None)
         t.pop("exchange_sl_sync_error_ts", None)
+        t.pop("exchange_sl_sync_skipped_reason", None)
+        t.pop("exchange_sl_sync_skipped_ts", None)
         t["sl_sync_fail_count"] = 0
         # FIX 5: if old cancel failed, track the orphaned ID for periodic cleanup
         if not result.get("cancel_ok") and old_sl_id:
@@ -4899,6 +4925,23 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
                 channel="alerts",
             )
         return False
+
+
+def _exit_text_for_telegram(exit_type, rr_value):
+    if str(exit_type or "").upper() == "SL":
+        rr = _safe_numeric_value(rr_value)
+        if rr is not None and rr > 0:
+            return "Chốt lời bằng SL"
+        return "Cắt lỗ"
+    exit_map = {
+        "TP":                   "Chốt lời",
+        "TRAIL":                "Trailing",
+        "BE":                   "Hòa vốn",
+        "EARLY_GIVEBACK":       "Mất lợi nhuận",
+        "EARLY_STRUCT":         "Gãy cấu trúc",
+        "EARLY_MOMENTUM_WEAK":  "Momentum yếu",
+    }
+    return exit_map.get(exit_type, exit_type)
 
 
 def _cancel_live_remaining_stop(t: dict, live_executor, prefix=None) -> bool:
@@ -6161,7 +6204,7 @@ def update_trades(fast_mode=False, ctx=None):
                             # Returns True=synced, False=failed, None=no exchange (live
                             # should never return None; guard is defensive).
                             _lml_sync_result = _sync_testnet_trailing_sl(
-                                t, ctx, old_sl=_lml_current_sl
+                                t, ctx, old_sl=_lml_current_sl, current_price=p
                             )
 
                             if _lml_sync_result is True:
@@ -6370,7 +6413,9 @@ def update_trades(fast_mode=False, ctx=None):
 
             if t["sl"] != _sl_before_updates:
                 _sync_requested_ts = time.time() if _exec_mode == "live" else None
-                _sync_result = _sync_testnet_trailing_sl(t, ctx, old_sl=_sl_before_updates)
+                _sync_result = _sync_testnet_trailing_sl(
+                    t, ctx, old_sl=_sl_before_updates, current_price=p
+                )
                 _sync_finished_ts = time.time() if _sync_requested_ts is not None else None
                 _log_trade_management_freshness(
                     t, _exec_mode, "TRAIL_UPDATE", _update_started_ts,
@@ -6449,7 +6494,9 @@ def update_trades(fast_mode=False, ctx=None):
                 # floor (lock_done block).  Sync immediately so exchange stop never lags.
                 if t["sl"] != _sl_before_exit_opt:
                     _sync_requested_ts = time.time() if _exec_mode == "live" else None
-                    _sync_result = _sync_testnet_trailing_sl(t, ctx, old_sl=_sl_before_exit_opt)
+                    _sync_result = _sync_testnet_trailing_sl(
+                        t, ctx, old_sl=_sl_before_exit_opt, current_price=p
+                    )
                     _sync_finished_ts = time.time() if _sync_requested_ts is not None else None
                     _log_trade_management_freshness(
                         t, _exec_mode, "TRAIL_UPDATE", _update_started_ts,
@@ -6544,7 +6591,9 @@ def update_trades(fast_mode=False, ctx=None):
                         t["sl"] = swing
                         # FIX 3: sync first — persist only after confirmed, eliminating crash window
                         _sync_requested_ts = time.time() if _exec_mode == "live" else None
-                        _sync_ok = _sync_testnet_trailing_sl(t, ctx, old_sl=_old_trail_sl)
+                        _sync_ok = _sync_testnet_trailing_sl(
+                            t, ctx, old_sl=_old_trail_sl, current_price=p
+                        )
                         _sync_finished_ts = time.time() if _sync_requested_ts is not None else None
                         _log_trade_management_freshness(
                             t, _exec_mode, "TRAIL_UPDATE", _update_started_ts,
@@ -6597,7 +6646,9 @@ def update_trades(fast_mode=False, ctx=None):
                         t["sl"] = swing
                         # FIX 3: sync first — persist only after confirmed, eliminating crash window
                         _sync_requested_ts = time.time() if _exec_mode == "live" else None
-                        _sync_ok = _sync_testnet_trailing_sl(t, ctx, old_sl=_old_trail_sl)
+                        _sync_ok = _sync_testnet_trailing_sl(
+                            t, ctx, old_sl=_old_trail_sl, current_price=p
+                        )
                         _sync_finished_ts = time.time() if _sync_requested_ts is not None else None
                         _log_trade_management_freshness(
                             t, _exec_mode, "TRAIL_UPDATE", _update_started_ts,
@@ -7078,17 +7129,7 @@ def update_trades(fast_mode=False, ctx=None):
                     "LOSE": "❌",
                     "BE": "⚖️"
                 }.get(t["status"], "❓")
-                exit_map = {
-                    "TP":                   "Chốt lời",
-                    "SL":                   "Cắt lỗ",
-                    "TRAIL":                "Trailing",
-                    "BE":                   "Hòa vốn",
-                    "EARLY_GIVEBACK":       "Mất lợi nhuận",
-                    "EARLY_STRUCT":         "Gãy cấu trúc",
-                    "EARLY_MOMENTUM_WEAK":  "Momentum yếu",
-                }
-    
-                exit_text = exit_map.get(t.get("exit_type"), t.get("exit_type"))
+                exit_text = _exit_text_for_telegram(t.get("exit_type"), t.get("rr_real"))
     
                 exit_real = t["exit_price"]
                 max_r = round(t.get("max_profit_r", 0), 2)
