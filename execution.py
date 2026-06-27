@@ -4843,8 +4843,10 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
     _side_str = "BUY" if t["side"] == "LONG" else "SELL"
     new_sl = t["sl"]
     _old_sl_str = round(old_sl, 6) if old_sl is not None else "?"
+    _trail_label = "[LIVE TRAIL]" if ctx.execution_mode == "live" else "[TESTNET TRAIL]"
+    _critical_label = "[LIVE CRITICAL]" if ctx.execution_mode == "live" else "[TESTNET CRITICAL]"
     print(
-        f"[TESTNET TRAIL] {t['symbol']} Updating stop: "
+        f"{_trail_label} {t['symbol']} Updating stop: "
         f"{_old_sl_str} -> {round(new_sl, 6)}"
     )
     result = _tn.update_trailing_stop(
@@ -4858,29 +4860,44 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None):
         t["exchange_sl_id"] = result["new_order_id"]
         t["exchange_sl_price_confirmed"] = new_sl
         t.pop("exchange_sl_sync_pending", None)
+        t.pop("exchange_sl_sync_error", None)
+        t.pop("exchange_sl_sync_error_ts", None)
+        t["sl_sync_fail_count"] = 0
         # FIX 5: if old cancel failed, track the orphaned ID for periodic cleanup
         if not result.get("cancel_ok") and old_sl_id:
             _orphans = t.setdefault("orphan_stop_ids", [])
             if old_sl_id not in _orphans:
                 _orphans.append(old_sl_id)
         print(
-            f"[TESTNET TRAIL] {t['symbol']} New stop confirmed "
+            f"{_trail_label} {t['symbol']} New stop confirmed "
             f"orderId={result['new_order_id']} stopPrice={round(new_sl, 6)}"
         )
         return True
     else:
         # FIX 2b: record intended SL for audit resync
         t["exchange_sl_sync_pending"] = new_sl
+        t["exchange_sl_sync_error"] = result.get("error") or str(result)
+        t["exchange_sl_sync_error_ts"] = time.time()
+        t["sl_sync_fail_count"] = int(t.get("sl_sync_fail_count") or 0) + 1
         print(
-            f"[TESTNET CRITICAL] {t['symbol']} Stop update failed — "
+            f"{_critical_label} {t['symbol']} Stop update failed — "
             f"Old protection retained at {_old_sl_str}. error={result.get('error')}"
         )
         send_telegram(
-            f"[TESTNET CRITICAL] {t['symbol']} Stop update failed — "
+            f"{_critical_label} {t['symbol']} Stop update failed — "
             f"Old protection retained at {_old_sl_str}",
             prefix=ctx.mode_prefix,
             channel="alerts",
         )
+        if t["sl_sync_fail_count"] >= 3:
+            send_telegram(
+                f"{_critical_label} {t['symbol']} HIGH-SEVERITY stop update failure — "
+                f"old protection still retained; consecutive_failures={t['sl_sync_fail_count']} "
+                f"current_confirmed_sl={t.get('exchange_sl_price_confirmed')} "
+                f"pending_target_sl={new_sl}",
+                prefix=ctx.mode_prefix,
+                channel="alerts",
+            )
         return False
 
 
