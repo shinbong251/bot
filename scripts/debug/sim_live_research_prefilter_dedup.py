@@ -11,13 +11,31 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+def _install_execution_mode_stub():
+    mode_mod = types.ModuleType("execution_mode")
+    mode_mod.EXECUTION_MODE = "paper"
+    mode_mod.TRADES_CSV = "paper_trades.csv"
+    mode_mod.STATE_FILE = "paper_state.json"
+    mode_mod.MODE_PREFIX = "[SIM]"
+    mode_mod.validate_startup = lambda: None
+    sys.modules["execution_mode"] = mode_mod
+
+
 @dataclass
 class DummyCtx:
     execution_mode: str = "live"
     trades: list = field(default_factory=list)
 
 
-def _candidate(key, rr=2.25, score=7.0, symbol="BTCUSDT", side="LONG"):
+def _candidate(
+    key,
+    rr=2.25,
+    score=7.0,
+    symbol="BTCUSDT",
+    side="LONG",
+    bos_quality="STRONG",
+    volume_confirmation="NORMAL",
+):
     entry = 100.0
     sl = 90.0 if side == "LONG" else 110.0
     tp = 125.0 if side == "LONG" else 75.0
@@ -33,8 +51,8 @@ def _candidate(key, rr=2.25, score=7.0, symbol="BTCUSDT", side="LONG"):
         "source_timestamp": key,
         "structural_context": {
             "score_v2_structural_shadow": score,
-            "bos_quality": "STRONG",
-            "volume_confirmation": "NORMAL",
+            "bos_quality": bos_quality,
+            "volume_confirmation": volume_confirmation,
         },
     }
 
@@ -67,6 +85,7 @@ def _assert(label, condition, detail=""):
 
 
 def main():
+    _install_execution_mode_stub()
     import signal_dispatcher as sd
     from exchange import live_executor
 
@@ -117,27 +136,38 @@ def main():
         sd._live_smc_research_terminal_failures.clear()
         _run_dispatch(sd, [_candidate("low-score", rr=2.2, score=2.0)], logs, open_calls)
         results.append(_assert(
-            "low score logs PREFILTER_REJECT",
-            len(logs) == 1 and logs[0]["decision"] == "PREFILTER_REJECT" and logs[0]["reason"] == "low_score",
+            "low score research passes to OPEN_ATTEMPT",
+            any(row["decision"] == "OPEN_ATTEMPT" for row in logs) and len(open_calls) == 1,
             str(logs),
         ))
-        results.append(_assert("low score does not call open_trade", len(open_calls) == 0, f"calls={len(open_calls)}"))
+        results.append(_assert(
+            "low score research logs score bypass metadata",
+            any(
+                row.get("decision") == "OPEN_ATTEMPT"
+                and row.get("score_filter_bypassed_for_research") is True
+                and row.get("score_filter_original_threshold") == 7
+                and row.get("score_filter_actual_score") == 2.0
+                and row.get("paper_research_population_aligned") is True
+                for row in logs
+            ),
+            str(logs),
+        ))
 
         logs.clear()
         open_calls.clear()
         _run_dispatch(sd, [_candidate("low-score", rr=2.2, score=2.0)], logs, open_calls)
         results.append(_assert(
-            "same dedup_key + same reason suppressed",
+            "same accepted dedup_key is skipped after open",
             len(logs) == 0 and len(open_calls) == 0,
             f"logs={len(logs)} calls={len(open_calls)}",
         ))
 
         logs.clear()
         open_calls.clear()
-        _run_dispatch(sd, [_candidate("low-score", rr=1.5, score=7.0)], logs, open_calls)
+        _run_dispatch(sd, [_candidate("rr-low", rr=2.2, score=7.0, bos_quality="WEAK")], logs, open_calls)
         results.append(_assert(
-            "same dedup_key + different reason logs once",
-            len(logs) == 1 and logs[0]["reason"] == "rr_below_min",
+            "same rejected dedup_key + different reason logs once",
+            len(logs) == 1 and logs[0]["reason"] == "research_predicate_fail",
             str(logs),
         ))
 
@@ -145,10 +175,37 @@ def main():
         open_calls.clear()
         _run_dispatch(sd, [_candidate("new-key", rr=2.2, score=2.0)], logs, open_calls)
         results.append(_assert(
-            "new dedup_key logs normally",
-            len(logs) == 1 and logs[0]["reason"] == "low_score",
+            "new low score research key opens normally",
+            any(row["decision"] == "OPEN_ATTEMPT" for row in logs) and len(open_calls) == 1,
             str(logs),
         ))
+
+        logs.clear()
+        open_calls.clear()
+        sd._live_smc_research_terminal_failures.clear()
+        _run_dispatch(sd, [_candidate("weak-bos", rr=2.2, score=2.0, bos_quality="WEAK")], logs, open_calls)
+        results.append(_assert(
+            "weak BOS still rejects research predicate",
+            len(logs) == 1 and logs[0]["decision"] == "PREFILTER_REJECT" and logs[0]["reason"] == "research_predicate_fail",
+            str(logs),
+        ))
+        results.append(_assert("weak BOS does not call open_trade", len(open_calls) == 0, f"calls={len(open_calls)}"))
+
+        logs.clear()
+        open_calls.clear()
+        sd._live_smc_research_terminal_failures.clear()
+        _run_dispatch(
+            sd,
+            [_candidate("expansion-volume", rr=2.2, score=2.0, volume_confirmation="EXPANSION")],
+            logs,
+            open_calls,
+        )
+        results.append(_assert(
+            "volume EXPANSION still rejects research predicate",
+            len(logs) == 1 and logs[0]["decision"] == "PREFILTER_REJECT" and logs[0]["reason"] == "research_predicate_fail",
+            str(logs),
+        ))
+        results.append(_assert("volume EXPANSION does not call open_trade", len(open_calls) == 0, f"calls={len(open_calls)}"))
 
         logs.clear()
         open_calls.clear()

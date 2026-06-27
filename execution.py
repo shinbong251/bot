@@ -1386,6 +1386,16 @@ def _paper_smc_research_trade_matches(t):
     )
 
 
+def _live_smc_research_score_filter_bypass(t, exec_mode):
+    if not isinstance(t, dict):
+        return False
+    return (
+        exec_mode == "live"
+        and bool(config.get("live_smc_research_enabled", False))
+        and str(t.get("entry_type") or "").upper() == "CONFIRM_SMC_RESEARCH"
+    )
+
+
 def _paper_smc_research_key(t):
     key = str(t.get("research_dedup_key") or "").strip()
     if key:
@@ -3888,10 +3898,19 @@ def open_trade(t, ctx=None):
         and t.get("entry_type") == "CONFIRM_SMC_RESEARCH"
         and t.get("strategy_family") == "confirm_smc_research"
     )
+    _is_live_smc_research_score_bypass = _live_smc_research_score_filter_bypass(t, _exec_mode)
 
     if score < 7:
         if _is_paper_smc_research:
             t["risk_percent"] = base_risk * 0.5
+        elif _is_live_smc_research_score_bypass:
+            t["risk_percent"] = base_risk * 0.5
+            t["score_filter_bypassed_for_research"] = True
+            t["research_score"] = score
+            t["paper_predicate_aligned"] = True
+            t["score_filter_original_threshold"] = 7
+            t["score_filter_actual_score"] = score
+            t["paper_research_population_aligned"] = True
         else:
             print(f"[BLOCK] LOW_SCORE {symbol} score={round(score, 2)}")
             _record_open_failure(t, "score_filter", "low_score", score=score)

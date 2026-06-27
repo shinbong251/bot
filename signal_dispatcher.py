@@ -4731,6 +4731,35 @@ def _live_smc_research_min_open_score():
     return 7
 
 
+def _live_smc_research_score_alignment_extra(trade, paper_predicate_aligned=None):
+    trade = trade if isinstance(trade, dict) else {}
+    min_score = _live_smc_research_min_open_score()
+    try:
+        score_val = float(trade.get("score"))
+    except (TypeError, ValueError):
+        score_val = 0.0
+    if paper_predicate_aligned is None:
+        paper_predicate_aligned = bool(
+            trade.get("score_filter_bypassed_for_research")
+            and trade.get("paper_predicate_aligned")
+        )
+    if (
+        bool(config.get("live_smc_research_enabled", False))
+        and str(trade.get("entry_type") or "").upper() == "CONFIRM_SMC_RESEARCH"
+        and score_val < min_score
+        and paper_predicate_aligned
+    ):
+        return {
+            "score_filter_bypassed_for_research": True,
+            "research_score": score_val,
+            "paper_predicate_aligned": True,
+            "score_filter_original_threshold": min_score,
+            "score_filter_actual_score": score_val,
+            "paper_research_population_aligned": True,
+        }
+    return {}
+
+
 def _live_smc_research_json_safe(value):
     if isinstance(value, dict):
         return {str(k): _live_smc_research_json_safe(v) for k, v in value.items()}
@@ -4834,6 +4863,7 @@ def _live_smc_research_prefilter_extra(stage, reason, trade, ctx=None, detail=No
     }
     if detail:
         extra["prefilter_detail"] = str(detail)
+    extra.update(_live_smc_research_score_alignment_extra(trade))
     return _live_smc_research_json_safe(extra)
 
 
@@ -4985,8 +5015,6 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
     except (TypeError, ValueError):
         score_val = 0.0
     min_score = _live_smc_research_min_open_score()
-    if score_val < min_score:
-        return False, "score", "low_score", f"score={score_val} < {min_score}"
 
     bos_quality = str(trade.get("bos_quality") or "").upper()
     if bos_quality == "WEAK":
@@ -4994,6 +5022,9 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
     volume_confirmation = str(trade.get("volume_confirmation") or "").upper()
     if volume_confirmation == "EXPANSION":
         return False, "research_predicate", "research_predicate_fail", "volume_confirmation=EXPANSION"
+
+    if score_val < min_score:
+        trade.update(_live_smc_research_score_alignment_extra(trade, paper_predicate_aligned=True))
 
     try:
         from exchange import live_executor as _live_executor
@@ -5120,7 +5151,12 @@ def _dispatch_live_smc_research_lane(ctx):
         if active_failure:
             continue
 
-        _live_smc_research_log(candidate, "OPEN_ATTEMPT", trade=trade)
+        _live_smc_research_log(
+            candidate,
+            "OPEN_ATTEMPT",
+            trade=trade,
+            extra=_live_smc_research_score_alignment_extra(trade),
+        )
 
         trade_for_open = copy.deepcopy(trade)
         try:
