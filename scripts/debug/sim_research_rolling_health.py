@@ -147,6 +147,52 @@ def main():
             f"health={live_health} status={status} reasons={live_reasons} metrics={live_metrics}",
         ))
 
+        one_win_csv = [{
+            "id": "live-win-1",
+            "symbol": "0GUSDT",
+            "open_time": "10:01 27-06",
+            "close_time": "10:29 27-06",
+            "side": "SHORT",
+            "entry_type": "CONFIRM_SMC_RESEARCH",
+            "status": "WIN",
+            "rr": "0.59",
+            "signal_created_ts": "1782529242.5687084",
+        }]
+        csv_closes = rh.live_close_rows(decision_rows=[], live_trade_rows=one_win_csv)
+        live_health, live_reasons, live_metrics = rh.classify_live(
+            decision_rows=[],
+            min_lock_rows=[],
+            live_state=[],
+            live_trade_rows=one_win_csv,
+        )
+        results.append(_assert(
+            "live_trades.csv one WIN => live_health not UNKNOWN, loss_streak=0",
+            len(csv_closes) == 1
+            and csv_closes[0]["symbol"] == "0GUSDT"
+            and live_health in ("GREEN", "SMALL_SAMPLE_OK")
+            and live_metrics["live_closed_n"] == 1
+            and live_metrics["live_loss_streak"] == 0
+            and live_metrics["live_rolling_net_r"] > 0,
+            f"health={live_health} reasons={live_reasons} metrics={live_metrics} closes={csv_closes}",
+        ))
+
+        duplicate_decision = [{
+            "id": "live-win-1",
+            "symbol": "0GUSDT",
+            "side": "SHORT",
+            "entry_type": "CONFIRM_SMC_RESEARCH",
+            "status": "CLOSED",
+            "decision": "CLOSED",
+            "actual_realized_r": 0.59,
+            "ts": 1782529242.5687084,
+        }]
+        deduped = rh.live_close_rows(decision_rows=duplicate_decision, live_trade_rows=one_win_csv)
+        results.append(_assert(
+            "decision log close + live_trades same trade => no double count",
+            len(deduped) == 1 and deduped[0].get("_live_close_source") == "live_trades_csv",
+            f"deduped={deduped}",
+        ))
+
         status = rh.promotion_status("YELLOW", "GREEN", {"n": 50})
         results.append(_assert(
             "paper collection unaffected while YELLOW blocks only live scale",
@@ -259,10 +305,10 @@ def main():
         ok, reason, detail = sd._live_research_micro_pause_status(
             ctx=DummyCtx(),
             now_ts=now,
-            close_rows=[
-                {"actual_realized_r": -0.5},
-                {"actual_realized_r": -0.4},
-                {"actual_realized_r": -0.3},
+            live_trade_rows=[
+                {"id": "loss-1", "symbol": "AAAUSDT", "open_time": "1", "close_time": "2", "side": "LONG", "entry_type": "CONFIRM_SMC_RESEARCH", "status": "LOSS", "rr": "-0.5"},
+                {"id": "loss-2", "symbol": "BBBUSDT", "open_time": "3", "close_time": "4", "side": "LONG", "entry_type": "CONFIRM_SMC_RESEARCH", "status": "LOSS", "rr": "-0.4"},
+                {"id": "loss-3", "symbol": "CCCUSDT", "open_time": "5", "close_time": "6", "side": "LONG", "entry_type": "CONFIRM_SMC_RESEARCH", "status": "LOSS", "rr": "-0.3"},
             ],
             pause_rows=[],
             health_rows=[{"paper_health": "GREEN"}],

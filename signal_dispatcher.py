@@ -4775,6 +4775,7 @@ def _dispatch_paper_smc_research_lane(ctx):
 _LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisions.jsonl")
 _LIVE_RESEARCH_MICRO_PAUSE_LOG = os.path.join("logs", "live_research_micro_pause.jsonl")
 _RESEARCH_ROLLING_HEALTH_LOG = os.path.join("logs", "research_rolling_health.jsonl")
+_LIVE_TRADES_CSV = "live_trades.csv"
 _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS = 15 * 60
 _live_smc_research_terminal_failures = {}
 
@@ -4853,6 +4854,20 @@ def _live_research_micro_read_jsonl(path):
     return rows
 
 
+def _live_research_micro_read_csv(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            reader = _csv_mod.DictReader(handle)
+            for row in reader:
+                rows.append(dict(row))
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    return rows
+
+
 def _live_research_micro_write(row):
     try:
         os.makedirs(os.path.dirname(_LIVE_RESEARCH_MICRO_PAUSE_LOG), exist_ok=True)
@@ -4870,7 +4885,43 @@ def _live_research_micro_write(row):
         print(f"[LIVE RESEARCH MICRO PAUSE] log failed: {exc}")
 
 
-def _live_research_close_rows(decision_rows=None):
+def _live_research_close_dedup_key(row):
+    stable = row.get("id") or row.get("trade_id") or row.get("client_order_id") or row.get("clientOrderId")
+    if stable not in (None, ""):
+        return f"id:{stable}"
+    return "|".join(
+        str(row.get(field) or "")
+        for field in ("symbol", "entry_time", "open_time", "close_time", "side")
+    )
+
+
+def _live_research_csv_close_rows(live_trade_rows=None):
+    rows = live_trade_rows if live_trade_rows is not None else _live_research_micro_read_csv(_LIVE_TRADES_CSV)
+    out = []
+    for row in rows:
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        status = str(row.get("status") or "").upper()
+        if status not in ("WIN", "LOSS", "CLOSED", "BREAKEVEN") and not row.get("close_time"):
+            continue
+        realized = _live_research_micro_float(
+            row.get("actual_realized_r", row.get("realized_r", row.get("rr_real", row.get("rr"))))
+        )
+        if realized is None:
+            continue
+        item = dict(row)
+        item["actual_realized_r"] = realized
+        item["_live_close_source"] = "live_trades_csv"
+        item["_sort_ts"] = _live_research_micro_float(
+            row.get("close_ts", row.get("closed_at_unix", row.get("signal_created_ts"))),
+            0.0,
+        )
+        out.append(item)
+    out.sort(key=lambda row: row.get("_sort_ts", 0.0))
+    return out
+
+
+def _live_research_decision_close_rows(decision_rows=None):
     rows = decision_rows if decision_rows is not None else _live_research_micro_read_jsonl(
         _LIVE_SMC_RESEARCH_DECISION_LOG
     )
@@ -4892,6 +4943,7 @@ def _live_research_close_rows(decision_rows=None):
             continue
         item = dict(row)
         item["actual_realized_r"] = realized
+        item["_live_close_source"] = "live_smc_research_decisions"
         item["_sort_ts"] = _live_research_micro_float(
             row.get("ts", row.get("observed_at_unix", row.get("time"))),
             0.0,
@@ -4901,8 +4953,27 @@ def _live_research_close_rows(decision_rows=None):
     return out
 
 
-def _live_research_micro_metrics(close_rows=None):
-    rows = close_rows if close_rows is not None else _live_research_close_rows()
+def _live_research_close_rows(decision_rows=None, live_trade_rows=None):
+    decision_closes = _live_research_decision_close_rows(decision_rows)
+    csv_closes = _live_research_csv_close_rows(live_trade_rows)
+    merged = {}
+    for row in decision_closes + csv_closes:
+        key = _live_research_close_dedup_key(row)
+        if key not in merged:
+            merged[key] = row
+            continue
+        if merged[key].get("_live_close_source") != "live_trades_csv" and row.get("_live_close_source") == "live_trades_csv":
+            merged[key] = row
+    out = list(merged.values())
+    out.sort(key=lambda row: row.get("_sort_ts", 0.0))
+    return out
+
+
+def _live_research_micro_metrics(close_rows=None, decision_rows=None, live_trade_rows=None):
+    rows = close_rows if close_rows is not None else _live_research_close_rows(
+        decision_rows=decision_rows,
+        live_trade_rows=live_trade_rows,
+    )
     values = [
         _live_research_micro_float(row.get("actual_realized_r"))
         for row in rows
@@ -4971,11 +5042,12 @@ def _live_research_micro_pause_status(
     ctx=None,
     now_ts=None,
     close_rows=None,
+    live_trade_rows=None,
     pause_rows=None,
     health_rows=None,
 ):
     now_ts = time.time() if now_ts is None else now_ts
-    metrics = _live_research_micro_metrics(close_rows=close_rows)
+    metrics = _live_research_micro_metrics(close_rows=close_rows, live_trade_rows=live_trade_rows)
     pause_hours = _live_research_micro_float(
         config.get("live_research_micro_pause_hours", 3),
         3.0,

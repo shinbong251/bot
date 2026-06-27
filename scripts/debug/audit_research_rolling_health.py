@@ -4,6 +4,7 @@
 import json
 import math
 import time
+import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -16,6 +17,7 @@ PAPER_MIN_LOCK = LOG_DIR / "paper_smc_research_min_lock_shadow.jsonl"
 LIVE_DECISIONS = LOG_DIR / "live_smc_research_decisions.jsonl"
 LIVE_MIN_LOCK = LOG_DIR / "live_smc_research_min_lock_075_events.jsonl"
 LIVE_STATE = ROOT / "live_state.json"
+LIVE_TRADES = ROOT / "live_trades.csv"
 SUMMARY_LOG = LOG_DIR / "research_rolling_health.jsonl"
 CONFIG_JSON = ROOT / "config.json"
 
@@ -43,6 +45,13 @@ def read_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def read_csv(path):
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 def write_jsonl(path, row):
@@ -326,7 +335,38 @@ def classify_active_paper(active_rows, min_active_closed):
     return health, reasons, last20, last50
 
 
-def live_close_rows(decision_rows=None):
+def live_close_dedup_key(row):
+    stable = row.get("id") or row.get("trade_id") or row.get("client_order_id") or row.get("clientOrderId")
+    if stable not in (None, ""):
+        return f"id:{stable}"
+    return "|".join(
+        str(row.get(field) or "")
+        for field in ("symbol", "entry_time", "open_time", "close_time", "side")
+    )
+
+
+def live_csv_close_rows(live_trade_rows=None):
+    rows = live_trade_rows if live_trade_rows is not None else read_csv(LIVE_TRADES)
+    out = []
+    for row in rows:
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        status = str(row.get("status") or "").upper()
+        if status not in ("WIN", "LOSS", "CLOSED", "BREAKEVEN") and not row.get("close_time"):
+            continue
+        realized = fnum(row.get("actual_realized_r", row.get("realized_r", row.get("rr_real", row.get("rr")))))
+        if realized is None:
+            continue
+        item = dict(row)
+        item["actual_realized_r"] = realized
+        item["_live_close_source"] = "live_trades_csv"
+        item["_sort_ts"] = fnum(row.get("close_ts", row.get("closed_at_unix", row.get("signal_created_ts"))), 0.0) or 0.0
+        out.append(item)
+    out.sort(key=lambda item: item.get("_sort_ts", 0.0))
+    return out
+
+
+def live_decision_close_rows(decision_rows=None):
     rows = decision_rows if decision_rows is not None else read_jsonl(LIVE_DECISIONS)
     out = []
     for row in rows:
@@ -345,8 +385,26 @@ def live_close_rows(decision_rows=None):
         if "CLOSE" in decision or "CLOSED" in decision or status == "CLOSED" or row.get("close_reason"):
             item = dict(row)
             item["actual_realized_r"] = realized
+            item["_live_close_source"] = "live_smc_research_decisions"
+            item["_sort_ts"] = row_ts(row)
             out.append(item)
-    out.sort(key=row_ts)
+    out.sort(key=lambda item: item.get("_sort_ts", 0.0))
+    return out
+
+
+def live_close_rows(decision_rows=None, live_trade_rows=None):
+    decision_closes = live_decision_close_rows(decision_rows)
+    csv_closes = live_csv_close_rows(live_trade_rows)
+    merged = {}
+    for row in decision_closes + csv_closes:
+        key = live_close_dedup_key(row)
+        if key not in merged:
+            merged[key] = row
+            continue
+        if merged[key].get("_live_close_source") != "live_trades_csv" and row.get("_live_close_source") == "live_trades_csv":
+            merged[key] = row
+    out = list(merged.values())
+    out.sort(key=lambda item: item.get("_sort_ts", row_ts(item)))
     return out
 
 
@@ -395,16 +453,18 @@ def live_safety_issues(decision_rows=None, min_lock_rows=None, live_state=None):
     return sorted(set(warnings)), sorted(set(critical))
 
 
-def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_state=None):
-    closes = close_rows if close_rows is not None else live_close_rows(decision_rows)
+def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_state=None, live_trade_rows=None):
+    closes = close_rows if close_rows is not None else live_close_rows(decision_rows, live_trade_rows)
     warnings, critical = live_safety_issues(decision_rows, min_lock_rows, live_state=live_state)
     values = [fnum(row.get("actual_realized_r")) for row in closes]
     values = [value for value in values if value is not None]
     reasons = []
     if critical:
-        return "RED", critical, {"n": len(values), "net_r": round(sum(values), 4), "consecutive_losses": max_loss_streak(values)}
+        live_net = round(sum(values), 4)
+        streak = max_loss_streak(values)
+        return "RED", critical, {"n": len(values), "net_r": live_net, "consecutive_losses": streak, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": streak}
     if len(values) == 0:
-        return "UNKNOWN", ["live_no_closed_research_trades"] + warnings, {"n": 0, "net_r": 0.0, "consecutive_losses": 0}
+        return "UNKNOWN", ["live_no_closed_research_trades"] + warnings, {"n": 0, "net_r": 0.0, "consecutive_losses": 0, "live_closed_n": 0, "live_rolling_net_r": 0.0, "live_loss_streak": 0}
     live_net = round(sum(values), 4)
     consecutive_losses = 0
     for value in reversed(values):
@@ -413,16 +473,18 @@ def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_
         else:
             break
     if consecutive_losses >= 3:
-        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses}
+        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
     if live_net <= -2.0:
-        return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses}
+        return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
     if consecutive_losses in (1, 2):
         reasons.append(f"live_consecutive_losses={consecutive_losses}")
-    if warnings:
-        reasons.extend(warnings)
+    blocking_warnings = [warning for warning in warnings if warning != "SL_SYNC_OK"]
+    if blocking_warnings:
+        reasons.extend(blocking_warnings)
     if reasons:
-        return "YELLOW", reasons, {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses}
-    return "GREEN", ["live_closed_small_sample_no_critical_failure"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses}
+        return "YELLOW", reasons + [warning for warning in warnings if warning == "SL_SYNC_OK"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
+    green_reasons = ["live_closed_small_sample_no_critical_failure"] + [warning for warning in warnings if warning == "SL_SYNC_OK"]
+    return "GREEN", green_reasons, {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
 
 
 def promotion_status(paper_health, live_health, last50, active_n=None, min_active_closed=20):
@@ -530,6 +592,9 @@ def main():
     print(f"paper_health={row['paper_health']}")
     print(f"live_health={row['live_health']}")
     print(f"promotion_status={row['promotion_status']}")
+    print(f"live_closed_n={row['live_metrics'].get('live_closed_n', row['live_metrics'].get('n'))}")
+    print(f"live_loss_streak={row['live_metrics'].get('live_loss_streak', row['live_metrics'].get('consecutive_losses'))}")
+    print(f"live_rolling_net_r={row['live_metrics'].get('live_rolling_net_r', row['live_metrics'].get('net_r'))}")
     print(f"research_health_baseline_ts={row['research_health_baseline_ts']}")
     print(f"active_closed_count={row['active_closed_count']}")
     print(f"max_live_research_trades={row.get('max_live_research_trades')}")
