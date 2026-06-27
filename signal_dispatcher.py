@@ -4773,6 +4773,8 @@ def _dispatch_paper_smc_research_lane(ctx):
 # =====================================================================
 
 _LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisions.jsonl")
+_LIVE_RESEARCH_MICRO_PAUSE_LOG = os.path.join("logs", "live_research_micro_pause.jsonl")
+_RESEARCH_ROLLING_HEALTH_LOG = os.path.join("logs", "research_rolling_health.jsonl")
 _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS = 15 * 60
 _live_smc_research_terminal_failures = {}
 
@@ -4818,6 +4820,244 @@ def _live_smc_research_json_safe(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _live_research_micro_float(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        out = float(value)
+        if out != out:
+            return default
+        return out
+    except (TypeError, ValueError):
+        return default
+
+
+def _live_research_micro_read_jsonl(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    return rows
+
+
+def _live_research_micro_write(row):
+    try:
+        os.makedirs(os.path.dirname(_LIVE_RESEARCH_MICRO_PAUSE_LOG), exist_ok=True)
+        with open(_LIVE_RESEARCH_MICRO_PAUSE_LOG, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    _live_smc_research_json_safe(row),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+    except Exception as exc:
+        print(f"[LIVE RESEARCH MICRO PAUSE] log failed: {exc}")
+
+
+def _live_research_close_rows(decision_rows=None):
+    rows = decision_rows if decision_rows is not None else _live_research_micro_read_jsonl(
+        _LIVE_SMC_RESEARCH_DECISION_LOG
+    )
+    out = []
+    for row in rows:
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        decision = str(row.get("decision") or "").upper()
+        status = str(row.get("status") or "").upper()
+        realized = _live_research_micro_float(
+            row.get(
+                "actual_realized_r",
+                row.get("realized_r", row.get("rr_real", row.get("r_multiple"))),
+            )
+        )
+        if realized is None:
+            continue
+        if "CLOSE" not in decision and "CLOSED" not in decision and status != "CLOSED" and not row.get("close_reason"):
+            continue
+        item = dict(row)
+        item["actual_realized_r"] = realized
+        item["_sort_ts"] = _live_research_micro_float(
+            row.get("ts", row.get("observed_at_unix", row.get("time"))),
+            0.0,
+        )
+        out.append(item)
+    out.sort(key=lambda row: row.get("_sort_ts", 0.0))
+    return out
+
+
+def _live_research_micro_metrics(close_rows=None):
+    rows = close_rows if close_rows is not None else _live_research_close_rows()
+    values = [
+        _live_research_micro_float(row.get("actual_realized_r"))
+        for row in rows
+    ]
+    values = [value for value in values if value is not None]
+    loss_streak = 0
+    for value in reversed(values):
+        if value < 0:
+            loss_streak += 1
+        else:
+            break
+    rolling_values = values[-20:]
+    return {
+        "live_loss_streak": loss_streak,
+        "live_rolling_net_r": round(sum(rolling_values), 4) if rolling_values else 0.0,
+        "live_closed_count": len(values),
+    }
+
+
+def _live_research_micro_latest_pause(now_ts=None, pause_rows=None):
+    now_ts = time.time() if now_ts is None else now_ts
+    rows = pause_rows if pause_rows is not None else _live_research_micro_read_jsonl(
+        _LIVE_RESEARCH_MICRO_PAUSE_LOG
+    )
+    latest = None
+    for row in rows:
+        if str(row.get("event_type") or "") != "LIVE_RESEARCH_MICRO_PAUSE":
+            continue
+        pause_until = _live_research_micro_float(row.get("pause_until"))
+        if pause_until is None:
+            continue
+        if latest is None or _live_research_micro_float(row.get("ts"), 0.0) >= _live_research_micro_float(latest.get("ts"), 0.0):
+            latest = row
+    if latest is None:
+        return None, None
+    pause_until = _live_research_micro_float(latest.get("pause_until"))
+    if pause_until and pause_until > now_ts:
+        return latest, pause_until
+    return latest, None
+
+
+def _live_research_micro_latest_paper_health(health_rows=None):
+    rows = health_rows if health_rows is not None else _live_research_micro_read_jsonl(
+        _RESEARCH_ROLLING_HEALTH_LOG
+    )
+    for row in reversed(rows):
+        value = str(row.get("paper_active_health") or row.get("paper_health") or "").upper()
+        if value:
+            return value
+    return "UNKNOWN"
+
+
+def _live_research_has_unmanaged_research_position(ctx):
+    for trade in getattr(ctx, "trades", []) or []:
+        if trade.get("status", "OPEN") != "OPEN":
+            continue
+        if str(trade.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        owner = str(trade.get("owner") or "bot").lower()
+        if owner != "bot":
+            return True
+    return False
+
+
+def _live_research_micro_pause_status(
+    ctx=None,
+    now_ts=None,
+    close_rows=None,
+    pause_rows=None,
+    health_rows=None,
+):
+    now_ts = time.time() if now_ts is None else now_ts
+    metrics = _live_research_micro_metrics(close_rows=close_rows)
+    pause_hours = _live_research_micro_float(
+        config.get("live_research_micro_pause_hours", 3),
+        3.0,
+    )
+    pause_secs = max(0.0, pause_hours * 3600.0)
+    payload = {
+        "event_type": "LIVE_RESEARCH_MICRO_PAUSE",
+        "ts": now_ts,
+        "pause_until": None,
+        "pause_remaining_sec": 0,
+        "live_loss_streak": metrics.get("live_loss_streak", 0),
+        "live_rolling_net_r": metrics.get("live_rolling_net_r", 0.0),
+        "paper_health": _live_research_micro_latest_paper_health(health_rows=health_rows),
+        "action": "ALLOW",
+    }
+
+    if not bool(config.get("live_research_micro_pause_enabled", True)):
+        return True, "", payload
+
+    latest_pause, active_pause_until = _live_research_micro_latest_pause(
+        now_ts=now_ts,
+        pause_rows=pause_rows,
+    )
+    if active_pause_until:
+        payload.update({
+            "pause_reason": str(latest_pause.get("pause_reason") or "LIVE_MICRO_PAUSE_ACTIVE"),
+            "pause_until": active_pause_until,
+            "pause_remaining_sec": round(max(0.0, active_pause_until - now_ts), 3),
+            "live_loss_streak": _live_research_micro_float(
+                latest_pause.get("live_loss_streak"),
+                payload.get("live_loss_streak"),
+            ),
+            "live_rolling_net_r": _live_research_micro_float(
+                latest_pause.get("live_rolling_net_r"),
+                payload.get("live_rolling_net_r"),
+            ),
+            "action": "BLOCK",
+        })
+        _live_research_micro_write(payload)
+        return False, "live_micro_pause", payload
+
+    pause_reason = ""
+    streak_threshold = int(config.get("live_research_loss_streak_pause_count", 3) or 3)
+    rolling_threshold = _live_research_micro_float(
+        config.get("live_research_rolling_net_pause_r", -2.0),
+        -2.0,
+    )
+    if metrics.get("live_loss_streak", 0) >= streak_threshold:
+        pause_reason = "LIVE_MICRO_PAUSE_3_LOSS_STREAK"
+    elif metrics.get("live_rolling_net_r", 0.0) <= rolling_threshold:
+        pause_reason = "LIVE_MICRO_PAUSE_ROLLING_NET"
+
+    if pause_reason:
+        pause_until = now_ts + pause_secs
+        payload.update({
+            "pause_reason": pause_reason,
+            "pause_until": pause_until,
+            "pause_remaining_sec": round(pause_secs, 3),
+            "action": "SET_AND_BLOCK",
+        })
+        _live_research_micro_write(payload)
+        return False, "live_micro_pause", payload
+
+    if latest_pause is not None:
+        if _live_research_has_unmanaged_research_position(ctx):
+            payload.update({
+                "pause_reason": "LIVE_MICRO_PAUSE_UNMANAGED_LIVE_POSITION",
+                "pause_until": now_ts + pause_secs,
+                "pause_remaining_sec": round(pause_secs, 3),
+                "action": "EXTEND_AND_BLOCK",
+            })
+            _live_research_micro_write(payload)
+            return False, "live_micro_pause", payload
+        if payload.get("paper_health") == "RED":
+            payload.update({
+                "pause_reason": "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+                "action": "BLOCK",
+            })
+            _live_research_micro_write(payload)
+            return False, "LIVE_SCALE_BLOCKED_PAPER_HEALTH", payload
+
+    return True, "", payload
 
 
 def _live_smc_research_failure_extra(trade, exc=None):
@@ -4911,7 +5151,12 @@ def _live_smc_research_prefilter_extra(stage, reason, trade, ctx=None, detail=No
         "client_order_id": None,
         "exchange_order_id": None,
     }
-    if detail:
+    if isinstance(detail, dict):
+        extra.update({
+            key: _live_smc_research_json_safe(value)
+            for key, value in detail.items()
+        })
+    elif detail:
         extra["prefilter_detail"] = str(detail)
     extra.update(_live_smc_research_score_alignment_extra(trade))
     return _live_smc_research_json_safe(extra)
@@ -5075,6 +5320,10 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
 
     if score_val < min_score:
         trade.update(_live_smc_research_score_alignment_extra(trade, paper_predicate_aligned=True))
+
+    micro_ok, micro_reason, micro_detail = _live_research_micro_pause_status(ctx=ctx)
+    if not micro_ok:
+        return False, "live_micro_pause", micro_reason, micro_detail
 
     try:
         from exchange import live_executor as _live_executor
