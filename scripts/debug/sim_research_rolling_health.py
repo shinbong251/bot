@@ -176,6 +176,24 @@ def main():
             f"health={live_health} reasons={live_reasons} metrics={live_metrics} closes={csv_closes}",
         ))
 
+        live_health, live_reasons, live_metrics = rh.classify_live(
+            close_rows=[
+                {"ts": 1, "actual_realized_r": -1.0, "rr_unconfirmed": True},
+                {"ts": 2, "actual_realized_r": -1.0, "exit_unconfirmed": True},
+                {"ts": 3, "actual_realized_r": -1.0, "entry_unconfirmed": True},
+            ],
+            decision_rows=[],
+            min_lock_rows=[],
+        )
+        results.append(_assert(
+            "live unconfirmed RR excluded from rolling health",
+            live_health == "UNKNOWN"
+            and "live_no_confirmed_rr_trades" in live_reasons
+            and live_metrics["live_unconfirmed_rr_n"] == 3
+            and live_metrics["live_closed_n"] == 0,
+            f"health={live_health} reasons={live_reasons} metrics={live_metrics}",
+        ))
+
         duplicate_decision = [{
             "id": "live-win-1",
             "symbol": "0GUSDT",

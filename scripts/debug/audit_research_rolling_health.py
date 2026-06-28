@@ -456,15 +456,24 @@ def live_safety_issues(decision_rows=None, min_lock_rows=None, live_state=None):
 def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_state=None, live_trade_rows=None):
     closes = close_rows if close_rows is not None else live_close_rows(decision_rows, live_trade_rows)
     warnings, critical = live_safety_issues(decision_rows, min_lock_rows, live_state=live_state)
-    values = [fnum(row.get("actual_realized_r")) for row in closes]
+    unconfirmed_rows = [
+        row for row in closes
+        if str(row.get("rr_unconfirmed") or "").lower() in ("true", "1", "yes")
+        or str(row.get("entry_unconfirmed") or "").lower() in ("true", "1", "yes")
+        or str(row.get("exit_unconfirmed") or "").lower() in ("true", "1", "yes")
+    ]
+    confirmed_closes = [row for row in closes if row not in unconfirmed_rows]
+    values = [fnum(row.get("actual_realized_r")) for row in confirmed_closes]
     values = [value for value in values if value is not None]
     reasons = []
+    unconfirmed_n = len(unconfirmed_rows)
     if critical:
         live_net = round(sum(values), 4)
         streak = max_loss_streak(values)
-        return "RED", critical, {"n": len(values), "net_r": live_net, "consecutive_losses": streak, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": streak}
+        return "RED", critical, {"n": len(values), "net_r": live_net, "consecutive_losses": streak, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": streak, "live_unconfirmed_rr_n": unconfirmed_n}
     if len(values) == 0:
-        return "UNKNOWN", ["live_no_closed_research_trades"] + warnings, {"n": 0, "net_r": 0.0, "consecutive_losses": 0, "live_closed_n": 0, "live_rolling_net_r": 0.0, "live_loss_streak": 0}
+        reason = "live_no_confirmed_rr_trades" if unconfirmed_n else "live_no_closed_research_trades"
+        return "UNKNOWN", [reason] + warnings, {"n": 0, "net_r": 0.0, "consecutive_losses": 0, "live_closed_n": 0, "live_rolling_net_r": 0.0, "live_loss_streak": 0, "live_unconfirmed_rr_n": unconfirmed_n}
     live_net = round(sum(values), 4)
     consecutive_losses = 0
     for value in reversed(values):
@@ -473,18 +482,20 @@ def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_
         else:
             break
     if consecutive_losses >= 3:
-        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
+        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
     if live_net <= -2.0:
-        return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
+        return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
     if consecutive_losses in (1, 2):
         reasons.append(f"live_consecutive_losses={consecutive_losses}")
     blocking_warnings = [warning for warning in warnings if warning != "SL_SYNC_OK"]
     if blocking_warnings:
         reasons.extend(blocking_warnings)
     if reasons:
-        return "YELLOW", reasons + [warning for warning in warnings if warning == "SL_SYNC_OK"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
+        return "YELLOW", reasons + [warning for warning in warnings if warning == "SL_SYNC_OK"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
     green_reasons = ["live_closed_small_sample_no_critical_failure"] + [warning for warning in warnings if warning == "SL_SYNC_OK"]
-    return "GREEN", green_reasons, {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses}
+    if unconfirmed_n:
+        green_reasons.append(f"live_unconfirmed_rr_excluded={unconfirmed_n}")
+    return "GREEN", green_reasons, {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
 
 
 def promotion_status(paper_health, live_health, last50, active_n=None, min_active_closed=20):

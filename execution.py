@@ -159,6 +159,60 @@ def _tmf_current_r(t, close_price):
         return None
 
 
+def _live_management_max_price_age_ms():
+    try:
+        return float(config.get("live_management_max_price_age_ms", 180000))
+    except Exception:
+        return 180000.0
+
+
+def _live_management_decision_price_age_ms(price_meta, now_ts=None):
+    price_meta = price_meta if isinstance(price_meta, dict) else {}
+    for key in ("price_age_ms", "decision_price_age_ms"):
+        try:
+            value = price_meta.get(key)
+            if value is not None:
+                age = float(value)
+                if not math.isnan(age) and age >= 0:
+                    return age
+        except (TypeError, ValueError):
+            pass
+    try:
+        cache_age_secs = price_meta.get("cache_age_secs")
+        if cache_age_secs is not None:
+            age = float(cache_age_secs) * 1000.0
+            if not math.isnan(age) and age >= 0:
+                return age
+    except (TypeError, ValueError):
+        pass
+
+    now_ts = time.time() if now_ts is None else now_ts
+    for key in ("cache_ts", "candle_time", "candle_ts"):
+        try:
+            ts = price_meta.get(key)
+            if ts is None:
+                continue
+            ts = float(ts)
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            age = (now_ts - ts) * 1000.0
+            if not math.isnan(age) and age >= 0:
+                return age
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _live_confirm_smc_management_price_is_stale(price_meta, now_ts=None):
+    threshold_ms = _live_management_max_price_age_ms()
+    price_age_ms = _live_management_decision_price_age_ms(price_meta, now_ts=now_ts)
+    return (
+        price_age_ms is not None and price_age_ms > threshold_ms,
+        price_age_ms,
+        threshold_ms,
+    )
+
+
 def _tmf_cfg_bool(key, default=False):
     try:
         return bool(config.get(key, default))
@@ -365,7 +419,13 @@ def _tmf_build_row(
         "price_source": price_meta.get("price_source") or "unknown",
         "candle_time": price_meta.get("candle_time"),
         "cache_ts": cache_ts,
-        "price_age_ms": round((now_ts - cache_ts) * 1000, 3) if cache_ts else None,
+        "price_age_ms": (
+            price_meta.get("price_age_ms")
+            if price_meta.get("price_age_ms") is not None
+            else round((now_ts - cache_ts) * 1000, 3) if cache_ts else None
+        ),
+        "threshold_ms": price_meta.get("threshold_ms"),
+        "decision_price_age_ms": price_meta.get("decision_price_age_ms"),
         "cache_age_secs": price_meta.get("cache_age_secs"),
         "cache_max_age_secs": price_meta.get("cache_max_age_secs"),
         "close_price_used": close_price,
@@ -3302,6 +3362,165 @@ def _entry_result_from_live_query(order: dict, client_order_id: str) -> dict:
     }
 
 
+def _live_entry_fill_price_from_result(result: dict):
+    if not isinstance(result, dict):
+        return None
+    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+    for value in (
+        result.get("fill_price"),
+        result.get("avg_fill"),
+        result.get("avgPrice"),
+        raw.get("avgPrice"),
+        raw.get("averagePrice"),
+    ):
+        parsed = _safe_float_value(value, None)
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
+def _mark_live_entry_fill_confirmed(
+    t: dict,
+    entry_result: dict,
+    fill_price: float,
+    exchange_entry_source: str = "immediate_market_response",
+) -> None:
+    now = time.time()
+    t["exchange_fill_price"] = fill_price
+    t["exchange_entry_price"] = fill_price
+    t["exchange_entry_price_ts"] = now
+    t["exchange_entry_source"] = exchange_entry_source
+    t["entry_source"] = "actual_exchange_fill"
+    t["entry_price_unconfirmed"] = False
+    t["entry_real"] = fill_price
+    t["entry_state"] = "ENTRY_CONFIRMED"
+    t["exchange_order_state_unknown"] = False
+    if isinstance(entry_result, dict):
+        t["exchange_order_id"] = entry_result.get("order_id") or t.get("exchange_order_id")
+        t["exchange_client_id"] = entry_result.get("client_order_id") or t.get("exchange_client_id")
+        t["client_order_id"] = entry_result.get("client_order_id") or t.get("client_order_id")
+
+
+def _mark_live_entry_fill_unconfirmed(
+    t: dict,
+    entry_result: dict,
+    client_order_id: str,
+    reason: str = "entry_fill_unconfirmed",
+) -> None:
+    t["entry_state"] = "ENTRY_FILL_UNCONFIRMED"
+    t["entry_price_unconfirmed"] = True
+    t["entry_unconfirmed"] = True
+    t["exchange_order_state_unknown"] = True
+    t["entry_uncertain_reason"] = reason
+    t["entry_uncertain_ts"] = time.time()
+    t["exchange_entry_source"] = "unconfirmed_exchange_fill"
+    t["entry_source"] = "unconfirmed_exchange_fill"
+    t["exchange_fill_price"] = None
+    t["exchange_entry_price"] = None
+    t["entry_real"] = None
+    if isinstance(entry_result, dict):
+        t["exchange_order_id"] = entry_result.get("order_id") or t.get("exchange_order_id")
+        t["exchange_client_id"] = entry_result.get("client_order_id") or client_order_id
+        t["client_order_id"] = entry_result.get("client_order_id") or client_order_id
+    elif client_order_id:
+        t["exchange_client_id"] = client_order_id
+        t["client_order_id"] = client_order_id
+
+
+def _query_live_entry_order_once(live_executor, symbol: str, order_id=None, client_order_id=None):
+    query_order = getattr(live_executor, "query_order", None)
+    if query_order is None:
+        return None
+    try:
+        if order_id:
+            return query_order(symbol, order_id=order_id, return_not_found=True)
+        return query_order(symbol, client_order_id=client_order_id, return_not_found=True)
+    except TypeError:
+        if order_id:
+            return query_order(symbol, order_id=order_id)
+        return query_order(symbol, client_order_id=client_order_id)
+    except Exception as exc:
+        print(f"[LIVE ENTRY FILL QUERY] {symbol} query exception={type(exc).__name__}")
+        return None
+
+
+def _confirm_live_entry_fill_price(t: dict, entry_result: dict, live_executor, prefix=None) -> dict:
+    symbol = t.get("symbol", "UNKNOWN")
+    client_order_id = (
+        (entry_result or {}).get("client_order_id")
+        or t.get("client_order_id")
+        or t.get("exchange_client_id")
+    )
+    fill_price = _live_entry_fill_price_from_result(entry_result)
+    if fill_price is not None:
+        _mark_live_entry_fill_confirmed(
+            t,
+            entry_result,
+            fill_price,
+            exchange_entry_source="immediate_market_response",
+        )
+        return {"confirmed": True, "entry_result": entry_result, "fill_price": fill_price, "source": "immediate_market_response"}
+
+    query_order = getattr(live_executor, "query_order", None)
+    if query_order is None:
+        _mark_live_entry_fill_unconfirmed(t, entry_result, client_order_id, "query_order_unavailable")
+        return {"confirmed": False, "reason": "query_order_unavailable"}
+
+    order_id = (entry_result or {}).get("order_id") or t.get("exchange_order_id")
+    delays = (0.0, 0.25, 0.75)
+    last_reason = "query_order_no_fill_price"
+    queried_order = None
+    for delay in delays:
+        if delay > 0:
+            time.sleep(delay)
+        queried_order = _query_live_entry_order_once(
+            live_executor,
+            symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        if isinstance(queried_order, dict) and queried_order.get("_query_not_found"):
+            last_reason = "query_order_not_found"
+            break
+        if not isinstance(queried_order, dict):
+            last_reason = "query_order_ambiguous"
+            continue
+        if not _live_order_status_is_filled(queried_order):
+            last_reason = f"query_status_{queried_order.get('status', '?')}"
+            continue
+        queried_result = _entry_result_from_live_query(queried_order, client_order_id)
+        fill_price = _live_entry_fill_price_from_result(queried_result)
+        if fill_price is not None:
+            _mark_live_entry_fill_confirmed(
+                t,
+                queried_result,
+                fill_price,
+                exchange_entry_source="query_order_after_market_fill",
+            )
+            print(
+                f"[LIVE ENTRY FILL CONFIRMED] {symbol} actual_fill={fill_price} "
+                f"source=query_order clientOrderId={client_order_id}"
+            )
+            return {"confirmed": True, "entry_result": queried_result, "fill_price": fill_price, "source": "query_order_after_market_fill"}
+        last_reason = "query_order_filled_without_avg_price"
+
+    _mark_live_entry_fill_unconfirmed(t, entry_result, client_order_id, last_reason)
+    print(
+        f"[LIVE SAFETY BLOCK] {symbol} ENTRY_FILL_UNCONFIRMED "
+        f"reason={last_reason} clientOrderId={client_order_id}"
+    )
+    send_telegram(
+        f"[LIVE SAFETY BLOCK] {symbol}\n"
+        "ENTRY_FILL_UNCONFIRMED\n"
+        f"clientOrderId={client_order_id}\n"
+        f"reason={last_reason}\n"
+        "Action: not ENTRY_CONFIRMED; no planned-entry management",
+        prefix=prefix,
+        channel="alerts",
+    )
+    return {"confirmed": False, "reason": last_reason}
+
+
 def _resolve_live_uncertain_entry(t: dict, live_executor, prefix=None) -> dict:
     symbol = t.get("symbol", "UNKNOWN")
     client_order_id = t.get("client_order_id") or t.get("exchange_client_id")
@@ -3707,6 +3926,9 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
     t["close_time"] = now
     t["exit_price"] = exit_price
     t["exit_price_source"] = exit_price_source
+    t["entry_unconfirmed"] = bool(t.get("entry_price_unconfirmed"))
+    t["exit_unconfirmed"] = exit_price_source != "exchange_fill"
+    t["rr_unconfirmed"] = bool(t.get("entry_unconfirmed") or t.get("exit_unconfirmed"))
     t["sl_audit_closed"] = True
     t["sl_audit_close_source"] = source
 
@@ -3783,6 +4005,7 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
             f"Exit: {fmt_price(exit_price, symbol)}\n"
             f"RR: {t.get('rr_real', 0)}R\n"
             f"Source: {exit_price_source} | Reason: {source}"
+            f"{chr(10) + 'RR estimate / fill unconfirmed' if t.get('rr_unconfirmed') else ''}"
         )
         try:
             send_telegram(msg, prefix=ctx.mode_prefix)
@@ -4763,10 +4986,28 @@ def open_trade(t, ctx=None):
                     )
                     return False
 
-                t["exchange_qty"] = _entry_result.get("fill_qty") or _prep["qty"]
                 if _exec_mode == "live":
-                    t["entry_state"] = "ENTRY_CONFIRMED"
-                    t["exchange_order_state_unknown"] = False
+                    _fill_confirmation = _confirm_live_entry_fill_price(
+                        t,
+                        _entry_result,
+                        _tn,
+                        prefix=_mode_prefix,
+                    )
+                    if not _fill_confirmation.get("confirmed"):
+                        save_open_trades(_trades, _state_file)
+                        _record_open_failure(
+                            t,
+                            "entry_fill_unconfirmed",
+                            _fill_confirmation.get("reason", "entry_fill_unconfirmed"),
+                            exchange_response=_entry_result,
+                            client_order_id=_entry_result.get("client_order_id") or _entry_client_order_id,
+                            **_execution_plan_failure_details(_prep),
+                        )
+                        return True
+                    _entry_result = _fill_confirmation.get("entry_result") or _entry_result
+                    t["exchange_qty"] = _entry_result.get("fill_qty") or _prep["qty"]
+                else:
+                    t["exchange_qty"] = _entry_result.get("fill_qty") or _prep["qty"]
 
                 # â”€â”€ BOT OWNERSHIP CONFIRMATION (exchange-level proof) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Persist the BOT_-prefixed clientOrderId returned by the exchange fill
@@ -5883,6 +6124,26 @@ def update_trades(fast_mode=False, ctx=None):
                 continue
 
             if _exec_mode == "live":
+                if (
+                    t.get("entry_price_unconfirmed")
+                    or t.get("entry_state") == "ENTRY_FILL_UNCONFIRMED"
+                    or (t.get("entry_real") in (None, "") and not t.get("exchange_fill_price"))
+                ):
+                    if not t.get("_entry_fill_unconfirmed_manage_warned"):
+                        print(
+                            f"[LIVE SAFETY BLOCK] {t.get('symbol', 'UNKNOWN')} "
+                            "ENTRY_FILL_UNCONFIRMED - normal BE/MIN_LOCK/trailing skipped"
+                        )
+                        send_telegram(
+                            f"[LIVE SAFETY BLOCK] {t.get('symbol', 'UNKNOWN')}\n"
+                            "ENTRY_FILL_UNCONFIRMED\n"
+                            "Normal BE/MIN_LOCK/trailing skipped until exchange fill is confirmed",
+                            prefix=_mode_prefix,
+                            channel="alerts",
+                        )
+                        t["_entry_fill_unconfirmed_manage_warned"] = True
+                        save_open_trades(_trades, _state_file)
+                    continue
                 if _missing_exchange_qty(t) and not t.get("exchange_close_confirmed"):
                     _sym_q = t.get("symbol", "UNKNOWN")
                     _side_q = t.get("side", "")
@@ -6034,7 +6295,36 @@ def update_trades(fast_mode=False, ctx=None):
                 continue
 
             _price_meta_5m["candle_time"] = _tmf_candle_time(df)
-    
+            if _exec_mode == "live" and _paper_smc_research_trade_matches(t):
+                (
+                    _live_mgmt_price_stale,
+                    _live_mgmt_price_age_ms,
+                    _live_mgmt_threshold_ms,
+                ) = _live_confirm_smc_management_price_is_stale(_price_meta_5m)
+                if _live_mgmt_price_stale:
+                    _price_meta_stale_guard = dict(_price_meta_5m)
+                    _price_meta_stale_guard["price_age_ms"] = _live_mgmt_price_age_ms
+                    _price_meta_stale_guard["decision_price_age_ms"] = _live_mgmt_price_age_ms
+                    _price_meta_stale_guard["threshold_ms"] = _live_mgmt_threshold_ms
+                    _log_trade_management_freshness(
+                        t,
+                        _exec_mode,
+                        "SKIP_STALE_CANDLE_FOR_LIVE_MANAGEMENT",
+                        _update_started_ts,
+                        price_meta=_price_meta_stale_guard,
+                        reason="SKIP_STALE_CANDLE_FOR_LIVE_MANAGEMENT",
+                        skip_reason="stale_candle_skip",
+                    )
+                    if not t.get("_live_stale_management_warned"):
+                        print(
+                            f"[LIVE MANAGEMENT SKIP] {symbol} "
+                            f"stale candle price_age_ms={round(_live_mgmt_price_age_ms, 3)} "
+                            f"threshold_ms={round(_live_mgmt_threshold_ms, 3)}"
+                        )
+                        t["_live_stale_management_warned"] = True
+                        save_open_trades(_trades, _state_file)
+                    continue
+
             high = df["high"].iloc[-1]
             low = df["low"].iloc[-1]
             p = df["close"].iloc[-1]
@@ -6116,7 +6406,8 @@ def update_trades(fast_mode=False, ctx=None):
                 t["max_r_after_partial"] = max(t.get("max_r_after_partial", 0), r_now)
 
             _sl_before_updates = t["sl"]
-    
+            _be_sl_changed_this_loop = False
+
             # ===== PRE-1R MOMENTUM LOCK (P6) =====
             if not t.get("pre1r_lock_done") and not t.get("partial_done") and not t.get("be_07_done"):
                 _r_now = t.get("max_profit_r", 0)
@@ -6130,6 +6421,7 @@ def update_trades(fast_mode=False, ctx=None):
                         if _new_sl > t["sl"]:
                             _decision_sl_before = t["sl"]
                             t["sl"] = _new_sl
+                            _be_sl_changed_this_loop = True
                             print(f"[PRE1R LOCK] {symbol} weakening at {round(_r_now,2)}R SL → +0.3R {round(t['sl'],6)}")
                             _log_trade_management_freshness(
                                 t, _exec_mode, "MOMENTUM_LOCK", _update_started_ts,
@@ -6149,6 +6441,7 @@ def update_trades(fast_mode=False, ctx=None):
                         if _new_sl < t["sl"]:
                             _decision_sl_before = t["sl"]
                             t["sl"] = _new_sl
+                            _be_sl_changed_this_loop = True
                             print(f"[PRE1R LOCK] {symbol} weakening at {round(_r_now,2)}R SL → +0.3R {round(t['sl'],6)}")
                             _log_trade_management_freshness(
                                 t, _exec_mode, "MOMENTUM_LOCK", _update_started_ts,
@@ -6174,6 +6467,7 @@ def update_trades(fast_mode=False, ctx=None):
                         if new_sl > t["sl"]:
                             _decision_sl_before = t["sl"]
                             t["sl"] = new_sl
+                            _be_sl_changed_this_loop = True
                             print(f"[BE] moved to breakeven at 0.7R {t['symbol']}")
                             _log_trade_management_freshness(
                                 t, _exec_mode, "PROFIT_LOCK", _update_started_ts,
@@ -6193,6 +6487,7 @@ def update_trades(fast_mode=False, ctx=None):
                         if new_sl < t["sl"]:
                             _decision_sl_before = t["sl"]
                             t["sl"] = new_sl
+                            _be_sl_changed_this_loop = True
                             print(f"[BE] moved to breakeven at 0.7R {t['symbol']}")
                             _log_trade_management_freshness(
                                 t, _exec_mode, "PROFIT_LOCK", _update_started_ts,
@@ -6220,6 +6515,7 @@ def update_trades(fast_mode=False, ctx=None):
                             if entry > t["sl"]:
                                 _decision_sl_before = t["sl"]
                                 t["sl"] = entry
+                                _be_sl_changed_this_loop = True
                                 print(f"[BE PROTECT] {symbol} {round(t['max_profit_r'], 2)}R reached Momentum weakening SL → BE")
                                 _log_trade_management_freshness(
                                     t, _exec_mode, "MOMENTUM_LOCK", _update_started_ts,
@@ -6239,6 +6535,7 @@ def update_trades(fast_mode=False, ctx=None):
                             if entry < t["sl"]:
                                 _decision_sl_before = t["sl"]
                                 t["sl"] = entry
+                                _be_sl_changed_this_loop = True
                                 print(f"[BE PROTECT] {symbol} {round(t['max_profit_r'], 2)}R reached Momentum weakening SL → BE")
                                 _log_trade_management_freshness(
                                     t, _exec_mode, "MOMENTUM_LOCK", _update_started_ts,
@@ -6330,6 +6627,7 @@ def update_trades(fast_mode=False, ctx=None):
                     and config.get("live_smc_research_enabled", False)
                     and _paper_smc_research_trade_matches(t)
                     and not t.get("min_lock_075_done")
+                    and not _be_sl_changed_this_loop
                     and float(t.get("max_profit_r", 0)) >= 0.75
                 ):
                     _lml_entry_real = t.get("entry_real") or t.get("entry")
@@ -6351,21 +6649,46 @@ def update_trades(fast_mode=False, ctx=None):
                                 )
                                 _lml_should_move = _lml_floor < _lml_current_sl
 
-                            if _lml_should_move:
-                                t["sl"] = _lml_floor
-
                             _lml_r_now = (
                                 (p - float(_lml_entry_real)) / _lml_initial_risk
                                 if t["side"] == "LONG"
                                 else (float(_lml_entry_real) - p) / _lml_initial_risk
                             )
 
-                            # Attempt exchange SL sync — same mechanism as trailing stop.
-                            # Returns True=synced, False=failed, None=no exchange (live
-                            # should never return None; guard is defensive).
-                            _lml_sync_result = _sync_testnet_trailing_sl(
-                                t, ctx, old_sl=_lml_current_sl, current_price=p
+                            _lml_immediately_triggerable = (
+                                (t["side"] == "LONG" and float(p) <= float(_lml_floor))
+                                or (t["side"] == "SHORT" and float(p) >= float(_lml_floor))
                             )
+
+                            _lml_log_event = None
+                            if _lml_should_move and _lml_immediately_triggerable:
+                                _lml_sync_result = False
+                                _lml_log_event = "MIN_LOCK_075_LIVE_IMMEDIATE_TRIGGER_GUARD"
+                                t["min_lock_skipped_reason"] = "immediately_triggerable_before_local_sl_mutation"
+                                t["min_lock_skipped_ts"] = time.time()
+                                t["exchange_sl_sync_pending"] = _lml_floor
+                                _management_send(
+                                    f"[LIVE_MIN_LOCK_075] {t.get('symbol')} skipped\n"
+                                    "reason=immediately_triggerable_before_local_sl_mutation",
+                                    "min_lock_075_skipped",
+                                    category="profit_lock",
+                                    old_sl=_lml_current_sl,
+                                    new_sl=_lml_current_sl,
+                                    proposed_sl=_lml_floor,
+                                    min_lock_skipped_reason=t["min_lock_skipped_reason"],
+                                )
+                            elif _lml_should_move:
+                                t["sl"] = _lml_floor
+                                # Attempt exchange SL sync — same mechanism as trailing stop.
+                                # Returns True=synced, False=failed, None=no exchange (live
+                                # should never return None; guard is defensive).
+                                _lml_sync_result = _sync_testnet_trailing_sl(
+                                    t, ctx, old_sl=_lml_current_sl, current_price=p
+                                )
+                                if _lml_sync_result is not True:
+                                    t["sl"] = _lml_current_sl
+                            else:
+                                _lml_sync_result = True
 
                             if _lml_sync_result is True:
                                 _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_OK"
@@ -6373,7 +6696,8 @@ def update_trades(fast_mode=False, ctx=None):
                             elif _lml_sync_result is False:
                                 # Do NOT mark done — exchange still has old SL.
                                 # Will retry next scan; exchange_sl_sync_pending is set.
-                                _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_FAILED"
+                                if _lml_log_event is None:
+                                    _lml_log_event = "MIN_LOCK_075_LIVE_SYNC_FAILED"
                             else:
                                 # None in live = sync anchor missing (no exchange_sl_id
                                 # or exchange_qty). Treat as SYNC_FAILED: do NOT mark
@@ -6399,7 +6723,9 @@ def update_trades(fast_mode=False, ctx=None):
                                     "initial_risk": _lml_initial_risk,
                                     "old_sl": _lml_current_sl,
                                     "new_sl": t["sl"],
+                                    "proposed_sl": _lml_floor,
                                     "sl_moved": _lml_should_move,
+                                    "min_lock_skipped_reason": t.get("min_lock_skipped_reason", ""),
                                     "current_r": round(_lml_r_now, 4),
                                     "mfe_r": t.get("max_profit_r"),
                                     "sync_result": str(_lml_sync_result),
@@ -6427,6 +6753,18 @@ def update_trades(fast_mode=False, ctx=None):
                                     f"[LIVE_MIN_LOCK_075] {t.get('symbol')} "
                                     f"{t.get('side')} SL sync FAILED — will retry next scan"
                                 )
+                elif (
+                    _exec_mode == "live"
+                    and config.get("live_smc_research_enabled", False)
+                    and _paper_smc_research_trade_matches(t)
+                    and not t.get("min_lock_075_done")
+                    and _be_sl_changed_this_loop
+                    and float(t.get("max_profit_r", 0)) >= 0.75
+                ):
+                    print(
+                        f"[LIVE_MIN_LOCK_075] {t.get('symbol')} skipped same loop "
+                        "after BE/local SL mutation"
+                    )
             except Exception as _lml_ex:
                 print(f"[WARN] LIVE_MIN_LOCK_075 block failed: {_lml_ex}")
 
@@ -6441,6 +6779,7 @@ def update_trades(fast_mode=False, ctx=None):
                     t["trail_started"] = True
                     t["sl"] = max(t["sl"], entry + 0.1 * risk)
                     _be_just_set = True
+                    _be_sl_changed_this_loop = True
                     save_open_trades(_trades, _state_file)
                     print(f"[BE TRIGGER] {t['symbol']} LONG SL → {round(t['sl'], 6)} (entry+0.1R buffer)")
                     _log_trade_management_freshness(
@@ -6467,6 +6806,7 @@ def update_trades(fast_mode=False, ctx=None):
                     t["trail_started"] = True
                     t["sl"] = min(t["sl"], entry - 0.1 * risk)
                     _be_just_set = True
+                    _be_sl_changed_this_loop = True
                     save_open_trades(_trades, _state_file)
                     print(f"[BE TRIGGER] {t['symbol']} SHORT SL → {round(t['sl'], 6)} (entry-0.1R buffer)")
                     _log_trade_management_freshness(
@@ -6856,7 +7196,11 @@ def update_trades(fast_mode=False, ctx=None):
                 else:
                     hit_tp = False if _tp_val is None else low  <= _tp_val
                     hit_sl = p    >= t["sl"]
-    
+                if _exec_mode == "live" and _be_sl_changed_this_loop and hit_sl:
+                    t["same_loop_sl_hit_skipped_reason"] = "be_sl_changed_this_loop"
+                    t["same_loop_sl_hit_skipped_ts"] = time.time()
+                    hit_sl = False
+
                 # ===== BOTH HIT =====
                 if hit_tp and hit_sl:
                     t["both_hit"] = True
@@ -7104,11 +7448,24 @@ def update_trades(fast_mode=False, ctx=None):
                         t["exit_type"] = ""
                         save_open_trades(_trades, _state_file)
                         continue
+                    _exchange_exit = _safe_numeric_value(
+                        t.get("exchange_exit_price") or t.get("exchange_close_price")
+                    )
+                    if _exchange_exit is not None and _exchange_exit > 0:
+                        t["exit_price"] = _exchange_exit
+                        t["exit_price_source"] = "exchange_fill"
+                        t["exit_unconfirmed"] = False
+                    else:
+                        t.setdefault("exit_price_source", "local_estimate")
+                        t["exit_unconfirmed"] = True
                     save_open_trades(_trades, _state_file)
                     t["status"] = _local_status
                     t["exit_type"] = _local_exit_type
                     t.pop("pending_exit_status", None)
                     t.pop("pending_exit_type", None)
+                else:
+                    t.setdefault("exit_price_source", "paper_model")
+                    t["exit_unconfirmed"] = False
                 t["close_time"] = time.time()
                 if _exec_mode == "paper" and t.get("exit_type") == "SL":
                     t["sl_before_0_5r"] = not bool(t.get("reached_0_5r"))
@@ -7131,6 +7488,13 @@ def update_trades(fast_mode=False, ctx=None):
                 entry = t.get("entry_real") or t.get("entry")
                 exit_real = t["exit_price"]
                 sl_init_val = t["sl_init"]
+                if _exec_mode == "live":
+                    t["entry_unconfirmed"] = bool(t.get("entry_price_unconfirmed"))
+                    t["exit_unconfirmed"] = bool(
+                        t.get("exit_unconfirmed")
+                        or t.get("exit_price_source") not in ("exchange_fill",)
+                    )
+                    t["rr_unconfirmed"] = bool(t.get("entry_unconfirmed") or t.get("exit_unconfirmed"))
                 if sl_init_val is None or math.isnan(sl_init_val):
                     t["rr_real"] = 0
                     t["status"]  = "BE"
@@ -7309,7 +7673,8 @@ def update_trades(fast_mode=False, ctx=None):
                 risk_amt = balance_entry * t.get("risk_percent", RISK_PER_TRADE)
                 pnl_str = fmt_pnl(t["rr_real"], risk_amt)
                 max_r = round(t.get("max_profit_r", 0), 2)
-    
+                _rr_note = "\nRR estimate / fill unconfirmed" if t.get("rr_unconfirmed") else ""
+
                 if ctx is not None and ctx.execution_mode == "testnet":
                     _tn_icon = "✅" if t["rr_real"] >= 0 else "❌"
                     _rr_sign = "+" if t["rr_real"] >= 0 else ""
@@ -7337,7 +7702,7 @@ def update_trades(fast_mode=False, ctx=None):
                             f"{t['symbol']} {t.get('side', '')} | {exit_text}\n"
                             f"E: {fmt_price(entry_real, t['symbol'])} → X: {fmt_price(exit_real, t['symbol'])}\n"
                             f"PnL: {pnl_str}\n"
-                            f"{_ana_line}\n"
+                            f"{_ana_line}{_rr_note}\n"
                             f"{balance_line} | {format_vn_time(time.time())}"
                         )
                     else:
@@ -7345,7 +7710,7 @@ def update_trades(fast_mode=False, ctx=None):
                             f"{status_icon} {t['symbol']} | {exit_text}\n"
                             f"E: {fmt_price(entry_real, t['symbol'])} → X: {fmt_price(exit_real, t['symbol'])}\n"
                             f"PnL: {pnl_str}\n"
-                            f"{_ana_line}\n"
+                            f"{_ana_line}{_rr_note}\n"
                             f"{balance_line} | {format_vn_time(time.time())}"
                         )
 

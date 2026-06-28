@@ -34,6 +34,7 @@ TRADE_CSV_HEADERS = [
     "giveback_r","trade_age_minutes","time_to_1r",
     "time_spent_above_1r","trailing_phase_at_exit","max_r_after_partial",
     "signal_created_ts",
+    "exchange_fill_price","entry_source","entry_price_unconfirmed","rr_unconfirmed",
 ]
 
 def log_path(filename):
@@ -447,10 +448,38 @@ def normalize_trade_schema(t):
     t.setdefault("close_reason", "")
     t.setdefault("exit_price", 0)
     t.setdefault("rr_real", 0)
+    is_live_trade = str(t.get("execution_mode", "")).lower() == "live"
+    exchange_fill_price = None
+    try:
+        raw_exchange_fill = t.get("exchange_fill_price") or t.get("exchange_entry_price")
+        if raw_exchange_fill is not None:
+            exchange_fill_price = float(raw_exchange_fill)
+            if np.isnan(exchange_fill_price) or exchange_fill_price <= 0:
+                exchange_fill_price = None
+    except (TypeError, ValueError):
+        exchange_fill_price = None
+
     if "entry_real" not in t:
-        t["entry_real"] = t.get("entry", 0)
+        if is_live_trade and exchange_fill_price is None:
+            t["entry_real"] = None
+            t["entry_price_unconfirmed"] = True
+            t.setdefault("entry_source", "unconfirmed_exchange_fill")
+        elif is_live_trade and exchange_fill_price is not None:
+            t["entry_real"] = exchange_fill_price
+            t["entry_price_unconfirmed"] = False
+            t.setdefault("entry_source", "actual_exchange_fill")
+        else:
+            t["entry_real"] = t.get("entry", 0)
     if "entry" not in t:
         t["entry"] = t.get("entry_real", 0)
+    if is_live_trade:
+        if exchange_fill_price is None:
+            t["entry_price_unconfirmed"] = True
+            t["entry_source"] = "unconfirmed_exchange_fill"
+        elif exchange_fill_price is not None:
+            t["entry_real"] = exchange_fill_price
+            t["entry_price_unconfirmed"] = False
+            t["entry_source"] = "actual_exchange_fill"
     t.setdefault("phase2_sent", False)
     t.setdefault("phase3_sent", False)
     t.setdefault("max_profit_r", 0)
@@ -690,6 +719,10 @@ def save_trade(t, trades_csv=None):
             "trailing_phase_at_exit": t.get("trailing_phase_at_exit", ""),
             "max_r_after_partial": t.get("max_r_after_partial", ""),
             "signal_created_ts": t.get("signal_created_ts", ""),
+            "exchange_fill_price": t.get("exchange_fill_price", ""),
+            "entry_source": t.get("entry_source", ""),
+            "entry_price_unconfirmed": t.get("entry_price_unconfirmed", ""),
+            "rr_unconfirmed": t.get("rr_unconfirmed", ""),
         }
 
         row = ensure_columns(row, headers)   # 👈 QUAN TRỌNG
