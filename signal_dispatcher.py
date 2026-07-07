@@ -97,6 +97,31 @@ LIVE_ALLOWED_BOS_TYPES    = {"NEAR"}
 LIVE_EXCLUDED_POOL_TIER   = "B"
 LIVE_SYMBOL_RE            = re.compile(r"^[A-Z0-9]{2,20}USDT$")
 
+_BTC_MTF_CONTEXT_FIELDS = (
+    "btc_context_available",
+    "btc_m5_trend",
+    "btc_m15_trend",
+    "btc_h1_trend",
+    "btc_m5_momentum",
+    "btc_m15_momentum",
+    "btc_h1_momentum",
+    "btc_mtf_alignment",
+    "btc_alignment_reason",
+    "btc_data_mode",
+    "btc_context_source_ts",
+    "btc_context_age_sec",
+    "btc_unknown_reason",
+)
+_BTC_MTF_TIMEFRAMES = (("m5", "5m"), ("m15", "15m"), ("h1", "1h"))
+_BTC_MTF_INTERVAL_SECS = {"5m": 300, "15m": 900, "1h": 3600}
+_BTC_MTF_EMA_FAST = 9
+_BTC_MTF_EMA_SLOW = 21
+_BTC_MTF_SLOPE_BARS = 3
+_BTC_MTF_MOMENTUM_EPS = 0.0002
+_BTC_MTF_DEFAULT_MAX_AGE_SEC = 3600.0
+_BTC_MTF_DEFAULT_REFRESH_INTERVAL_SEC = 60.0
+_BTC_MTF_FETCH_CACHE = {"refreshed_at": 0.0, "frames": None}
+
 # TIER4 score threshold for live execution.
 # Rationale for 9.5 vs old 10.0:
 #   The TIER4 extra gate compounds with HEALTHY-only and NEAR-only filters.
@@ -417,6 +442,878 @@ def _first_nonblank(*values):
             return value
     return None
 
+
+def _btc_mtf_cfg_float(key, default):
+    try:
+        value = float(config.get(key, default))
+        if value != value or value < 0:
+            return default
+        return value
+    except (TypeError, ValueError):
+        return default
+
+
+def _btc_mtf_max_age_sec():
+    return _btc_mtf_cfg_float("btc_mtf_max_age_sec", _BTC_MTF_DEFAULT_MAX_AGE_SEC)
+
+
+def _btc_mtf_refresh_interval_sec():
+    return _btc_mtf_cfg_float(
+        "btc_mtf_refresh_interval_sec",
+        _BTC_MTF_DEFAULT_REFRESH_INTERVAL_SEC,
+    )
+
+
+def _btc_mtf_unknown_context(
+    data_mode="NO_INDEPENDENT_BTC_MTF_DATA",
+    reason=None,
+    unknown_reason=None,
+    age_sec=None,
+    source_ts=None,
+):
+    row = {field: None for field in _BTC_MTF_CONTEXT_FIELDS}
+    row.update({
+        "btc_context_available": False,
+        "btc_m5_trend": "UNKNOWN",
+        "btc_m15_trend": "UNKNOWN",
+        "btc_h1_trend": "UNKNOWN",
+        "btc_m5_momentum": "UNKNOWN",
+        "btc_m15_momentum": "UNKNOWN",
+        "btc_h1_momentum": "UNKNOWN",
+        "btc_mtf_alignment": "UNKNOWN",
+        "btc_alignment_reason": reason or data_mode,
+        "btc_data_mode": data_mode,
+        "btc_context_source_ts": source_ts,
+        "btc_context_age_sec": round(age_sec, 3) if age_sec is not None else None,
+        "btc_unknown_reason": unknown_reason or data_mode,
+    })
+    return row
+
+
+def _btc_mtf_signal_ts(source):
+    source = source if isinstance(source, dict) else {}
+    return _safe_float(
+        _first_nonblank(
+            source.get("signal_created_ts"),
+            source.get("signal_ts"),
+            source.get("source_timestamp"),
+            source.get("open_ts"),
+            source.get("time"),
+        )
+    )
+
+
+def _btc_mtf_candle_rows(df, signal_ts, interval):
+    if df is None or signal_ts is None:
+        return []
+    signal_ms = float(signal_ts) * 1000.0
+    interval_ms = float(_BTC_MTF_INTERVAL_SECS.get(interval, 0)) * 1000.0
+    rows = []
+    try:
+        records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+    except Exception:
+        return []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        open_ms = _safe_float(_first_nonblank(item.get("time"), item.get("open_time")))
+        close_ms = _safe_float(_first_nonblank(item.get("ct"), item.get("close_time")))
+        if close_ms is None and open_ms is not None and interval_ms > 0:
+            close_ms = open_ms + interval_ms - 1
+        if close_ms is None or close_ms > signal_ms:
+            continue
+        close = _safe_float(item.get("close"))
+        if close is None or close <= 0:
+            continue
+        rows.append({"close": close, "close_ts": close_ms / 1000.0})
+    rows.sort(key=lambda r: r["close_ts"])
+    return rows
+
+
+def _btc_mtf_ema(values, period):
+    if not values:
+        return []
+    alpha = 2.0 / (float(period) + 1.0)
+    out = []
+    prev = None
+    for value in values:
+        prev = value if prev is None else (alpha * value) + ((1.0 - alpha) * prev)
+        out.append(prev)
+    return out
+
+
+def _btc_mtf_tf_context(df, signal_ts, interval):
+    rows = _btc_mtf_candle_rows(df, signal_ts, interval)
+    min_rows = _BTC_MTF_EMA_SLOW + _BTC_MTF_SLOPE_BARS + 1
+    if len(rows) < min_rows:
+        return None
+    closes = [r["close"] for r in rows]
+    ema_fast = _btc_mtf_ema(closes, _BTC_MTF_EMA_FAST)
+    ema_slow = _btc_mtf_ema(closes, _BTC_MTF_EMA_SLOW)
+    close = closes[-1]
+    fast = ema_fast[-1]
+    slow = ema_slow[-1]
+    slope = fast - ema_fast[-1 - _BTC_MTF_SLOPE_BARS]
+    # Formula is intentionally conservative and log-only:
+    # BULLISH when close > EMA9 > EMA21 and EMA9 slope over 3 closed bars is positive;
+    # BEARISH when close < EMA9 < EMA21 and that slope is negative; otherwise CHOP.
+    if close > fast > slow and slope > 0:
+        trend = "BULLISH"
+    elif close < fast < slow and slope < 0:
+        trend = "BEARISH"
+    else:
+        trend = "CHOP"
+
+    recent_return = (closes[-1] - closes[-2]) / closes[-2] if closes[-2] else 0.0
+    if recent_return > _BTC_MTF_MOMENTUM_EPS:
+        momentum = "UP"
+    elif recent_return < -_BTC_MTF_MOMENTUM_EPS:
+        momentum = "DOWN"
+    else:
+        momentum = "FLAT"
+    return {
+        "trend": trend,
+        "momentum": momentum,
+        "source_ts": rows[-1]["close_ts"],
+    }
+
+
+def _btc_mtf_side_aligned(side, trend, momentum):
+    side = str(side or "").upper()
+    return (
+        (side == "LONG" and trend == "BULLISH" and momentum == "UP")
+        or (side == "SHORT" and trend == "BEARISH" and momentum == "DOWN")
+    )
+
+
+def _btc_mtf_side_counter(side, trend, momentum):
+    side = str(side or "").upper()
+    return (
+        (side == "LONG" and (trend == "BEARISH" or momentum == "DOWN"))
+        or (side == "SHORT" and (trend == "BULLISH" or momentum == "UP"))
+    )
+
+
+def _btc_mtf_alignment(side, tf_ctx):
+    required = ("m5", "m15", "h1")
+    if any(tf_ctx.get(k) is None for k in required):
+        return "UNKNOWN", "required_btc_timeframe_missing"
+    if any(
+        tf_ctx[k]["trend"] == "UNKNOWN" or tf_ctx[k]["momentum"] == "UNKNOWN"
+        for k in required
+    ):
+        return "UNKNOWN", "required_btc_context_unknown"
+    if any(tf_ctx[k]["trend"] == "CHOP" or tf_ctx[k]["momentum"] == "FLAT" for k in required):
+        return "BTC_CHOP", "trend_chop_or_momentum_flat_present"
+
+    aligned = {k: _btc_mtf_side_aligned(side, tf_ctx[k]["trend"], tf_ctx[k]["momentum"]) for k in required}
+    counter = {k: _btc_mtf_side_counter(side, tf_ctx[k]["trend"], tf_ctx[k]["momentum"]) for k in required}
+    if all(aligned.values()):
+        return "ALL_ALIGNED", "m5_m15_h1_align_with_trade_side"
+    if aligned["h1"] and counter["m5"]:
+        return "HTF_ALIGNED_LTF_COUNTER", "h1_aligns_m5_counters_trade_side"
+    if aligned["m5"] and counter["h1"]:
+        return "LTF_ALIGNED_HTF_COUNTER", "m5_aligns_h1_counters_trade_side"
+    if counter["h1"]:
+        return "COUNTER_HTF", "h1_counters_trade_side"
+    return "MIXED", "btc_timeframes_mixed_vs_trade_side"
+
+
+def _btc_mtf_fetch_frames(fetcher=None, now_ts=None):
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    if fetcher is not None:
+        return {
+            prefix: fetcher("BTCUSDT", interval, is_priority=True)
+            for prefix, interval in _BTC_MTF_TIMEFRAMES
+        }
+
+    cached_frames = _BTC_MTF_FETCH_CACHE.get("frames")
+    refreshed_at = _safe_float(_BTC_MTF_FETCH_CACHE.get("refreshed_at"), 0.0)
+    if (
+        isinstance(cached_frames, dict)
+        and refreshed_at
+        and now_ts - refreshed_at <= _btc_mtf_refresh_interval_sec()
+    ):
+        return cached_frames
+
+    from pool_pipeline import fetch
+    frames = {}
+    for prefix, interval in _BTC_MTF_TIMEFRAMES:
+        frames[prefix] = fetch("BTCUSDT", interval, is_priority=True)
+    _BTC_MTF_FETCH_CACHE["frames"] = frames
+    _BTC_MTF_FETCH_CACHE["refreshed_at"] = now_ts
+    return frames
+
+
+def _btc_mtf_context_for_signal(source, side=None, now_ts=None, fetcher=None):
+    source = source if isinstance(source, dict) else {}
+    side = str(side or source.get("side") or "").upper()
+    signal_ts = _btc_mtf_signal_ts(source)
+    if signal_ts is None:
+        return _btc_mtf_unknown_context(
+            reason="entry_or_signal_timestamp_missing",
+            unknown_reason="ENTRY_TS_MISSING",
+        )
+    if side not in {"LONG", "SHORT"}:
+        return _btc_mtf_unknown_context(reason="missing_or_invalid_side")
+    try:
+        frames = _btc_mtf_fetch_frames(fetcher=fetcher, now_ts=now_ts)
+        tf_ctx = {}
+        for prefix, interval in _BTC_MTF_TIMEFRAMES:
+            df = frames.get(prefix) if isinstance(frames, dict) else None
+            tf_ctx[prefix] = _btc_mtf_tf_context(df, signal_ts, interval)
+        if any(value is None for value in tf_ctx.values()):
+            return _btc_mtf_unknown_context(
+                data_mode="NO_INDEPENDENT_BTC_MTF_DATA",
+                reason="independent_btc_closed_candles_unavailable",
+                unknown_reason="NO_INDEPENDENT_BTC_MTF_DATA",
+            )
+        alignment, reason = _btc_mtf_alignment(side, tf_ctx)
+        source_ts = min(tf_ctx[prefix]["source_ts"] for prefix, _ in _BTC_MTF_TIMEFRAMES)
+        age = max(0.0, float(signal_ts) - float(source_ts))
+        max_age = _btc_mtf_max_age_sec()
+        if age > max_age:
+            return _btc_mtf_unknown_context(
+                data_mode="BTC_CONTEXT_STALE",
+                reason=f"btc_context_age_sec={round(age, 3)} > max={max_age}",
+                unknown_reason="BTC_SNAPSHOT_TOO_STALE",
+                age_sec=age,
+                source_ts=source_ts,
+            )
+        return {
+            "btc_context_available": True,
+            "btc_m5_trend": tf_ctx["m5"]["trend"],
+            "btc_m15_trend": tf_ctx["m15"]["trend"],
+            "btc_h1_trend": tf_ctx["h1"]["trend"],
+            "btc_m5_momentum": tf_ctx["m5"]["momentum"],
+            "btc_m15_momentum": tf_ctx["m15"]["momentum"],
+            "btc_h1_momentum": tf_ctx["h1"]["momentum"],
+            "btc_mtf_alignment": alignment,
+            "btc_alignment_reason": reason,
+            "btc_data_mode": "INDEPENDENT_BTC_MTF",
+            "btc_context_source_ts": source_ts,
+            "btc_context_age_sec": round(age, 3),
+            "btc_unknown_reason": "NONE",
+        }
+    except Exception as exc:
+        return _btc_mtf_unknown_context(
+            data_mode="BTC_CONTEXT_FETCH_ERROR",
+            reason=f"{type(exc).__name__}: {exc}",
+            unknown_reason="BTC_CONTEXT_FETCH_ERROR",
+        )
+
+
+# =====================================================================
+# BTC_ALIGNMENT_INSTRUMENTATION (SHADOW / LOG-ONLY)
+# ---------------------------------------------------------------------
+# Independent BTC / market context captured at CONFIRM_SMC_RESEARCH decision
+# time. This is pure instrumentation: it NEVER changes a paper/live decision,
+# NEVER gates, and NEVER mirrors the trade side (bias is derived from BTC price
+# action only). It reuses the existing independent BTC MTF fetch/candle helpers
+# and writes one row per decision to
+# logs/btc_alignment_instrumentation_shadow.jsonl.
+# =====================================================================
+_BTC_ALIGN_VERSION = "btc_align_instrument_v1_log_only"
+_BTC_ALIGN_CHANGE_BARS = 3
+_BTC_ALIGN_STRUCT_BARS = 20
+_BTC_ALIGN_VOL_BARS = 20
+_BTC_ALIGN_VOL_SPIKE_MULT = 1.8
+_BTC_ALIGN_NEAR_PCT = 0.005
+_BTC_ALIGN_VOL_HIGH = 0.006
+_BTC_ALIGN_VOL_LOW = 0.0015
+
+# The independent BTC context fields the shadow adds. Kept separate so the
+# simulator can strip them and assert the underlying decision is unchanged.
+_BTC_ALIGN_CONTEXT_FIELDS = (
+    "btc_5m_dir",
+    "btc_15m_dir",
+    "btc_1h_dir",
+    "btc_5m_change_pct",
+    "btc_15m_change_pct",
+    "btc_1h_change_pct",
+    "btc_slope_15m",
+    "btc_bos_state",
+    "btc_structure_state",
+    "btc_volatility_state",
+    "btc_vol_spike",
+    "btc_near_local_high",
+    "btc_near_local_low",
+    "btc_alignment_independent",
+    "btc_bias_independent",
+    "btc_bias_votes",
+    "btc_context_quality",
+    "btc_context_missing_fields",
+    "btc_context_version",
+    "btc_context_source_ts",
+    "btc_context_age_sec",
+    "btc_context_signal_ts",
+)
+
+def _btc_align_stdev(values):
+    if not values or len(values) < 2:
+        return None
+    n = len(values)
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return var ** 0.5
+
+
+def _btc_align_ohlcv_rows(df, signal_ts, interval):
+    """Closed BTC candles at/at-or-before signal_ts, keeping OHLCV."""
+    if df is None or signal_ts is None:
+        return []
+    signal_ms = float(signal_ts) * 1000.0
+    interval_ms = float(_BTC_MTF_INTERVAL_SECS.get(interval, 0)) * 1000.0
+    rows = []
+    try:
+        records = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+    except Exception:
+        return []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        open_ms = _safe_float(_first_nonblank(item.get("time"), item.get("open_time")))
+        close_ms = _safe_float(_first_nonblank(item.get("ct"), item.get("close_time")))
+        if close_ms is None and open_ms is not None and interval_ms > 0:
+            close_ms = open_ms + interval_ms - 1
+        if close_ms is None or close_ms > signal_ms:
+            continue
+        close = _safe_float(item.get("close"))
+        if close is None or close <= 0:
+            continue
+        rows.append({
+            "close": close,
+            "high": _safe_float(item.get("high")),
+            "low": _safe_float(item.get("low")),
+            "volume": _safe_float(item.get("volume")),
+            "close_ts": close_ms / 1000.0,
+        })
+    rows.sort(key=lambda r: r["close_ts"])
+    return rows
+
+
+def _btc_align_tf_metrics(df, signal_ts, interval):
+    """Per-TF independent direction + change_pct + slope from BTC OHLCV.
+
+    Direction uses the SAME conservative EMA formula as _btc_mtf_tf_context
+    (BULLISH: close>EMA9>EMA21 & positive slope; BEARISH: inverse; else CHOP).
+    Returns None when there are not enough closed candles.
+    """
+    rows = _btc_align_ohlcv_rows(df, signal_ts, interval)
+    min_rows = _BTC_MTF_EMA_SLOW + _BTC_MTF_SLOPE_BARS + 1
+    if len(rows) < min_rows:
+        return None
+    closes = [r["close"] for r in rows]
+    ema_fast = _btc_mtf_ema(closes, _BTC_MTF_EMA_FAST)
+    ema_slow = _btc_mtf_ema(closes, _BTC_MTF_EMA_SLOW)
+    close = closes[-1]
+    fast = ema_fast[-1]
+    slow = ema_slow[-1]
+    slope = fast - ema_fast[-1 - _BTC_MTF_SLOPE_BARS]
+    if close > fast > slow and slope > 0:
+        direction = "BULLISH"
+    elif close < fast < slow and slope < 0:
+        direction = "BEARISH"
+    else:
+        direction = "CHOP"
+    change_pct = None
+    if len(closes) > _BTC_ALIGN_CHANGE_BARS:
+        ref = closes[-1 - _BTC_ALIGN_CHANGE_BARS]
+        if ref:
+            change_pct = round((close - ref) / ref * 100.0, 4)
+    return {
+        "dir": direction,
+        "slope": slope,
+        "change_pct": change_pct,
+        "closes": closes,
+        "rows": rows,
+        "source_ts": rows[-1]["close_ts"],
+    }
+
+
+def _btc_align_bias_independent(m5_dir, m15_dir, h1_dir):
+    """Derive BTC bias from BTC per-TF directions ONLY (never the trade side).
+
+    Emits BULLISH / BEARISH / NEUTRAL_OR_CHOP / UNKNOWN by majority vote.
+    """
+    dirs = [m5_dir, m15_dir, h1_dir]
+    known = [d for d in dirs if d in ("BULLISH", "BEARISH", "CHOP")]
+    bull = sum(1 for d in dirs if d == "BULLISH")
+    bear = sum(1 for d in dirs if d == "BEARISH")
+    if not known:
+        bias = "UNKNOWN"
+    elif bull > bear:
+        bias = "BULLISH"
+    elif bear > bull:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL_OR_CHOP"
+    return bias, {"bull": bull, "bear": bear, "known": len(known)}
+
+
+def _btc_align_alignment(side, bias):
+    """Compare trade side vs INDEPENDENT BTC bias.
+
+    LONG+BULLISH / SHORT+BEARISH => ALIGNED
+    LONG+BEARISH / SHORT+BULLISH => COUNTER
+    NEUTRAL_OR_CHOP => NEUTRAL ; UNKNOWN/unknown side => UNKNOWN
+    """
+    side = str(side or "").upper()
+    if bias == "UNKNOWN" or side not in ("LONG", "SHORT"):
+        return "UNKNOWN"
+    if bias == "NEUTRAL_OR_CHOP":
+        return "NEUTRAL"
+    if (side == "LONG" and bias == "BULLISH") or (side == "SHORT" and bias == "BEARISH"):
+        return "ALIGNED"
+    return "COUNTER"
+
+
+def _btc_align_unknown_context(signal_ts=None, reason="NO_INDEPENDENT_BTC_DATA"):
+    row = {field: None for field in _BTC_ALIGN_CONTEXT_FIELDS}
+    row.update({
+        "btc_5m_dir": "UNKNOWN",
+        "btc_15m_dir": "UNKNOWN",
+        "btc_1h_dir": "UNKNOWN",
+        "btc_bos_state": "UNKNOWN",
+        "btc_structure_state": "UNKNOWN",
+        "btc_volatility_state": "UNKNOWN",
+        "btc_alignment_independent": "UNKNOWN",
+        "btc_bias_independent": "UNKNOWN",
+        "btc_context_quality": "MISSING",
+        "btc_context_missing_fields": [reason],
+        "btc_context_version": _BTC_ALIGN_VERSION,
+        "btc_context_signal_ts": signal_ts,
+    })
+    return row
+
+
+def _btc_independent_context(source, side=None, now_ts=None, fetcher=None):
+    """Build the independent BTC / market context (shadow, never gates).
+
+    Reuses the production BTC MTF fetch cache; adds richer per-TF metrics,
+    structure/volatility state, and a side-independent bias + alignment.
+    Always returns a dict; on any failure returns an UNKNOWN context.
+    """
+    source = source if isinstance(source, dict) else {}
+    side = str(side or source.get("side") or "").upper()
+    signal_ts = _btc_mtf_signal_ts(source)
+    if signal_ts is None:
+        signal_ts = _safe_float(now_ts) if now_ts is not None else time.time()
+    try:
+        frames = _btc_mtf_fetch_frames(fetcher=fetcher, now_ts=now_ts)
+        tf_metrics = {}
+        for prefix, interval in _BTC_MTF_TIMEFRAMES:
+            df = frames.get(prefix) if isinstance(frames, dict) else None
+            tf_metrics[prefix] = _btc_align_tf_metrics(df, signal_ts, interval)
+
+        missing_fields = []
+        m5 = tf_metrics.get("m5")
+        m15 = tf_metrics.get("m15")
+        h1 = tf_metrics.get("h1")
+        m5_dir = m5["dir"] if m5 else "UNKNOWN"
+        m15_dir = m15["dir"] if m15 else "UNKNOWN"
+        h1_dir = h1["dir"] if h1 else "UNKNOWN"
+        for tf_prefix, tf in (("btc_5m_dir", m5), ("btc_15m_dir", m15), ("btc_1h_dir", h1)):
+            if tf is None:
+                missing_fields.append(tf_prefix)
+
+        bias, votes = _btc_align_bias_independent(m5_dir, m15_dir, h1_dir)
+        alignment = _btc_align_alignment(side, bias)
+
+        # --- 15m-based structure / volatility / location metrics ------------
+        bos_state = "UNKNOWN"
+        structure_state = "UNKNOWN"
+        volatility_state = "UNKNOWN"
+        vol_spike = None
+        near_high = None
+        near_low = None
+        slope_15m = round(m15["slope"], 6) if m15 else None
+        if m15 is not None:
+            rows = m15["rows"]
+            closes = m15["closes"]
+            last_close = closes[-1]
+            window = rows[-(_BTC_ALIGN_STRUCT_BARS + 1):-1]
+            highs = [r["high"] for r in window if r["high"] is not None]
+            lows = [r["low"] for r in window if r["low"] is not None]
+            if len(highs) >= 5 and len(lows) >= 5:
+                prior_high = max(highs)
+                prior_low = min(lows)
+                if last_close > prior_high:
+                    bos_state = "BOS_UP"
+                elif last_close < prior_low:
+                    bos_state = "BOS_DOWN"
+                else:
+                    bos_state = "NONE"
+            else:
+                missing_fields.append("btc_bos_state")
+            # structure via thirds of recent closes
+            seg = closes[-_BTC_ALIGN_STRUCT_BARS:]
+            if len(seg) >= 9:
+                third = len(seg) // 3
+                first_mean = sum(seg[:third]) / third
+                mid_mean = sum(seg[third:2 * third]) / third
+                last_mean = sum(seg[2 * third:]) / (len(seg) - 2 * third)
+                if last_mean > mid_mean > first_mean:
+                    structure_state = "HH_HL_UPTREND"
+                elif last_mean < mid_mean < first_mean:
+                    structure_state = "LH_LL_DOWNTREND"
+                else:
+                    structure_state = "RANGE"
+            else:
+                missing_fields.append("btc_structure_state")
+            # volatility via stdev of recent returns
+            rets = [
+                (closes[i] - closes[i - 1]) / closes[i - 1]
+                for i in range(1, len(closes))
+                if closes[i - 1]
+            ]
+            tail = rets[-_BTC_ALIGN_VOL_BARS:]
+            sd = _btc_align_stdev(tail)
+            if sd is not None:
+                if sd >= _BTC_ALIGN_VOL_HIGH:
+                    volatility_state = "HIGH"
+                elif sd <= _BTC_ALIGN_VOL_LOW:
+                    volatility_state = "LOW"
+                else:
+                    volatility_state = "NORMAL"
+            else:
+                missing_fields.append("btc_volatility_state")
+            # volume spike on last closed 15m candle
+            vols = [r["volume"] for r in rows if r["volume"] is not None]
+            if len(vols) >= _BTC_ALIGN_VOL_BARS + 1:
+                prev = vols[-(_BTC_ALIGN_VOL_BARS + 1):-1]
+                mean_prev = sum(prev) / len(prev) if prev else 0.0
+                vol_spike = bool(mean_prev > 0 and vols[-1] > _BTC_ALIGN_VOL_SPIKE_MULT * mean_prev)
+            else:
+                missing_fields.append("btc_vol_spike")
+            # proximity to local high/low
+            if len(highs) >= 5 and len(lows) >= 5:
+                loc_high = max(highs + [last_close])
+                loc_low = min(lows + [last_close])
+                near_high = bool(last_close >= loc_high * (1.0 - _BTC_ALIGN_NEAR_PCT))
+                near_low = bool(last_close <= loc_low * (1.0 + _BTC_ALIGN_NEAR_PCT))
+            else:
+                missing_fields.append("btc_near_local_high")
+                missing_fields.append("btc_near_local_low")
+        else:
+            missing_fields.extend([
+                "btc_slope_15m", "btc_bos_state", "btc_structure_state",
+                "btc_volatility_state", "btc_vol_spike",
+                "btc_near_local_high", "btc_near_local_low",
+            ])
+
+        resolved_tfs = sum(1 for d in (m5_dir, m15_dir, h1_dir) if d != "UNKNOWN")
+        if resolved_tfs == 3:
+            quality = "OK"
+        elif resolved_tfs >= 1:
+            quality = "PARTIAL"
+        else:
+            quality = "MISSING"
+
+        source_ts = None
+        present_ts = [tf["source_ts"] for tf in (m5, m15, h1) if tf is not None]
+        if present_ts:
+            source_ts = min(present_ts)
+        age_sec = None
+        if source_ts is not None:
+            age_sec = round(max(0.0, float(signal_ts) - float(source_ts)), 3)
+
+        return {
+            "btc_5m_dir": m5_dir,
+            "btc_15m_dir": m15_dir,
+            "btc_1h_dir": h1_dir,
+            "btc_5m_change_pct": m5["change_pct"] if m5 else None,
+            "btc_15m_change_pct": m15["change_pct"] if m15 else None,
+            "btc_1h_change_pct": h1["change_pct"] if h1 else None,
+            "btc_slope_15m": slope_15m,
+            "btc_bos_state": bos_state,
+            "btc_structure_state": structure_state,
+            "btc_volatility_state": volatility_state,
+            "btc_vol_spike": vol_spike,
+            "btc_near_local_high": near_high,
+            "btc_near_local_low": near_low,
+            "btc_alignment_independent": alignment,
+            "btc_bias_independent": bias,
+            "btc_bias_votes": votes,
+            "btc_context_quality": quality,
+            "btc_context_missing_fields": missing_fields,
+            "btc_context_version": _BTC_ALIGN_VERSION,
+            "btc_context_source_ts": source_ts,
+            "btc_context_age_sec": age_sec,
+            "btc_context_signal_ts": signal_ts,
+        }
+    except Exception as exc:
+        return _btc_align_unknown_context(
+            signal_ts=signal_ts,
+            reason=f"BTC_CONTEXT_ERROR:{type(exc).__name__}",
+        )
+
+
+def _btc_alignment_instrumentation_write(row):
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "btc_alignment_instrumentation_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        print(f"[BTC ALIGNMENT INSTRUMENTATION] log failed: {exc}")
+
+
+# =====================================================================
+# BTC_BIAS_SIDE_ENABLE_SHADOW (SHADOW / LOG-ONLY)
+# ---------------------------------------------------------------------
+# Log-only side-enable evaluator for the CONFIRM_SMC_RESEARCH lane. Given a
+# trade side and the INDEPENDENT BTC context already computed above
+# (btc_bias_independent / btc_alignment_independent / btc_context_quality /
+# btc_context_missing_fields), it classifies whether the side would be allowed
+# under the top-down regime rule surfaced by MARKET_BIAS_AND_TRADING_EDGE_AUDIT:
+#   LONG  allowed only when independent BTC bias is BULLISH
+#   SHORT allowed only when independent BTC bias is BEARISH
+# NEUTRAL_OR_CHOP and UNKNOWN/missing are classified SEPARATELY and are NEVER
+# auto-allowed. This NEVER changes any paper/live decision, never gates, and
+# reads ONLY the independent BTC fields (the old degenerate BTC MTF shadow
+# fields are never consulted). Scoped by call-site: the only callers are the
+# paper qualified-research and live SMC-research decision loggers.
+# =====================================================================
+_BTC_SIDE_ENABLE_VERSION = "btc_bias_side_enable_shadow_v1_log_only"
+
+# The additive shadow fields folded into the instrumentation payload. Kept
+# separate so the simulator can strip them and assert the underlying decision
+# is byte-for-byte unchanged.
+_BTC_SIDE_ENABLE_SHADOW_FIELDS = (
+    "btc_side_enable_shadow_label",
+    "btc_side_enable_shadow_allow",
+    "btc_side_enable_shadow_reason",
+    "btc_side_enable_shadow_version",
+    "btc_side_enable_bias",
+    "btc_side_enable_alignment",
+    "btc_side_enable_context_quality",
+)
+
+
+def _btc_bias_side_enable_eval(side, btc_ctx):
+    """Pure side-enable classifier. INDEPENDENT BTC fields only; log-only.
+
+    Returns (label, allow, reason) where allow is True / False / None:
+      LONG  + BULLISH        -> BTC_SIDE_ENABLE_ALLOW                  (True)
+      SHORT + BEARISH        -> BTC_SIDE_ENABLE_ALLOW                  (True)
+      LONG  + BEARISH        -> BTC_SIDE_ENABLE_BLOCK_COUNTER_BIAS     (False)
+      SHORT + BULLISH        -> BTC_SIDE_ENABLE_BLOCK_COUNTER_BIAS     (False)
+      NEUTRAL_OR_CHOP        -> BTC_SIDE_ENABLE_BLOCK_NEUTRAL_CHOP     (False)
+      UNKNOWN / missing ctx  -> BTC_SIDE_ENABLE_UNKNOWN_MISSING_CONTEXT (None)
+    allow=None marks the unknown/missing class as "not automatically allowed"
+    and distinct from an explicit block.
+    """
+    btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else {}
+    side = str(side or "").upper()
+    bias = str(btc_ctx.get("btc_bias_independent") or "UNKNOWN").upper()
+    quality = str(btc_ctx.get("btc_context_quality") or "MISSING").upper()
+
+    # Unknown / missing context: classified separately, never auto-allowed.
+    if (
+        bias not in ("BULLISH", "BEARISH", "NEUTRAL_OR_CHOP")
+        or quality == "MISSING"
+        or side not in ("LONG", "SHORT")
+    ):
+        return (
+            "BTC_SIDE_ENABLE_UNKNOWN_MISSING_CONTEXT",
+            None,
+            f"unknown_missing_context|side={side or 'NA'}|bias={bias}|quality={quality}",
+        )
+
+    if bias == "NEUTRAL_OR_CHOP":
+        return (
+            "BTC_SIDE_ENABLE_BLOCK_NEUTRAL_CHOP",
+            False,
+            f"block_neutral_chop|side={side}|bias={bias}",
+        )
+
+    if (side == "LONG" and bias == "BULLISH") or (side == "SHORT" and bias == "BEARISH"):
+        return (
+            "BTC_SIDE_ENABLE_ALLOW",
+            True,
+            f"allow|side={side}|bias={bias}",
+        )
+
+    return (
+        "BTC_SIDE_ENABLE_BLOCK_COUNTER_BIAS",
+        False,
+        f"block_counter_bias|side={side}|bias={bias}",
+    )
+
+
+def _btc_bias_side_enable_shadow_fields(side, btc_ctx):
+    """Build the additive side-enable payload fields (log-only)."""
+    label, allow, reason = _btc_bias_side_enable_eval(side, btc_ctx)
+    btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else {}
+    return {
+        "btc_side_enable_shadow_label": label,
+        "btc_side_enable_shadow_allow": allow,
+        "btc_side_enable_shadow_reason": reason,
+        "btc_side_enable_shadow_version": _BTC_SIDE_ENABLE_VERSION,
+        "btc_side_enable_bias": btc_ctx.get("btc_bias_independent"),
+        "btc_side_enable_alignment": btc_ctx.get("btc_alignment_independent"),
+        "btc_side_enable_context_quality": btc_ctx.get("btc_context_quality"),
+    }
+
+
+def _btc_bias_side_enable_shadow_write(row):
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "btc_bias_side_enable_shadow.jsonl")
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        print(f"[BTC BIAS SIDE ENABLE SHADOW] log failed: {exc}")
+
+
+def _btc_alignment_instrumentation_shadow(
+    source,
+    execution_mode,
+    v1_decision,
+    v1_reason,
+    side=None,
+    trade=None,
+    gate_fields=None,
+    v2b_fields=None,
+    now_ts=None,
+    fetcher=None,
+):
+    """Assemble + append one BTC_ALIGNMENT_INSTRUMENTATION shadow row.
+
+    SHADOW / LOG-ONLY. Returns the row (or None on failure). It reads decision
+    context that already exists at the call site and never feeds back into any
+    decision. Fully guarded so it can never raise into the caller.
+    """
+    try:
+        source = source if isinstance(source, dict) else {}
+        trade = trade if isinstance(trade, dict) else None
+        gate_fields = gate_fields if isinstance(gate_fields, dict) else {}
+        v2b_fields = v2b_fields if isinstance(v2b_fields, dict) else {}
+        now_ts = now_ts if now_ts is not None else time.time()
+        side = str(side or source.get("side") or "").upper()
+
+        btc_ctx = _btc_independent_context(source, side=side, now_ts=now_ts, fetcher=fetcher)
+
+        entry = _first_nonblank(
+            (trade or {}).get("entry"), (trade or {}).get("entry_real"),
+            source.get("entry"),
+        )
+        sl = _first_nonblank((trade or {}).get("sl"), source.get("sl"))
+        tp = _first_nonblank((trade or {}).get("tp"), source.get("tp"))
+        rr = _first_nonblank(
+            (trade or {}).get("rr"), (trade or {}).get("planned_rr"),
+            source.get("planned_rr"), source.get("rr"),
+        )
+
+        row = {
+            "ts": now_ts,
+            "timestamp": format_vn_time(now_ts),
+            "event_type": "BTC_ALIGNMENT_INSTRUMENTATION_SHADOW",
+            "execution_mode": execution_mode,
+            "symbol": str(source.get("symbol") or ""),
+            "side": side,
+            "signal_ts": _btc_mtf_signal_ts(source),
+            "dedup_key": str(source.get("dedup_key") or ""),
+            "entry_type": str(
+                source.get("entry_type") or (trade or {}).get("entry_type")
+                or "CONFIRM_SMC_RESEARCH"
+            ),
+            "v1_decision": v1_decision,
+            "v1_reason": v1_reason,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+            # paper location gate context (if available at this call site)
+            "paper_location_gate_would_block": gate_fields.get(
+                "confirm_smc_entry_location_would_block"
+            ),
+            "trade_location_quality": gate_fields.get("trade_location_quality"),
+            "smc_zone": gate_fields.get("smc_zone"),
+            "market_regime": gate_fields.get("market_regime"),
+            # V2B allowlist context (if available at this call site)
+            "v2b_label": v2b_fields.get("v2b_label"),
+            "v2b_match": v2b_fields.get("v2b_match"),
+            "v2b_reason": v2b_fields.get("v2b_reason"),
+            "v2b_market_bias": v2b_fields.get("v2b_market_bias"),
+            "v2b_direction_alignment": v2b_fields.get("v2b_direction_alignment"),
+        }
+        row.update(btc_ctx)
+
+        # --- BTC_BIAS_SIDE_ENABLE_SHADOW (log-only, CONFIRM_SMC_RESEARCH) -----
+        # Additive side-enable classification + dedicated forward log. Reads
+        # only the independent BTC fields just computed; never changes any
+        # paper/live decision. Guarded so a failure here can never prevent the
+        # main instrumentation write nor raise into the caller.
+        try:
+            side_enable = _btc_bias_side_enable_shadow_fields(side, btc_ctx)
+            row.update(side_enable)
+            _btc_bias_side_enable_shadow_write({
+                "ts": row.get("ts"),
+                "timestamp": row.get("timestamp"),
+                "event_type": "BTC_BIAS_SIDE_ENABLE_SHADOW",
+                "execution_mode": execution_mode,
+                "symbol": row.get("symbol"),
+                "side": side,
+                "signal_ts": row.get("signal_ts"),
+                "dedup_key": row.get("dedup_key"),
+                "entry_type": row.get("entry_type"),
+                "v1_decision": v1_decision,
+                "v1_reason": v1_reason,
+                "entry": row.get("entry"),
+                "sl": row.get("sl"),
+                "tp": row.get("tp"),
+                "rr": row.get("rr"),
+                "btc_bias_independent": btc_ctx.get("btc_bias_independent"),
+                "btc_alignment_independent": btc_ctx.get("btc_alignment_independent"),
+                "btc_context_quality": btc_ctx.get("btc_context_quality"),
+                "btc_context_missing_fields": btc_ctx.get("btc_context_missing_fields"),
+                "shadow_label": side_enable["btc_side_enable_shadow_label"],
+                "shadow_allow": side_enable["btc_side_enable_shadow_allow"],
+                "shadow_version": _BTC_SIDE_ENABLE_VERSION,
+                # PAPER_LOCATION_GATE context (read-only passthrough, if present)
+                "paper_location_gate_would_block": row.get("paper_location_gate_would_block"),
+                "trade_location_quality": row.get("trade_location_quality"),
+                "smc_zone": row.get("smc_zone"),
+                "market_regime": row.get("market_regime"),
+                # V2B allowlist context (read-only passthrough, if present)
+                "v2b_label": row.get("v2b_label"),
+                "v2b_match": row.get("v2b_match"),
+                "v2b_reason": row.get("v2b_reason"),
+                "v2b_market_bias": row.get("v2b_market_bias"),
+                "v2b_direction_alignment": row.get("v2b_direction_alignment"),
+                # SMC_PA_SCORE_V3 context (read-only passthrough, if available).
+                # Sourced from whichever carrier holds it; None when the V3
+                # summary has not been merged at this call site. Never computed
+                # or modified here.
+                "smc_pa_v3_total_score": _first_nonblank(
+                    gate_fields.get("smc_pa_v3_total_score"),
+                    v2b_fields.get("smc_pa_v3_total_score"),
+                ),
+                "smc_pa_v3_score_band": _first_nonblank(
+                    gate_fields.get("smc_pa_v3_score_band"),
+                    v2b_fields.get("smc_pa_v3_score_band"),
+                ),
+                "smc_pa_v3_missing_components": _first_nonblank(
+                    gate_fields.get("smc_pa_v3_missing_components"),
+                    v2b_fields.get("smc_pa_v3_missing_components"),
+                ),
+                "smc_pa_v3_version": _first_nonblank(
+                    gate_fields.get("smc_pa_v3_version"),
+                    v2b_fields.get("smc_pa_v3_version"),
+                ),
+            })
+        except Exception as _side_exc:
+            print(f"[BTC BIAS SIDE ENABLE SHADOW] shadow failed: {_side_exc}")
+
+        _btc_alignment_instrumentation_write(row)
+        return row
+    except Exception as exc:
+        print(f"[BTC ALIGNMENT INSTRUMENTATION] shadow failed: {exc}")
+        return None
 
 def _signal_smc_context(signal):
     score_breakdown = _safe_dict(signal.get("score_breakdown"))
@@ -1436,6 +2333,12 @@ def _paper_smc_research_entry_context_snapshot(
         if decision_ts is None:
             decision_ts = time.time()
         entry_context = _research_entry_context(candidate, decision_ts=decision_ts)
+        btc_context = _btc_mtf_context_for_signal(
+            {**candidate, **opened, "decision_ts": decision_ts},
+            side=_first_nonblank(opened.get("side"), candidate.get("side")),
+            now_ts=decision_ts,
+        )
+        entry_context.update({key: _json_safe_copy(value) for key, value in btc_context.items()})
         entry_fallback_shadow = None
         if isinstance(qualified_fields, dict):
             entry_fallback_shadow = _paper_smc_research_entry_fallback_shadow_safe(
@@ -1498,6 +2401,7 @@ def _paper_smc_research_entry_context_snapshot(
             "source_timestamp": candidate.get("source_timestamp"),
             "entry_context": entry_context,
         }
+        row.update({key: _json_safe_copy(value) for key, value in btc_context.items()})
         if isinstance(qualified_fields, dict):
             row.update(_PAPER_SMC_RESEARCH_EXTENSION_METADATA)
             row["research_is_post_50"] = bool(opened.get("research_is_post_50"))
@@ -1519,7 +2423,6 @@ def _paper_smc_research_entry_context_snapshot(
             )
     except Exception as exc:
         print(f"[PAPER SMC RESEARCH ENTRY CONTEXT] snapshot failed: {exc}")
-
 
 def _paper_confirm_entry_context_write(row):
     try:
@@ -2344,6 +3247,8 @@ def _paper_confirm_entry_context_snapshot(opened):
         planned_rr = _safe_float(_first_nonblank(opened.get("planned_rr"), opened.get("rr")))
 
         entry_context = _research_entry_context(opened, decision_ts=open_ts)
+        btc_context = _btc_mtf_context_for_signal(opened, now_ts=open_ts)
+        entry_context.update({key: _json_safe_copy(value) for key, value in btc_context.items()})
         qualified_fields = _paper_smc_research_qualified_fields(opened)
         structural_context = _paper_structural_context(opened)
         smc = _signal_smc_context(opened)
@@ -2477,6 +3382,7 @@ def _paper_confirm_entry_context_snapshot(opened):
             "v2b_direction_alignment": qualified_fields.get("v2b_direction_alignment"),
             "v2b_class": qualified_fields.get("v2b_class"),
         }
+        row.update({key: _json_safe_copy(value) for key, value in btc_context.items()})
         coverage_fields = (
             "market_regime",
             "router_regime",
@@ -2507,7 +3413,6 @@ def _paper_confirm_entry_context_snapshot(opened):
         _paper_confirm_pre_break_low_shadow_snapshot(row)
     except Exception as exc:
         print(f"[PAPER CONFIRM ENTRY CONTEXT] snapshot failed: {exc}")
-
 
 def _paper_smc_research_float(value):
     try:
@@ -3481,6 +4386,1488 @@ def _paper_smc_research_qualified_apply_entry_location_risk(trade, fields):
         trade[key] = _json_safe_copy(fields.get(key))
 
 
+def _confirm_smc_location_gate_reason(fields):
+    fields = fields if isinstance(fields, dict) else {}
+    primary = fields.get("confirm_smc_entry_location_primary_reason")
+    if primary not in (None, ""):
+        return primary
+    reasons = fields.get("confirm_smc_entry_location_risk_reasons")
+    if isinstance(reasons, (list, tuple)) and reasons:
+        return "|".join(str(item) for item in reasons if item not in (None, ""))
+    bucket = fields.get("confirm_smc_entry_location_risk_bucket")
+    if bucket not in (None, ""):
+        return f"risk_bucket={bucket}"
+    return "UNKNOWN_LOCATION_BLOCK_REASON"
+
+
+def _confirm_smc_location_gate_would_block(fields):
+    fields = fields if isinstance(fields, dict) else {}
+    return fields.get("confirm_smc_entry_location_would_block") is True
+
+
+def _confirm_smc_location_gate_log_fields(candidate, fields=None, mode="SHADOW_ONLY"):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    fields = fields if isinstance(fields, dict) else _paper_smc_research_qualified_fields(candidate)
+    would_block = _confirm_smc_location_gate_would_block(fields)
+    return {
+        "gate_source": "EXISTING_LOCATION_BLOCK_SHADOW",
+        "location_gate_source": "EXISTING_LOCATION_BLOCK_SHADOW",
+        "location_gate_mode": mode,
+        "location_gate_would_block": would_block,
+        "location_gate_reason": _confirm_smc_location_gate_reason(fields),
+        "location_gate_enabled": (
+            bool(config.get("paper_smc_research_location_gate_enabled", False))
+            if mode == "PAPER_GATE"
+            else bool(config.get("live_smc_research_location_gate_enabled", False))
+        ),
+        "confirm_smc_entry_location_would_block": fields.get(
+            "confirm_smc_entry_location_would_block"
+        ),
+        "confirm_smc_entry_location_primary_reason": fields.get(
+            "confirm_smc_entry_location_primary_reason"
+        ),
+        "confirm_smc_entry_location_risk_bucket": fields.get(
+            "confirm_smc_entry_location_risk_bucket"
+        ),
+        "confirm_smc_entry_location_risk_score": fields.get(
+            "confirm_smc_entry_location_risk_score"
+        ),
+        "confirm_smc_entry_location_risk_reasons": _json_safe_copy(
+            fields.get("confirm_smc_entry_location_risk_reasons") or []
+        ),
+        "would_have_entry": candidate.get("entry"),
+        "would_have_sl": candidate.get("sl"),
+        "would_have_tp": candidate.get("tp"),
+        "would_have_rr": fields.get("planned_rr"),
+        "smc_zone": fields.get("smc_zone"),
+        "market_regime": fields.get("market_regime"),
+        "bos_quality": fields.get("bos_quality"),
+        "exhaustion": fields.get("exhaustion"),
+        "fallback_reason": fields.get("research_fallback_reason"),
+    }
+
+
+def _smc_entry_v2_text(value):
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def _smc_entry_v2_float(value):
+    return _paper_smc_research_float(value)
+
+
+def _smc_entry_v2b_score_bucket(value):
+    score = _smc_entry_v2_float(value)
+    if score is None:
+        return "SCORE_UNKNOWN"
+    if score < 1:
+        return "SCORE_LT_1"
+    if score < 2:
+        return "SCORE_1_2"
+    if score < 4:
+        return "SCORE_2_3"
+    return "SCORE_GTE_4"
+
+
+def _smc_entry_v2b_feature_quality(candidate, fields):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    fields = fields if isinstance(fields, dict) else {}
+    exact_keys = (
+        "premium_discount",
+        "dow_trend_context",
+        "poi_type",
+        "poi_location_quality",
+        "entry_poi_alignment",
+        "liquidity_context",
+    )
+    for key in exact_keys:
+        value = _smc_entry_v2_text(_first_nonblank(candidate.get(key), fields.get(key)))
+        if value not in {"", "UNKNOWN", "NONE"}:
+            return "EXACT_FEATURES"
+    return "COARSE_PROXY"
+
+
+def _smc_entry_v2b_allowlist_shadow(candidate, fields=None, trade=None, mode="SHADOW_ONLY"):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    trade = trade if isinstance(trade, dict) else {}
+    fields = fields if isinstance(fields, dict) else _paper_smc_research_qualified_fields(candidate)
+    side = _smc_entry_v2_text(_first_nonblank(candidate.get("side"), trade.get("side")))
+    score = _smc_entry_v2_float(
+        _first_nonblank(
+            fields.get("score_v2_structural_shadow"),
+            candidate.get("score_v2_structural_shadow"),
+            trade.get("score_v2_structural_shadow"),
+            fields.get("score_v2_current"),
+            candidate.get("score"),
+            trade.get("score"),
+        )
+    )
+    score_bucket = _smc_entry_v2b_score_bucket(score)
+    exhaustion = _smc_entry_v2_text(
+        _first_nonblank(
+            fields.get("exhaustion"),
+            fields.get("exhaustion_state"),
+            candidate.get("exhaustion"),
+            candidate.get("exhaustion_state"),
+            candidate.get("exhaustion_cls"),
+            trade.get("exhaustion"),
+        )
+    )
+    match = side == "SHORT" and exhaustion == "EXTENDED" and score_bucket == "SCORE_2_3"
+    if match:
+        reason = "side=SHORT;exhaustion=EXTENDED;score_bucket=SCORE_2_3"
+    else:
+        misses = []
+        if side != "SHORT":
+            misses.append(f"side={side or 'UNKNOWN'}")
+        if exhaustion != "EXTENDED":
+            misses.append(f"exhaustion={exhaustion or 'UNKNOWN'}")
+        if score_bucket != "SCORE_2_3":
+            misses.append(f"score_bucket={score_bucket}")
+        reason = "not_allowlisted:" + ";".join(misses)
+    return {
+        "smc_entry_v2b_allowlist_label": SMC_ENTRY_V2B_ALLOWLIST_LABEL,
+        "smc_entry_v2b_allowlist_match": bool(match),
+        "smc_entry_v2b_allowlist_reason": reason,
+        "smc_entry_v2b_allowlist_version": SMC_ENTRY_V2B_ALLOWLIST_VERSION,
+        "smc_entry_v2b_score_bucket": score_bucket,
+        "smc_entry_v2b_score": score,
+        "smc_entry_v2b_feature_quality": _smc_entry_v2b_feature_quality(candidate, fields),
+        "smc_entry_v2b_forward_mode": mode,
+    }
+
+
+def _smc_entry_v2b_allowlist_shadow_write(
+    candidate,
+    fields,
+    shadow,
+    execution_mode="shadow_context",
+    v1_decision="",
+    v1_reason="",
+    trade=None,
+    now_ts=None,
+):
+    try:
+        candidate = candidate if isinstance(candidate, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        shadow = shadow if isinstance(shadow, dict) else {}
+        trade = trade if isinstance(trade, dict) else {}
+        now_ts = time.time() if now_ts is None else now_ts
+        row = {
+            "ts": now_ts,
+            "symbol": candidate.get("symbol") or trade.get("symbol"),
+            "side": candidate.get("side") or trade.get("side"),
+            "signal_ts": _first_nonblank(
+                candidate.get("signal_created_ts"),
+                candidate.get("source_timestamp"),
+                candidate.get("collector_ts"),
+                candidate.get("timestamp"),
+                trade.get("signal_created_ts"),
+            ),
+            "dedup_key": candidate.get("dedup_key") or trade.get("research_dedup_key"),
+            "execution_mode": execution_mode,
+            "v1_decision": v1_decision,
+            "v1_reason": v1_reason,
+            "score": shadow.get("smc_entry_v2b_score"),
+            "score_bucket": shadow.get("smc_entry_v2b_score_bucket"),
+            "exhaustion": _first_nonblank(
+                fields.get("exhaustion"),
+                fields.get("exhaustion_state"),
+                candidate.get("exhaustion"),
+                candidate.get("exhaustion_state"),
+                candidate.get("exhaustion_cls"),
+                trade.get("exhaustion"),
+            ),
+            "smc_zone": fields.get("smc_zone"),
+            "market_regime": fields.get("market_regime"),
+            "bos_quality": fields.get("bos_quality"),
+            "phase": fields.get("phase"),
+            "rr": _first_nonblank(fields.get("planned_rr"), candidate.get("rr"), trade.get("rr")),
+            "entry": _first_nonblank(candidate.get("entry"), trade.get("entry")),
+            "sl": _first_nonblank(candidate.get("sl"), trade.get("sl")),
+            "tp": _first_nonblank(candidate.get("tp"), trade.get("tp")),
+            "allowlist_match": shadow.get("smc_entry_v2b_allowlist_match"),
+            "allowlist_reason": shadow.get("smc_entry_v2b_allowlist_reason"),
+            "feature_quality": shadow.get("smc_entry_v2b_feature_quality"),
+            "smc_entry_v2b_allowlist_label": shadow.get("smc_entry_v2b_allowlist_label"),
+            "smc_entry_v2b_allowlist_version": shadow.get("smc_entry_v2b_allowlist_version"),
+            "smc_entry_v2b_forward_mode": shadow.get("smc_entry_v2b_forward_mode"),
+        }
+        os.makedirs("logs", exist_ok=True)
+        with open(SMC_ENTRY_V2B_ALLOWLIST_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[SMC_ENTRY_V2B_ALLOWLIST_SHADOW] log failed: {exc}")
+
+
+def _smc_entry_v2_expected_rr(side, entry, sl, tp):
+    if entry is None or sl is None or tp is None:
+        return None
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    if side == "LONG":
+        reward = tp - entry
+    elif side == "SHORT":
+        reward = entry - tp
+    else:
+        return None
+    if reward <= 0:
+        return None
+    return round(reward / risk, 4)
+
+
+def _smc_entry_v2_fallback_shadow(candidate, fields, now_ts=None):
+    try:
+        return _paper_smc_research_entry_fallback_shadow_safe(
+            candidate,
+            fields=fields,
+            now_ts=now_ts,
+        )
+    except Exception:
+        return {}
+
+
+def _smc_entry_v2_shadow(candidate, fields=None, v1_decision="", v1_reason="", trade=None, now_ts=None):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    trade = trade if isinstance(trade, dict) else {}
+    fields = fields if isinstance(fields, dict) else _paper_smc_research_qualified_fields(candidate)
+    now_ts = time.time() if now_ts is None else now_ts
+    fallback = _smc_entry_v2_fallback_shadow(candidate, fields, now_ts=now_ts)
+
+    side = _smc_entry_v2_text(_first_nonblank(candidate.get("side"), trade.get("side")))
+    entry = _smc_entry_v2_float(_first_nonblank(candidate.get("entry"), trade.get("entry")))
+    sl = _smc_entry_v2_float(_first_nonblank(candidate.get("sl"), trade.get("sl")))
+    tp = _smc_entry_v2_float(_first_nonblank(candidate.get("tp"), trade.get("tp")))
+    rr = _smc_entry_v2_float(
+        _first_nonblank(fields.get("planned_rr"), candidate.get("rr"), trade.get("rr"))
+    )
+    expected_rr = rr if rr is not None else _smc_entry_v2_expected_rr(side, entry, sl, tp)
+
+    smc_zone = _smc_entry_v2_text(fields.get("smc_zone"))
+    market_regime = _smc_entry_v2_text(fields.get("market_regime"))
+    bos_quality = _smc_entry_v2_text(fields.get("bos_quality"))
+    exhaustion = _smc_entry_v2_text(fields.get("exhaustion"))
+    phase = _smc_entry_v2_text(fields.get("phase"))
+    range_context = _smc_entry_v2_text(fields.get("range_context"))
+    liquidity_sweep = _smc_entry_v2_text(fields.get("liquidity_sweep"))
+    risk_class = _smc_entry_v2_text(fallback.get("research_entry_timing_risk_class"))
+    fallback_reason = fallback.get("research_fallback_reason")
+    stale_signal = bool(
+        isinstance(fallback.get("research_entry_timing_components"), dict)
+        and fallback["research_entry_timing_components"].get("stale_signal")
+    )
+
+    exact_keys = (
+        "premium_discount",
+        "dow_trend_context",
+        "poi_type",
+        "poi_location_quality",
+        "entry_poi_alignment",
+        "liquidity_context",
+    )
+    exact_feature_seen = any(
+        _smc_entry_v2_text(_first_nonblank(candidate.get(key), fields.get(key)))
+        not in {"", "UNKNOWN", "NONE"}
+        for key in exact_keys
+    )
+    feature_quality = "EXACT_FEATURES" if exact_feature_seen else "COARSE_PROXY"
+
+    missing_core = []
+    for key, value in (
+        ("side", side),
+        ("entry", entry),
+        ("sl", sl),
+        ("tp", tp),
+        ("rr", expected_rr),
+    ):
+        if value in (None, ""):
+            missing_core.append(key)
+
+    location_score = 0
+    location_reasons = []
+    if side == "LONG":
+        if smc_zone == "DISCOUNT" or range_context == "RANGE_LOW":
+            location_score += 2
+            location_reasons.append("long_favorable_discount_or_low")
+        if smc_zone == "PREMIUM":
+            location_score -= 3
+            location_reasons.append("long_in_premium")
+        if liquidity_sweep == "SWEEP_LOW":
+            location_score += 1
+            location_reasons.append("long_sweep_low_reclaim_proxy")
+        if liquidity_sweep == "SWEEP_HIGH":
+            location_score -= 1
+            location_reasons.append("long_into_sweep_high_proxy")
+    elif side == "SHORT":
+        if smc_zone == "PREMIUM" or range_context == "RANGE_HIGH":
+            location_score += 2
+            location_reasons.append("short_favorable_premium_or_high")
+        if smc_zone == "DISCOUNT":
+            location_score -= 3
+            location_reasons.append("short_in_discount")
+        if liquidity_sweep == "SWEEP_HIGH":
+            location_score += 1
+            location_reasons.append("short_sweep_high_rejection_proxy")
+        if liquidity_sweep == "SWEEP_LOW":
+            location_score -= 1
+            location_reasons.append("short_into_sweep_low_proxy")
+    else:
+        location_reasons.append("missing_side")
+
+    retest_tokens = ("RETEST", "PULLBACK", "PRE_BREAK", "PREBREAK", "ACCEPT", "RECLAIM")
+    has_retest_proxy = any(token in phase for token in retest_tokens) or risk_class == "PRE_BREAK_ANTICIPATION"
+    if has_retest_proxy:
+        location_score += 1
+        location_reasons.append("retest_or_location_proxy")
+
+    late_chase_score = 0
+    late_reasons = []
+    if market_regime == "CHOP_NO_TRADE":
+        late_chase_score += 3
+        late_reasons.append("chop_no_trade")
+    if market_regime == "EXHAUSTION_REVERSAL":
+        late_chase_score += 3
+        late_reasons.append("exhaustion_reversal")
+    if exhaustion not in ("", "UNKNOWN", "HEALTHY", "NONE", "NO", "FALSE"):
+        late_chase_score += 2
+        late_reasons.append(f"exhaustion={exhaustion}")
+    if bos_quality in {"NO_FOLLOWTHROUGH", "TRAP"}:
+        late_chase_score += 2
+        late_reasons.append(f"bos_quality={bos_quality}")
+    if risk_class in {"BAD_REGIME_ENTRY", "CHOP_OR_RANGE_ENTRY", "STALE_SIGNAL_ENTRY", "NO_FOLLOWTHROUGH_RISK"}:
+        late_chase_score += 2
+        late_reasons.append(f"risk_class={risk_class}")
+    if stale_signal:
+        late_chase_score += 2
+        late_reasons.append("stale_signal")
+
+    structure_score = 0
+    structure_reasons = []
+    if not missing_core:
+        if side == "LONG" and sl < entry < tp:
+            structure_score += 1
+            structure_reasons.append("long_geometry_valid")
+        elif side == "SHORT" and tp < entry < sl:
+            structure_score += 1
+            structure_reasons.append("short_geometry_valid")
+        else:
+            structure_score -= 2
+            structure_reasons.append("invalid_v1_geometry")
+    else:
+        structure_reasons.append(f"missing_core={','.join(missing_core)}")
+    if expected_rr is not None and expected_rr >= 2.0:
+        structure_score += 1
+        structure_reasons.append("rr_ge_2")
+    elif expected_rr is not None:
+        structure_score -= 1
+        structure_reasons.append("rr_below_2")
+
+    if missing_core:
+        status = "UNKNOWN_MISSING_FEATURES"
+        reason = f"missing_core_features={','.join(missing_core)}"
+        compared = "NOT_COMPUTABLE"
+    elif market_regime == "CHOP_NO_TRADE":
+        status = "WOULD_SKIP_CHOP"
+        reason = "market_regime=CHOP_NO_TRADE"
+        compared = "BETTER_LOCATION"
+    elif market_regime == "EXHAUSTION_REVERSAL":
+        status = "WOULD_SKIP_EXHAUSTION"
+        reason = "market_regime=EXHAUSTION_REVERSAL"
+        compared = "BETTER_LOCATION"
+    elif side == "LONG" and smc_zone == "PREMIUM" and late_chase_score >= 2:
+        status = "WOULD_SKIP_BAD_LOCATION"
+        reason = "long_in_premium_with_late_or_weak_context"
+        compared = "BETTER_LOCATION"
+    elif side == "SHORT" and smc_zone == "DISCOUNT" and late_chase_score >= 2:
+        status = "WOULD_SKIP_BAD_LOCATION"
+        reason = "short_in_discount_with_late_or_weak_context"
+        compared = "BETTER_LOCATION"
+    elif late_chase_score >= 4:
+        status = "WOULD_SKIP_LATE_CHASE"
+        reason = ";".join(late_reasons) or "late_chase_proxy"
+        compared = "BETTER_LOCATION"
+    elif structure_score < 1:
+        status = "WOULD_SKIP_NO_STRUCTURE_SL"
+        reason = ";".join(structure_reasons) or "structure_proxy_failed"
+        compared = "NOT_COMPUTABLE"
+    elif expected_rr is None or expected_rr < 2.0:
+        status = "WOULD_SKIP_RR"
+        reason = f"expected_rr={expected_rr}"
+        compared = "NOT_COMPUTABLE"
+    elif location_score >= 2 and has_retest_proxy:
+        status = "WOULD_ENTER"
+        reason = ";".join(location_reasons + structure_reasons)
+        compared = "BETTER_LOCATION" if location_score > 0 else "SAME"
+    else:
+        status = "WAIT_RETEST"
+        reason = "needs_retest_or_location_confirmation"
+        compared = "SAME" if location_score >= 0 else "BETTER_LOCATION"
+
+    return {
+        "smc_entry_v2_shadow_version": SMC_ENTRY_V2_SHADOW_VERSION,
+        "v2_shadow_status": status,
+        "v2_shadow_reason": reason,
+        "v2_location_score": location_score,
+        "v2_late_chase_score": late_chase_score,
+        "v2_structure_score": structure_score,
+        "v2_expected_entry": entry,
+        "v2_structural_sl": sl,
+        "v2_expected_rr": expected_rr,
+        "v2_compared_to_v1": compared,
+        "v2_feature_quality": feature_quality,
+        "v2_location_reasons": location_reasons,
+        "v2_late_chase_reasons": late_reasons,
+        "v2_structure_reasons": structure_reasons,
+        "v1_decision": v1_decision,
+        "v1_reason": v1_reason,
+        "v1_entry": entry,
+        "v1_sl": sl,
+        "v1_rr": rr,
+        "smc_zone": fields.get("smc_zone"),
+        "market_regime": fields.get("market_regime"),
+        "bos_quality": fields.get("bos_quality"),
+        "exhaustion": fields.get("exhaustion"),
+        "research_entry_timing_risk_class": fallback.get("research_entry_timing_risk_class"),
+        "research_fallback_reason": fallback_reason,
+    }
+
+
+def _smc_entry_v2_shadow_write(candidate, fields, shadow, v1_decision="", v1_reason="", now_ts=None):
+    try:
+        candidate = candidate if isinstance(candidate, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        shadow = shadow if isinstance(shadow, dict) else {}
+        now_ts = time.time() if now_ts is None else now_ts
+        row = {
+            "ts": now_ts,
+            "symbol": candidate.get("symbol"),
+            "side": candidate.get("side"),
+            "signal_ts": _first_nonblank(
+                candidate.get("signal_created_ts"),
+                candidate.get("source_timestamp"),
+                candidate.get("collector_ts"),
+                candidate.get("timestamp"),
+            ),
+            "v1_decision": v1_decision,
+            "v1_reason": v1_reason,
+            "v1_entry": shadow.get("v1_entry"),
+            "v1_sl": shadow.get("v1_sl"),
+            "v1_rr": shadow.get("v1_rr"),
+            "smc_zone": fields.get("smc_zone"),
+            "market_regime": fields.get("market_regime"),
+            "bos_quality": fields.get("bos_quality"),
+            "exhaustion": fields.get("exhaustion"),
+            "v2_shadow_status": shadow.get("v2_shadow_status"),
+            "v2_shadow_reason": shadow.get("v2_shadow_reason"),
+            "v2_location_score": shadow.get("v2_location_score"),
+            "v2_late_chase_score": shadow.get("v2_late_chase_score"),
+            "v2_structure_score": shadow.get("v2_structure_score"),
+            "v2_expected_entry": shadow.get("v2_expected_entry"),
+            "v2_structural_sl": shadow.get("v2_structural_sl"),
+            "v2_expected_rr": shadow.get("v2_expected_rr"),
+            "v2_compared_to_v1": shadow.get("v2_compared_to_v1"),
+            "v2_feature_quality": shadow.get("v2_feature_quality"),
+        }
+        os.makedirs("logs", exist_ok=True)
+        with open(SMC_ENTRY_V2_SHADOW_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[SMC_ENTRY_V2_SHADOW] log failed: {exc}")
+
+
+# =====================================================================
+# SMC_PA_SCORE_V3_SHADOW (SHADOW / LOG-ONLY)
+# ---------------------------------------------------------------------
+# Per-component SMC/PA quality annotator for the CONFIRM_SMC_RESEARCH lane
+# (SMC_PA_SCORE_MODEL_AUDIT follow-up). Pure instrumentation: it NEVER gates,
+# NEVER changes a paper/live decision, never touches risk/cap/A3, SL/MIN_LOCK/
+# trailing or any order path, and never fetches network data — the BTC context
+# it reads is the independent context already computed by the caller.
+# Components are logged raw and separately so each one's predictiveness can be
+# measured on realized outcomes before any weight or gate is proposed
+# (the audit script enforces an n>=100 rule before recommendations).
+# Old degenerate BTC fields (btc_m5/m15/h1_bias_label unified-router copies)
+# are NEVER consulted: market bias uses independent BTC fields only, otherwise
+# the component is 0 and marked missing.
+# =====================================================================
+_SMC_PA_V3_VERSION = "smc_pa_score_v3_shadow_v0.1_log_only"
+_SMC_PA_V3_LOG = os.path.join("logs", "smc_pa_score_v3_shadow.jsonl")
+
+# Summary fields folded (additively) into the paper/live decision payloads.
+# Kept separate so the simulator can strip them and assert the underlying
+# decision rows are unchanged.
+_SMC_PA_V3_SUMMARY_FIELDS = (
+    "smc_pa_v3_total_score",
+    "smc_pa_v3_score_band",
+    "smc_pa_v3_missing_components",
+    "smc_pa_v3_version",
+)
+
+_SMC_PA_V3_COMPONENT_FIELDS = (
+    "smc_pa_v3_market_bias_score",
+    "smc_pa_v3_regime_score",
+    "smc_pa_v3_structure_quality_score",
+    "smc_pa_v3_liquidity_sweep_score",
+    "smc_pa_v3_location_quality_score",
+    "smc_pa_v3_breakout_acceptance_score",
+    "smc_pa_v3_relative_strength_score",
+    "smc_pa_v3_volatility_sl_quality_score",
+    "smc_pa_v3_target_realism_score",
+    "smc_pa_v3_execution_risk_score",
+)
+
+_SMC_PA_V3_STRONG_MIN = 4.0
+_SMC_PA_V3_OK_MIN = 1.0
+_SMC_PA_V3_WEAK_MIN = -2.0
+# More missing components than this -> banding is not meaningful.
+_SMC_PA_V3_MAX_MISSING_FOR_BANDING = 4
+_SMC_PA_V3_EXEC_RISK_AGE_FRACTION = 0.7
+
+_SMC_PA_V3_EXPANSION_REGIMES = {"TRENDING_CONTINUATION", "BREAKOUT_EXPANSION"}
+_SMC_PA_V3_STRUCTURE_POSITIVE = {
+    "STRONG", "CONFIRM", "TRUE", "CONFIRMED", "CLOSE_THROUGH", "DISPLACEMENT",
+}
+_SMC_PA_V3_PREBREAK_TOKENS = (
+    "PRE_BREAK", "PREBREAK", "RETEST", "PULLBACK", "RECLAIM", "ACCEPT",
+)
+_SMC_PA_V3_LATE_EXHAUSTION = {"EXTENDED", "EXHAUSTED", "COLLAPSING"}
+
+
+def _smc_pa_v3_text(value):
+    return str(value or "").strip().upper()
+
+
+def _smc_pa_v3_float(value):
+    try:
+        if value in (None, ""):
+            return None
+        out = float(value)
+        if out != out:
+            return None
+        return out
+    except (TypeError, ValueError):
+        return None
+
+
+def _smc_pa_v3_source_value(source, *keys):
+    for key in keys:
+        value = source.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _smc_pa_score_v3_eval(source, side=None, btc_ctx=None, stale_info=None):
+    """Pure SMC_PA_SCORE_V3 component evaluator. LOG-ONLY; no I/O, no network.
+
+    Reads only the merged decision-context dict (candidate/fields/trade) and
+    the already-computed independent BTC context. Never mutates its inputs.
+    Returns all component scores separately plus total/band/missing list.
+    """
+    source = source if isinstance(source, dict) else {}
+    btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else {}
+    stale_info = stale_info if isinstance(stale_info, dict) else {}
+    side = _smc_pa_v3_text(side or source.get("side"))
+
+    missing = []
+    reasons = {}
+
+    smc_zone = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "smc_zone"))
+    market_regime = _smc_pa_v3_text(
+        _smc_pa_v3_source_value(source, "market_regime", "market_regime_at_entry", "regime")
+    )
+    bos_quality = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "bos_quality"))
+    phase = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "phase"))
+    liquidity_sweep = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "liquidity_sweep"))
+    exhaustion = _smc_pa_v3_text(
+        _smc_pa_v3_source_value(source, "exhaustion", "exhaustion_state")
+    )
+    volume_confirmation = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "volume_confirmation"))
+    trend_direction = _smc_pa_v3_text(_smc_pa_v3_source_value(source, "trend_direction"))
+
+    entry = _smc_pa_v3_float(
+        _smc_pa_v3_source_value(source, "entry", "entry_real", "entry_price")
+    )
+    sl = _smc_pa_v3_float(_smc_pa_v3_source_value(source, "sl", "stop_loss"))
+    tp = _smc_pa_v3_float(_smc_pa_v3_source_value(source, "tp", "take_profit"))
+    planned_rr = _smc_pa_v3_float(_smc_pa_v3_source_value(source, "planned_rr", "rr"))
+    atr = _smc_pa_v3_float(
+        _smc_pa_v3_source_value(source, "atr", "atr_m15", "atr_15m", "atr14", "atr_value")
+    )
+
+    # ── 1. market_bias_score: INDEPENDENT BTC fields only ────────────────
+    # Degenerate unified-router labels (btc_m5/m15/h1_bias_label,
+    # btc_mtf_summary_label) are intentionally never read here.
+    market_bias_score = 0
+    bias_source = "NONE"
+    bias_value = "UNKNOWN"
+    independent_bias = _smc_pa_v3_text(btc_ctx.get("btc_bias_independent"))
+    independent_quality = _smc_pa_v3_text(btc_ctx.get("btc_context_quality"))
+    independent_alignment = _smc_pa_v3_text(btc_ctx.get("btc_alignment_independent"))
+    mtf_alignment = _smc_pa_v3_text(btc_ctx.get("btc_mtf_alignment"))
+    mtf_data_mode = _smc_pa_v3_text(btc_ctx.get("btc_data_mode"))
+    if (
+        side in ("LONG", "SHORT")
+        and independent_bias in ("BULLISH", "BEARISH", "NEUTRAL_OR_CHOP")
+        and independent_quality not in ("", "MISSING")
+    ):
+        bias_source = "btc_bias_independent"
+        bias_value = independent_bias
+        if independent_bias == "NEUTRAL_OR_CHOP":
+            market_bias_score = 0
+            reasons["market_bias"] = "neutral_or_chop"
+        elif (side == "LONG" and independent_bias == "BULLISH") or (
+            side == "SHORT" and independent_bias == "BEARISH"
+        ):
+            market_bias_score = 2
+            reasons["market_bias"] = f"aligned|side={side}|bias={independent_bias}"
+        else:
+            market_bias_score = -2
+            reasons["market_bias"] = f"counter|side={side}|bias={independent_bias}"
+    elif side in ("LONG", "SHORT") and independent_alignment in ("ALIGNED", "COUNTER", "NEUTRAL"):
+        bias_source = "btc_alignment_independent"
+        bias_value = independent_alignment
+        if independent_alignment == "ALIGNED":
+            market_bias_score = 2
+        elif independent_alignment == "COUNTER":
+            market_bias_score = -2
+        reasons["market_bias"] = f"alignment_independent={independent_alignment}"
+    elif (
+        side in ("LONG", "SHORT")
+        and mtf_data_mode == "INDEPENDENT_BTC_MTF"
+        and mtf_alignment not in ("", "UNKNOWN")
+    ):
+        bias_source = "btc_mtf_alignment_independent"
+        bias_value = mtf_alignment
+        if mtf_alignment == "ALL_ALIGNED":
+            market_bias_score = 2
+        elif mtf_alignment == "COUNTER_HTF":
+            market_bias_score = -2
+        reasons["market_bias"] = f"mtf_alignment={mtf_alignment}"
+    else:
+        missing.append("market_bias")
+        reasons["market_bias"] = "independent_btc_context_unavailable"
+
+    # ── 2. regime_score ───────────────────────────────────────────────────
+    regime_score = 0
+    if market_regime == "RANGE_MEAN_REVERSION":
+        regime_score = 1
+        reasons["regime"] = "range_mean_reversion"
+    elif market_regime in ("CHOP_NO_TRADE", "EXHAUSTION_REVERSAL"):
+        regime_score = -2
+        reasons["regime"] = f"bad_regime={market_regime}"
+    elif market_regime in _SMC_PA_V3_EXPANSION_REGIMES:
+        if trend_direction in ("LONG", "SHORT") and trend_direction == side:
+            regime_score = 1
+            reasons["regime"] = f"expansion_side_aligned={market_regime}"
+        else:
+            regime_score = 0
+            reasons["regime"] = f"expansion_not_side_confirmed={market_regime}"
+    elif market_regime in ("", "UNKNOWN", "INSUFFICIENT_DATA"):
+        missing.append("regime")
+        reasons["regime"] = "market_regime_unavailable"
+    else:
+        reasons["regime"] = f"unmapped_regime={market_regime}"
+
+    # ── 3. structure_quality_score ────────────────────────────────────────
+    structure_quality_score = 0
+    if bos_quality == "TRAP":
+        structure_quality_score = 2
+        reasons["structure_quality"] = "trap_sweep_reclaim_like"
+    elif bos_quality in _SMC_PA_V3_STRUCTURE_POSITIVE:
+        structure_quality_score = 1
+        reasons["structure_quality"] = f"bos_quality={bos_quality}"
+    elif bos_quality == "NO_FOLLOWTHROUGH":
+        structure_quality_score = -1
+        reasons["structure_quality"] = "no_followthrough"
+    elif bos_quality in ("", "UNKNOWN"):
+        missing.append("structure_quality")
+        reasons["structure_quality"] = "bos_quality_unavailable"
+    else:
+        reasons["structure_quality"] = f"neutral_bos_quality={bos_quality}"
+
+    # ── 4. liquidity_sweep_score ──────────────────────────────────────────
+    # The SWEEP_HIGH/SWEEP_LOW annotation (compute_smc_context) already
+    # requires the sweep candle to close back inside the level, so the
+    # reclaim condition is embedded in the label itself.
+    liquidity_sweep_score = 0
+    if liquidity_sweep in ("", "UNKNOWN"):
+        missing.append("liquidity_sweep")
+        reasons["liquidity_sweep"] = "liquidity_sweep_unavailable"
+    elif side == "LONG" and liquidity_sweep == "SWEEP_LOW":
+        liquidity_sweep_score = 2
+        reasons["liquidity_sweep"] = "long_after_sweep_low_reclaim"
+    elif side == "SHORT" and liquidity_sweep == "SWEEP_HIGH":
+        liquidity_sweep_score = 2
+        reasons["liquidity_sweep"] = "short_after_sweep_high_reclaim"
+    elif side == "LONG" and liquidity_sweep == "SWEEP_HIGH":
+        liquidity_sweep_score = -1
+        reasons["liquidity_sweep"] = "long_into_sweep_high"
+    elif side == "SHORT" and liquidity_sweep == "SWEEP_LOW":
+        liquidity_sweep_score = -1
+        reasons["liquidity_sweep"] = "short_into_sweep_low"
+    else:
+        reasons["liquidity_sweep"] = f"no_sweep={liquidity_sweep or 'NONE'}"
+
+    # ── 5. location_quality_score ─────────────────────────────────────────
+    bullish_expansion = (
+        market_regime in _SMC_PA_V3_EXPANSION_REGIMES and trend_direction == "LONG"
+    )
+    bearish_expansion = (
+        market_regime in _SMC_PA_V3_EXPANSION_REGIMES and trend_direction == "SHORT"
+    )
+    location_quality_score = 0
+    if smc_zone in ("", "UNKNOWN"):
+        missing.append("location_quality")
+        reasons["location_quality"] = "smc_zone_unavailable"
+    elif side == "LONG" and smc_zone == "DISCOUNT":
+        location_quality_score = 2
+        reasons["location_quality"] = "long_in_discount"
+    elif side == "LONG" and smc_zone == "PREMIUM":
+        if bullish_expansion:
+            location_quality_score = 0
+            reasons["location_quality"] = "long_in_premium_softened_bullish_expansion"
+        else:
+            location_quality_score = -2
+            reasons["location_quality"] = "long_in_premium"
+    elif side == "SHORT" and smc_zone == "PREMIUM":
+        location_quality_score = 2
+        reasons["location_quality"] = "short_in_premium"
+    elif side == "SHORT" and smc_zone == "DISCOUNT":
+        if bearish_expansion:
+            location_quality_score = 0
+            reasons["location_quality"] = "short_in_discount_softened_bearish_expansion"
+        else:
+            location_quality_score = -2
+            reasons["location_quality"] = "short_in_discount"
+    else:
+        reasons["location_quality"] = f"neutral_zone={smc_zone}"
+
+    # ── 6. breakout_acceptance_score (proxy) ──────────────────────────────
+    # Real N-bar follow-through instrumentation does not exist yet; this is a
+    # proxy from phase/bos_quality and is always flagged as missing the real
+    # follow-through measurement.
+    missing.append("breakout_acceptance_followthrough_bars")
+    stale_resolved = stale_info.get("candidate_time_source") not in (None, "", "missing")
+    is_stale = bool(stale_resolved and stale_info.get("is_stale"))
+    late_chase_context = is_stale or exhaustion in _SMC_PA_V3_LATE_EXHAUSTION
+    breakout_acceptance_score = 0
+    if bos_quality == "NO_FOLLOWTHROUGH":
+        breakout_acceptance_score = -2
+        reasons["breakout_acceptance"] = "no_followthrough"
+    elif phase == "BREAKOUT_STRONG" and late_chase_context:
+        breakout_acceptance_score = -2
+        reasons["breakout_acceptance"] = "breakout_strong_late_chase"
+    elif any(token in phase for token in _SMC_PA_V3_PREBREAK_TOKENS):
+        breakout_acceptance_score = 1
+        reasons["breakout_acceptance"] = f"pre_break_or_retest_phase={phase}"
+    elif phase in ("", "UNKNOWN"):
+        reasons["breakout_acceptance"] = "phase_unavailable_proxy_neutral"
+    else:
+        reasons["breakout_acceptance"] = f"neutral_phase={phase}"
+
+    # ── 7. relative_strength_score ────────────────────────────────────────
+    # Never inferred from trade side or degenerate fields.
+    relative_strength_score = 0
+    rs_value = _smc_pa_v3_float(
+        _smc_pa_v3_source_value(
+            source,
+            "relative_strength_alt_vs_btc",
+            "alt_vs_btc_rs",
+            "relative_strength_ratio",
+        )
+    )
+    if rs_value is None:
+        missing.append("relative_strength")
+        reasons["relative_strength"] = "alt_vs_btc_rs_unavailable|NEED_RS_INSTRUMENTATION"
+    elif side == "LONG":
+        relative_strength_score = 2 if rs_value > 0 else (-2 if rs_value < 0 else 0)
+        reasons["relative_strength"] = f"rs={rs_value}"
+    elif side == "SHORT":
+        relative_strength_score = 2 if rs_value < 0 else (-2 if rs_value > 0 else 0)
+        reasons["relative_strength"] = f"rs={rs_value}"
+    else:
+        missing.append("relative_strength")
+        reasons["relative_strength"] = "missing_side"
+
+    # ── 8. volatility_sl_quality_score ────────────────────────────────────
+    volatility_sl_quality_score = 0
+    sl_dist = abs(entry - sl) if entry is not None and sl is not None else None
+    sl_atr_ratio = None
+    if sl_dist in (None, 0) or atr is None or atr <= 0:
+        missing.append("volatility_sl_quality")
+        if sl_dist in (None, 0) and (atr is None or atr <= 0):
+            reasons["volatility_sl_quality"] = "atr_and_sl_distance_unavailable"
+        elif sl_dist in (None, 0):
+            reasons["volatility_sl_quality"] = "sl_distance_unavailable"
+        else:
+            reasons["volatility_sl_quality"] = "atr_unavailable"
+    else:
+        sl_atr_ratio = round(sl_dist / atr, 4)
+        if sl_atr_ratio < 1.0:
+            volatility_sl_quality_score = -2
+            reasons["volatility_sl_quality"] = f"sl_inside_noise_ratio={sl_atr_ratio}"
+        elif sl_atr_ratio <= 2.5:
+            if market_regime == "RANGE_MEAN_REVERSION":
+                volatility_sl_quality_score = 1
+            else:
+                volatility_sl_quality_score = 0
+            reasons["volatility_sl_quality"] = f"sl_ok_ratio={sl_atr_ratio}"
+        else:
+            volatility_sl_quality_score = -1
+            reasons["volatility_sl_quality"] = f"sl_too_wide_ratio={sl_atr_ratio}"
+
+    # ── 9. target_realism_score ───────────────────────────────────────────
+    target_realism_score = 0
+    opposing_r = _smc_pa_v3_float(
+        _smc_pa_v3_source_value(source, "opposing_barrier_distance_r", "opposing_distance_r")
+    )
+    if opposing_r is None and entry is not None and sl_dist not in (None, 0):
+        resistance = _smc_pa_v3_float(
+            _smc_pa_v3_source_value(
+                source, "nearest_htf_resistance", "m15_swing_high", "range_high"
+            )
+        )
+        support = _smc_pa_v3_float(
+            _smc_pa_v3_source_value(
+                source, "nearest_htf_support", "m15_swing_low", "range_low"
+            )
+        )
+        if side == "LONG" and resistance is not None:
+            opposing_r = round(abs(resistance - entry) / sl_dist, 4)
+        elif side == "SHORT" and support is not None:
+            opposing_r = round(abs(entry - support) / sl_dist, 4)
+    if opposing_r is None or planned_rr is None:
+        missing.append("target_realism")
+        if opposing_r is None and planned_rr is None:
+            reasons["target_realism"] = "opposing_distance_and_planned_rr_unavailable"
+        elif opposing_r is None:
+            reasons["target_realism"] = "opposing_distance_unavailable"
+        else:
+            reasons["target_realism"] = "planned_rr_unavailable"
+    elif planned_rr <= opposing_r:
+        target_realism_score = 1
+        reasons["target_realism"] = (
+            f"target_before_opposing_liquidity|planned_rr={planned_rr}|opposing_r={opposing_r}"
+        )
+    else:
+        target_realism_score = -2
+        reasons["target_realism"] = (
+            f"target_beyond_opposing_liquidity|planned_rr={planned_rr}|opposing_r={opposing_r}"
+        )
+
+    # ── 10. execution_risk_score ──────────────────────────────────────────
+    execution_risk_score = 0
+    age_secs = _smc_pa_v3_float(stale_info.get("candidate_age_secs"))
+    max_age_secs = _smc_pa_v3_float(stale_info.get("candidate_max_age_secs"))
+    if not stale_resolved:
+        missing.append("execution_risk_signal_age")
+        reasons["execution_risk"] = "signal_timestamp_unavailable"
+    elif is_stale or (
+        age_secs is not None
+        and max_age_secs not in (None, 0)
+        and age_secs >= max_age_secs * _SMC_PA_V3_EXEC_RISK_AGE_FRACTION
+    ):
+        execution_risk_score = -1
+        reasons["execution_risk"] = (
+            f"signal_age_near_or_past_stale|age={age_secs}|max_age={max_age_secs}"
+        )
+    else:
+        reasons["execution_risk"] = f"fresh|age={age_secs}"
+
+    total = (
+        market_bias_score
+        + regime_score
+        + structure_quality_score
+        + liquidity_sweep_score
+        + location_quality_score
+        + breakout_acceptance_score
+        + relative_strength_score
+        + volatility_sl_quality_score
+        + target_realism_score
+        + execution_risk_score
+    )
+
+    if len(missing) > _SMC_PA_V3_MAX_MISSING_FOR_BANDING:
+        band = "V3_UNKNOWN_TOO_MISSING"
+    elif total >= _SMC_PA_V3_STRONG_MIN:
+        band = "V3_STRONG"
+    elif total >= _SMC_PA_V3_OK_MIN:
+        band = "V3_OK"
+    elif total >= _SMC_PA_V3_WEAK_MIN:
+        band = "V3_WEAK"
+    else:
+        band = "V3_REJECT_LIKE"
+
+    return {
+        "smc_pa_v3_version": _SMC_PA_V3_VERSION,
+        "smc_pa_v3_total_score": round(float(total), 4),
+        "smc_pa_v3_score_band": band,
+        "smc_pa_v3_market_bias_score": market_bias_score,
+        "smc_pa_v3_regime_score": regime_score,
+        "smc_pa_v3_structure_quality_score": structure_quality_score,
+        "smc_pa_v3_liquidity_sweep_score": liquidity_sweep_score,
+        "smc_pa_v3_location_quality_score": location_quality_score,
+        "smc_pa_v3_breakout_acceptance_score": breakout_acceptance_score,
+        "smc_pa_v3_relative_strength_score": relative_strength_score,
+        "smc_pa_v3_volatility_sl_quality_score": volatility_sl_quality_score,
+        "smc_pa_v3_target_realism_score": target_realism_score,
+        "smc_pa_v3_execution_risk_score": execution_risk_score,
+        "smc_pa_v3_missing_components": list(missing),
+        "smc_pa_v3_component_reasons": dict(reasons),
+        "smc_pa_v3_bias_source": bias_source,
+        "smc_pa_v3_bias_value": bias_value,
+        # Source snapshot used by the evaluator (for later audits).
+        "smc_pa_v3_src_smc_zone": smc_zone,
+        "smc_pa_v3_src_market_regime": market_regime,
+        "smc_pa_v3_src_bos_quality": bos_quality,
+        "smc_pa_v3_src_phase": phase,
+        "smc_pa_v3_src_liquidity_sweep": liquidity_sweep,
+        "smc_pa_v3_src_exhaustion": exhaustion,
+        "smc_pa_v3_src_volume_confirmation": volume_confirmation,
+        "smc_pa_v3_src_trend_direction": trend_direction,
+        "smc_pa_v3_src_atr": atr,
+        "smc_pa_v3_src_sl_atr_ratio": sl_atr_ratio,
+        "smc_pa_v3_src_opposing_barrier_distance_r": opposing_r,
+        "smc_pa_v3_src_planned_rr": planned_rr,
+        "smc_pa_v3_src_candidate_age_secs": age_secs,
+        "smc_pa_v3_src_entry": entry,
+        "smc_pa_v3_src_sl": sl,
+        "smc_pa_v3_src_tp": tp,
+    }
+
+
+def _smc_pa_score_v3_shadow_write(row):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(_SMC_PA_V3_LOG, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True)
+                + "\n"
+            )
+    except Exception as exc:
+        print(f"[SMC_PA_SCORE_V3_SHADOW] log failed: {exc}")
+
+
+def _smc_pa_score_v3_shadow(
+    candidate,
+    fields=None,
+    trade=None,
+    execution_mode="",
+    v1_decision="",
+    v1_reason="",
+    btc_ctx=None,
+    now_ts=None,
+):
+    """Assemble + append one SMC_PA_SCORE_V3 shadow row (forward log) and
+    return the additive summary fields for the decision payload.
+
+    SHADOW / LOG-ONLY. Never mutates candidate/fields/trade, never raises into
+    the caller, never fetches network data, never touches any decision, risk,
+    SL/order or gate path. Returns {} on any failure.
+    """
+    try:
+        candidate = candidate if isinstance(candidate, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        trade = trade if isinstance(trade, dict) else {}
+        btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else {}
+        now_ts = time.time() if now_ts is None else now_ts
+
+        entry_type = _smc_pa_v3_text(
+            _first_nonblank(
+                trade.get("entry_type"),
+                candidate.get("entry_type"),
+                "CONFIRM_SMC_RESEARCH",
+            )
+        )
+        if entry_type not in ("CONFIRM", "CONFIRM_SMC_RESEARCH"):
+            return {}
+
+        source = {}
+        source.update(candidate)
+        source.update({k: v for k, v in fields.items() if v not in (None, "")})
+        source.update({k: v for k, v in trade.items() if v not in (None, "")})
+
+        # Log-only fallback: reuse the level/ATR context already carried by
+        # the candidate (confirm_entry_acceptance_context) for components
+        # whose flat source fields are absent. Only fills gaps in the local
+        # merged copy — never overwrites an existing value and never mutates
+        # candidate/fields/trade.
+        _v3_acceptance_ctx = source.get("confirm_entry_acceptance_context")
+        _v3_acceptance_ctx = _v3_acceptance_ctx if isinstance(_v3_acceptance_ctx, dict) else {}
+        ctx_fallback_used = []
+        for _ctx_key in ("atr", "nearest_htf_support", "nearest_htf_resistance"):
+            if source.get(_ctx_key) in (None, "") and _v3_acceptance_ctx.get(_ctx_key) not in (None, ""):
+                source[_ctx_key] = _v3_acceptance_ctx.get(_ctx_key)
+                ctx_fallback_used.append(_ctx_key)
+
+        side = _smc_pa_v3_text(_first_nonblank(candidate.get("side"), trade.get("side")))
+        stale_info = _paper_smc_research_stale_info(candidate, now_ts)
+        shadow = _smc_pa_score_v3_eval(
+            source, side=side, btc_ctx=btc_ctx, stale_info=stale_info
+        )
+
+        row = {
+            "ts": now_ts,
+            "timestamp": format_vn_time(now_ts),
+            "event_type": "SMC_PA_SCORE_V3_SHADOW",
+            "execution_mode": execution_mode,
+            "symbol": str(_first_nonblank(candidate.get("symbol"), trade.get("symbol")) or ""),
+            "side": side,
+            "signal_ts": _first_nonblank(
+                candidate.get("signal_created_ts"),
+                candidate.get("source_timestamp"),
+                candidate.get("collector_ts"),
+                candidate.get("timestamp"),
+            ),
+            "dedup_key": str(candidate.get("dedup_key") or ""),
+            "entry_type": entry_type,
+            "v1_decision": v1_decision,
+            "v1_reason": v1_reason,
+            "old_score": _smc_pa_v3_float(
+                _first_nonblank(trade.get("score"), candidate.get("score"))
+            ),
+            "entry": _smc_pa_v3_float(
+                _first_nonblank(trade.get("entry"), candidate.get("entry"))
+            ),
+            "sl": _smc_pa_v3_float(_first_nonblank(trade.get("sl"), candidate.get("sl"))),
+            "tp": _smc_pa_v3_float(_first_nonblank(trade.get("tp"), candidate.get("tp"))),
+            "rr": _smc_pa_v3_float(
+                _first_nonblank(
+                    fields.get("planned_rr"), trade.get("rr"), candidate.get("rr")
+                )
+            ),
+            # PAPER_LOCATION_GATE context (read-only passthrough, if available)
+            "paper_location_gate_would_block": source.get(
+                "confirm_smc_entry_location_would_block"
+            ),
+            "paper_location_gate_primary_reason": source.get(
+                "confirm_smc_entry_location_primary_reason"
+            ),
+            "paper_location_gate_risk_bucket": source.get(
+                "confirm_smc_entry_location_risk_bucket"
+            ),
+            # V2B allowlist context (read-only passthrough, if available)
+            "v2b_label": source.get("v2b_label"),
+            "v2b_match": source.get("v2b_match"),
+            "v2b_reason": source.get("v2b_reason"),
+            "v2b_market_bias": source.get("v2b_market_bias"),
+            "v2b_direction_alignment": source.get("v2b_direction_alignment"),
+            # BTC bias side-enable context (read-only passthrough, if available)
+            "btc_side_enable_shadow_label": btc_ctx.get("btc_side_enable_shadow_label"),
+            "btc_side_enable_shadow_allow": btc_ctx.get("btc_side_enable_shadow_allow"),
+            "btc_bias_independent": btc_ctx.get("btc_bias_independent"),
+            "btc_alignment_independent": btc_ctx.get("btc_alignment_independent"),
+            "btc_context_quality": btc_ctx.get("btc_context_quality"),
+            "btc_mtf_alignment": btc_ctx.get("btc_mtf_alignment"),
+            "btc_data_mode": btc_ctx.get("btc_data_mode"),
+            # Which component inputs were filled from the candidate's
+            # confirm_entry_acceptance_context (log-only provenance).
+            "smc_pa_v3_ctx_fallback_used": list(ctx_fallback_used),
+            "smc_pa_v3_ctx_fallback_source": _v3_acceptance_ctx.get("context_source"),
+        }
+        row.update(shadow)
+        _smc_pa_score_v3_shadow_write(row)
+        return {key: shadow.get(key) for key in _SMC_PA_V3_SUMMARY_FIELDS}
+    except Exception as exc:
+        print(f"[SMC_PA_SCORE_V3_SHADOW] shadow failed: {exc}")
+        return {}
+
+
+# =====================================================================
+# BREAKOUT_ACCEPTANCE_SHADOW (SHADOW / LOG-ONLY)
+# ---------------------------------------------------------------------
+# Breakout acceptance instrumentation for the CONFIRM_SMC_RESEARCH lane
+# (BOS follow-through research: NO_FOLLOWTHROUGH is the largest losing
+# class and current BOS is effectively single-candle/immediate). Pure
+# instrumentation: it NEVER gates, NEVER changes a paper/live decision,
+# never touches risk/cap/A3, SL/MIN_LOCK/trailing or any order path,
+# never fetches network data, and never adds fields to any decision
+# payload — it only appends rows to its own forward log so future audits
+# can test whether BOS entries should require acceptance / hold / retest
+# confirmation.
+# Runtime N-bar lifecycle tracking is intentionally NOT wired into the
+# candle update loops (too close to decision paths for a shadow); rows
+# are written at decision time with lifecycle fields = None and
+# lifecycle_tracking = "MISSING_RUNTIME_DEFERRED_TO_AUDIT".
+# scripts/debug/audit_breakout_acceptance_shadow.py reconstructs an
+# approximate lifecycle from logs/confirm_structural_outcomes.jsonl.
+# The pure evaluator below accepts optional follow bars so the simulator
+# (and any offline reconstruction) can compute the terminal labels.
+# =====================================================================
+_BREAKOUT_ACCEPT_VERSION = "breakout_acceptance_shadow_v0.1_log_only"
+_BREAKOUT_ACCEPT_LOG = os.path.join("logs", "breakout_acceptance_shadow.jsonl")
+# Same retest tolerance family as entry._detect_retest (0.5% of level).
+_BREAKOUT_ACCEPT_RETEST_TOL = 0.005
+_BREAKOUT_ACCEPT_MAX_BARS = 3
+
+_BREAKOUT_LABEL_ACCEPTED = "BREAKOUT_ACCEPTED"
+_BREAKOUT_LABEL_RETEST_HELD = "BREAKOUT_RETEST_HELD"
+_BREAKOUT_LABEL_FAILED_BACK_INSIDE = "BREAKOUT_FAILED_BACK_INSIDE"
+_BREAKOUT_LABEL_WICK_REJECTED = "BREAKOUT_WICK_REJECTED"
+_BREAKOUT_LABEL_NO_FOLLOWTHROUGH = "BREAKOUT_NO_FOLLOWTHROUGH"
+_BREAKOUT_LABEL_UNKNOWN_MISSING_LEVEL = "BREAKOUT_UNKNOWN_MISSING_LEVEL"
+# Non-terminal label used at decision time when the candle closed through
+# the level but no (or not enough) follow bars have been observed yet.
+_BREAKOUT_LABEL_PENDING_LIFECYCLE = "BREAKOUT_PENDING_LIFECYCLE"
+
+
+def _breakout_acceptance_eval(side, breakout_level, signal_candle=None,
+                              follow_bars=None, entry=None, sl=None):
+    """Pure breakout-acceptance classifier. LOG-ONLY; no I/O, no network.
+
+    signal_candle: OHLC dict of the BOS/breakout signal candle.
+    follow_bars: optional list of OHLC dicts AFTER the signal candle (oldest
+    first; only the first _BREAKOUT_ACCEPT_MAX_BARS are consumed). Production
+    decision-time calls pass no follow bars (runtime lifecycle is deferred to
+    the audit reconstruction); the simulator / offline reconstruction pass
+    bars to obtain the terminal labels. Never mutates its inputs.
+    """
+    side = _smc_pa_v3_text(side)
+    level = _smc_pa_v3_float(breakout_level)
+    candle = signal_candle if isinstance(signal_candle, dict) else {}
+    bars = [bar for bar in (follow_bars or []) if isinstance(bar, dict)]
+    bars = bars[:_BREAKOUT_ACCEPT_MAX_BARS]
+
+    entry_val = _smc_pa_v3_float(entry)
+    sl_val = _smc_pa_v3_float(sl)
+    risk = None
+    if entry_val is not None and sl_val is not None:
+        risk_abs = abs(entry_val - sl_val)
+        if risk_abs > 0:
+            risk = risk_abs
+
+    out = {
+        "breakout_acceptance_version": _BREAKOUT_ACCEPT_VERSION,
+        "breakout_level_value": level,
+        "signal_candle_open": _smc_pa_v3_float(candle.get("open")),
+        "signal_candle_high": _smc_pa_v3_float(candle.get("high")),
+        "signal_candle_low": _smc_pa_v3_float(candle.get("low")),
+        "signal_candle_close": _smc_pa_v3_float(candle.get("close")),
+        "entry_distance_from_level_pct": None,
+        "close_distance_from_level_pct": None,
+        "close_beyond_level": None,
+        "wick_rejection": None,
+        "retest_candidate": None,
+        "follow_bars_observed": len(bars),
+        "acceptance_1bar": None,
+        "acceptance_2bar": None,
+        "acceptance_3bar": None,
+        "held_breakout_level": None,
+        "failed_back_inside_level": None,
+        "retest_held": None,
+        "retest_failed": None,
+        "max_favorable_r_after_3bars": None,
+        "max_adverse_r_after_3bars": None,
+        "time_to_0_25r_bars": None,
+        "time_to_0_5r_bars": None,
+        "breakout_acceptance_label": _BREAKOUT_LABEL_UNKNOWN_MISSING_LEVEL,
+    }
+
+    c_close = out["signal_candle_close"]
+    if side not in ("LONG", "SHORT") or level is None or level <= 0 or c_close is None:
+        return out
+
+    c_high = out["signal_candle_high"]
+    c_low = out["signal_candle_low"]
+
+    if entry_val is not None:
+        out["entry_distance_from_level_pct"] = (entry_val - level) / level
+    out["close_distance_from_level_pct"] = (c_close - level) / level
+
+    if side == "LONG":
+        closed_through = c_close > level
+        wick_broke = c_high is not None and c_high > level
+    else:
+        closed_through = c_close < level
+        wick_broke = c_low is not None and c_low < level
+    wick_rejection = bool(wick_broke and not closed_through)
+    retest_candidate = bool(
+        closed_through and abs(c_close - level) / level <= _BREAKOUT_ACCEPT_RETEST_TOL
+    )
+    out["close_beyond_level"] = closed_through
+    out["wick_rejection"] = wick_rejection
+    out["retest_candidate"] = retest_candidate
+
+    bar_closes = []
+    bar_highs = []
+    bar_lows = []
+    for bar in bars:
+        bar_closes.append(_smc_pa_v3_float(bar.get("close")))
+        bar_highs.append(_smc_pa_v3_float(bar.get("high")))
+        bar_lows.append(_smc_pa_v3_float(bar.get("low")))
+
+    def _close_beyond(value):
+        if value is None:
+            return None
+        if side == "LONG":
+            return value > level
+        return value < level
+
+    beyond_flags = [_close_beyond(value) for value in bar_closes]
+    for idx, key in enumerate(("acceptance_1bar", "acceptance_2bar", "acceptance_3bar")):
+        if idx < len(beyond_flags):
+            out[key] = beyond_flags[idx]
+
+    known_flags = [flag for flag in beyond_flags if flag is not None]
+    if known_flags:
+        held = all(known_flags)
+        out["held_breakout_level"] = held
+        out["failed_back_inside_level"] = bool(closed_through and not held)
+
+        touched = False
+        for bar_high, bar_low in zip(bar_highs, bar_lows):
+            if side == "LONG":
+                if bar_low is not None and bar_low <= level * (1.0 + _BREAKOUT_ACCEPT_RETEST_TOL):
+                    touched = True
+            else:
+                if bar_high is not None and bar_high >= level * (1.0 - _BREAKOUT_ACCEPT_RETEST_TOL):
+                    touched = True
+        out["retest_held"] = bool(closed_through and touched and held)
+        out["retest_failed"] = bool(closed_through and touched and not held)
+
+    if risk is not None and entry_val is not None and bars:
+        fav_extremes = bar_highs if side == "LONG" else bar_lows
+        adv_extremes = bar_lows if side == "LONG" else bar_highs
+        max_fav = None
+        max_adv = None
+        for bar_index, (fav, adv) in enumerate(zip(fav_extremes, adv_extremes), start=1):
+            if fav is not None:
+                if side == "LONG":
+                    fav_r = (fav - entry_val) / risk
+                else:
+                    fav_r = (entry_val - fav) / risk
+                if max_fav is None or fav_r > max_fav:
+                    max_fav = fav_r
+                if out["time_to_0_25r_bars"] is None and fav_r >= 0.25:
+                    out["time_to_0_25r_bars"] = bar_index
+                if out["time_to_0_5r_bars"] is None and fav_r >= 0.5:
+                    out["time_to_0_5r_bars"] = bar_index
+            if adv is not None:
+                if side == "LONG":
+                    adv_r = (entry_val - adv) / risk
+                else:
+                    adv_r = (adv - entry_val) / risk
+                if max_adv is None or adv_r > max_adv:
+                    max_adv = adv_r
+        out["max_favorable_r_after_3bars"] = max_fav
+        out["max_adverse_r_after_3bars"] = max_adv
+
+    if wick_rejection:
+        label = _BREAKOUT_LABEL_WICK_REJECTED
+    elif not closed_through:
+        # BOS claimed a breakout but the signal candle never closed through
+        # the level and never even wicked through it: no follow-through
+        # evidence at all.
+        label = _BREAKOUT_LABEL_NO_FOLLOWTHROUGH
+    elif not known_flags:
+        label = _BREAKOUT_LABEL_PENDING_LIFECYCLE
+    elif out["failed_back_inside_level"]:
+        label = _BREAKOUT_LABEL_FAILED_BACK_INSIDE
+    elif out["retest_held"]:
+        label = _BREAKOUT_LABEL_RETEST_HELD
+    elif out["held_breakout_level"] and len(known_flags) >= 2:
+        label = _BREAKOUT_LABEL_ACCEPTED
+    else:
+        label = _BREAKOUT_LABEL_PENDING_LIFECYCLE
+    out["breakout_acceptance_label"] = label
+    return out
+
+
+def _breakout_acceptance_shadow_write(row):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(_BREAKOUT_ACCEPT_LOG, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True)
+                + "\n"
+            )
+    except Exception as exc:
+        print(f"[BREAKOUT_ACCEPTANCE_SHADOW] log failed: {exc}")
+
+
+def _breakout_acceptance_shadow(
+    candidate,
+    fields=None,
+    trade=None,
+    execution_mode="",
+    v1_decision="",
+    v1_reason="",
+    btc_ctx=None,
+    v3_summary=None,
+    now_ts=None,
+):
+    """Assemble + append one BREAKOUT_ACCEPTANCE_SHADOW forward-log row.
+
+    SHADOW / LOG-ONLY. Never mutates candidate/fields/trade/btc_ctx/
+    v3_summary, never raises into the caller, never fetches network data,
+    never touches any decision, risk, SL/order or gate path, and never adds
+    fields to any decision payload (callers must ignore the return value in
+    production). Returns the logged row for the simulator, {} on any failure.
+    """
+    try:
+        candidate = candidate if isinstance(candidate, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        trade = trade if isinstance(trade, dict) else {}
+        btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else {}
+        v3_summary = v3_summary if isinstance(v3_summary, dict) else {}
+        now_ts = time.time() if now_ts is None else now_ts
+
+        entry_type = _smc_pa_v3_text(
+            _first_nonblank(
+                trade.get("entry_type"),
+                candidate.get("entry_type"),
+                "CONFIRM_SMC_RESEARCH",
+            )
+        )
+        if entry_type not in ("CONFIRM", "CONFIRM_SMC_RESEARCH"):
+            return {}
+
+        source = {}
+        source.update(candidate)
+        source.update({k: v for k, v in fields.items() if v not in (None, "")})
+        source.update({k: v for k, v in trade.items() if v not in (None, "")})
+
+        side = _smc_pa_v3_text(_first_nonblank(candidate.get("side"), trade.get("side")))
+        acceptance_ctx = source.get("confirm_entry_acceptance_context")
+        acceptance_ctx = acceptance_ctx if isinstance(acceptance_ctx, dict) else {}
+
+        bos_level = _smc_pa_v3_float(
+            _smc_pa_v3_source_value(source, "bos_level", "bos_price")
+        )
+        # Same precedence as before; additionally records which source the
+        # level came from and the exact reason when it is missing (log-only).
+        breakout_level = None
+        level_source = None
+        level_missing_reason = None
+        for _level_source_name, _level_raw in (
+            ("confirm_entry_acceptance_context.break_level", acceptance_ctx.get("break_level")),
+            ("source.breakout_level", source.get("breakout_level")),
+            ("source.bos_level", source.get("bos_level")),
+            ("confirm_entry_acceptance_context.pre_break_level", acceptance_ctx.get("pre_break_level")),
+        ):
+            if _level_raw not in (None, ""):
+                breakout_level = _smc_pa_v3_float(_level_raw)
+                if breakout_level is not None:
+                    level_source = _level_source_name
+                else:
+                    level_missing_reason = f"level_value_unparsable:{_level_source_name}"
+                break
+        if breakout_level is None and level_missing_reason is None:
+            if not acceptance_ctx:
+                level_missing_reason = "acceptance_context_absent_and_no_source_level_fields"
+            else:
+                level_missing_reason = "acceptance_context_present_but_break_level_null"
+        level_available = breakout_level is not None
+
+        entry_price = _smc_pa_v3_float(
+            _first_nonblank(trade.get("entry"), candidate.get("entry"))
+        )
+        sl = _smc_pa_v3_float(_first_nonblank(trade.get("sl"), candidate.get("sl")))
+        tp = _smc_pa_v3_float(_first_nonblank(trade.get("tp"), candidate.get("tp")))
+        rr = _smc_pa_v3_float(
+            _first_nonblank(
+                fields.get("planned_rr"), trade.get("rr"), candidate.get("rr")
+            )
+        )
+
+        signal_candle = {
+            "open": acceptance_ctx.get("candle_open"),
+            "high": acceptance_ctx.get("candle_high"),
+            "low": acceptance_ctx.get("candle_low"),
+            "close": acceptance_ctx.get("candle_close"),
+        }
+        eval_fields = _breakout_acceptance_eval(
+            side,
+            breakout_level,
+            signal_candle=signal_candle,
+            follow_bars=None,
+            entry=entry_price,
+            sl=sl,
+        )
+
+        row = {
+            "ts": now_ts,
+            "timestamp": format_vn_time(now_ts),
+            "event_type": "BREAKOUT_ACCEPTANCE_SHADOW",
+            "execution_mode": execution_mode,
+            "symbol": str(_first_nonblank(candidate.get("symbol"), trade.get("symbol")) or ""),
+            "side": side,
+            "signal_ts": _first_nonblank(
+                candidate.get("signal_created_ts"),
+                candidate.get("source_timestamp"),
+                candidate.get("collector_ts"),
+                candidate.get("timestamp"),
+            ),
+            "dedup_key": str(candidate.get("dedup_key") or ""),
+            "entry_type": entry_type,
+            "v1_decision": v1_decision,
+            "v1_reason": v1_reason,
+            "entry": entry_price,
+            "entry_price": entry_price,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+            "bos_level": bos_level,
+            "breakout_level": breakout_level,
+            "level_source": level_source,
+            "level_available": level_available,
+            "level_missing_reason": level_missing_reason,
+            "signal_candle_available": _smc_pa_v3_float(acceptance_ctx.get("candle_close")) is not None,
+            "level_context_source": acceptance_ctx.get("context_source"),
+            "phase": _smc_pa_v3_text(_smc_pa_v3_source_value(source, "phase")),
+            "bos_quality": _smc_pa_v3_text(_smc_pa_v3_source_value(source, "bos_quality")),
+            "market_regime": _smc_pa_v3_text(
+                _smc_pa_v3_source_value(source, "market_regime", "market_regime_at_entry", "regime")
+            ),
+            "smc_zone": _smc_pa_v3_text(_smc_pa_v3_source_value(source, "smc_zone")),
+            "old_score": _smc_pa_v3_float(
+                _first_nonblank(trade.get("score"), candidate.get("score"))
+            ),
+            # BTC context (read-only passthrough, if available)
+            "btc_bias_independent": btc_ctx.get("btc_bias_independent"),
+            "btc_alignment_independent": btc_ctx.get("btc_alignment_independent"),
+            "btc_context_quality": btc_ctx.get("btc_context_quality"),
+            "btc_side_enable_shadow_label": btc_ctx.get("btc_side_enable_shadow_label"),
+            "btc_side_enable_shadow_allow": btc_ctx.get("btc_side_enable_shadow_allow"),
+            # SMC_PA_SCORE_V3 (read-only passthrough, if available)
+            "smc_pa_v3_total_score": _first_nonblank(
+                v3_summary.get("smc_pa_v3_total_score"), source.get("smc_pa_v3_total_score")
+            ),
+            "smc_pa_v3_score_band": _first_nonblank(
+                v3_summary.get("smc_pa_v3_score_band"), source.get("smc_pa_v3_score_band")
+            ),
+            "smc_pa_v3_version": _first_nonblank(
+                v3_summary.get("smc_pa_v3_version"), source.get("smc_pa_v3_version")
+            ),
+            # PAPER_LOCATION_GATE context (read-only passthrough, if available)
+            "paper_location_gate_would_block": source.get(
+                "confirm_smc_entry_location_would_block"
+            ),
+            "paper_location_gate_primary_reason": source.get(
+                "confirm_smc_entry_location_primary_reason"
+            ),
+            "paper_location_gate_risk_bucket": source.get(
+                "confirm_smc_entry_location_risk_bucket"
+            ),
+            # V2B allowlist context (read-only passthrough, if available)
+            "v2b_label": source.get("v2b_label"),
+            "v2b_match": source.get("v2b_match"),
+            "v2b_reason": source.get("v2b_reason"),
+            # Runtime N-bar lifecycle is not tracked in production paths;
+            # the audit script reconstructs it offline.
+            "lifecycle_tracking": "MISSING_RUNTIME_DEFERRED_TO_AUDIT",
+        }
+        row.update(eval_fields)
+        _breakout_acceptance_shadow_write(row)
+        return row
+    except Exception as exc:
+        print(f"[BREAKOUT_ACCEPTANCE_SHADOW] shadow failed: {exc}")
+        return {}
+
+
 def _paper_smc_research_qualified_opened_total():
     path = _paper_smc_research_qualified_log_path()
     if not os.path.exists(path):
@@ -4057,6 +6444,18 @@ def _paper_smc_research_qualified_decision_log(
             fields=fields,
             now_ts=now_ts,
         )
+        smc_entry_v2_shadow = _smc_entry_v2_shadow(
+            candidate,
+            fields=fields,
+            v1_decision=decision,
+            v1_reason=reason,
+            now_ts=now_ts,
+        )
+        smc_entry_v2b_allowlist_shadow = _smc_entry_v2b_allowlist_shadow(
+            candidate,
+            fields=fields,
+            mode="PAPER_SHADOW_ONLY",
+        )
         row = {
             "event_type": "PAPER_SMC_RESEARCH_QUALIFIED_DECISION",
             "observed_at": format_vn_time(now_ts),
@@ -4131,11 +6530,95 @@ def _paper_smc_research_qualified_decision_log(
             key: _json_safe_copy(value)
             for key, value in entry_fallback_shadow.items()
         })
+        row.update({
+            key: _json_safe_copy(smc_entry_v2_shadow.get(key))
+            for key in (
+                "smc_entry_v2_shadow_version",
+                "v2_shadow_status",
+                "v2_shadow_reason",
+                "v2_location_score",
+                "v2_late_chase_score",
+                "v2_structure_score",
+                "v2_expected_entry",
+                "v2_structural_sl",
+                "v2_expected_rr",
+                "v2_compared_to_v1",
+                "v2_feature_quality",
+            )
+        })
+        row.update({
+            key: _json_safe_copy(smc_entry_v2b_allowlist_shadow.get(key))
+            for key in (
+                "smc_entry_v2b_allowlist_label",
+                "smc_entry_v2b_allowlist_match",
+                "smc_entry_v2b_allowlist_reason",
+                "smc_entry_v2b_allowlist_version",
+                "smc_entry_v2b_score_bucket",
+                "smc_entry_v2b_feature_quality",
+                "smc_entry_v2b_forward_mode",
+            )
+        })
+        _smc_entry_v2_shadow_write(
+            candidate,
+            fields,
+            smc_entry_v2_shadow,
+            v1_decision=decision,
+            v1_reason=reason,
+            now_ts=now_ts,
+        )
+        _smc_entry_v2b_allowlist_shadow_write(
+            candidate,
+            fields,
+            smc_entry_v2b_allowlist_shadow,
+            execution_mode="paper",
+            v1_decision=decision,
+            v1_reason=reason,
+            now_ts=now_ts,
+        )
+        btc_instrumentation_row = _btc_alignment_instrumentation_shadow(
+            candidate,
+            execution_mode="paper",
+            v1_decision=decision,
+            v1_reason=reason,
+            side=candidate.get("side"),
+            trade=None,
+            gate_fields=fields,
+            v2b_fields=fields,
+            now_ts=now_ts,
+        )
+        # SMC_PA_SCORE_V3_SHADOW (log-only): additive annotation, never gates.
+        smc_pa_v3_summary = _smc_pa_score_v3_shadow(
+            candidate,
+            fields=fields,
+            trade=None,
+            execution_mode="paper",
+            v1_decision=decision,
+            v1_reason=reason,
+            btc_ctx=btc_instrumentation_row,
+            now_ts=now_ts,
+        )
+        if smc_pa_v3_summary:
+            row.update({
+                key: _json_safe_copy(value)
+                for key, value in smc_pa_v3_summary.items()
+            })
+        # BREAKOUT_ACCEPTANCE_SHADOW (log-only): appends to its own forward
+        # log only; never gates and never adds fields to this decision row.
+        _breakout_acceptance_shadow(
+            candidate,
+            fields=fields,
+            trade=None,
+            execution_mode="paper",
+            v1_decision=decision,
+            v1_reason=reason,
+            btc_ctx=btc_instrumentation_row,
+            v3_summary=smc_pa_v3_summary,
+            now_ts=now_ts,
+        )
         with open(_paper_smc_research_qualified_log_path(), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, default=str, sort_keys=True) + "\n")
     except Exception as exc:
         print(f"[PAPER SMC RESEARCH QUALIFIED] decision log failed: {exc}")
-
 
 def _paper_smc_research_qualified_reject_subreason(candidate, ctx, now_ts):
     # Log-only mirror of the qualified base gate; never use this value for execution.
@@ -5414,6 +7897,8 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
 
 def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=None):
     try:
+        candidate = candidate if isinstance(candidate, dict) else {}
+        trade = trade if isinstance(trade, dict) else trade
         row = {
             "ts": time.time(),
             "decision": decision,
@@ -5431,12 +7916,61 @@ def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=Non
             row["entry_type"] = trade.get("entry_type")
         if isinstance(extra, dict):
             row.update(extra)
+        btc_source = dict(candidate)
+        if isinstance(trade, dict):
+            btc_source.update(trade)
+        btc_source["decision_ts"] = row.get("ts")
+        btc_context = _btc_mtf_context_for_signal(
+            btc_source,
+            side=_first_nonblank(row.get("side"), btc_source.get("side")),
+            now_ts=row.get("ts"),
+        )
+        row.update({key: _live_smc_research_json_safe(value) for key, value in btc_context.items()})
+        # SMC_PA_SCORE_V3_SHADOW (log-only): additive annotation, never gates.
+        smc_pa_v3_summary = _smc_pa_score_v3_shadow(
+            candidate,
+            fields=None,
+            trade=trade if isinstance(trade, dict) else None,
+            execution_mode="live",
+            v1_decision=decision,
+            v1_reason=reason,
+            btc_ctx=btc_context,
+            now_ts=row.get("ts"),
+        )
+        if smc_pa_v3_summary:
+            row.update({
+                key: _live_smc_research_json_safe(value)
+                for key, value in smc_pa_v3_summary.items()
+            })
+        # BREAKOUT_ACCEPTANCE_SHADOW (log-only): appends to its own forward
+        # log only; never gates and never adds fields to this decision row.
+        _breakout_acceptance_shadow(
+            candidate,
+            fields=None,
+            trade=trade if isinstance(trade, dict) else None,
+            execution_mode="live",
+            v1_decision=decision,
+            v1_reason=reason,
+            btc_ctx=btc_context,
+            v3_summary=smc_pa_v3_summary,
+            now_ts=row.get("ts"),
+        )
         os.makedirs("logs", exist_ok=True)
         with open(_LIVE_SMC_RESEARCH_DECISION_LOG, "a", encoding="utf-8") as _fh:
             _fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        _btc_alignment_instrumentation_shadow(
+            btc_source,
+            execution_mode="live",
+            v1_decision=decision,
+            v1_reason=reason,
+            side=_first_nonblank(row.get("side"), btc_source.get("side")),
+            trade=trade if isinstance(trade, dict) else None,
+            gate_fields=btc_source,
+            v2b_fields=btc_source,
+            now_ts=row.get("ts"),
+        )
     except Exception as _log_ex:
         print(f"[WARN] _live_smc_research_log failed: {_log_ex}")
-
 
 def _live_smc_research_open_count(ctx):
     return sum(
@@ -5488,6 +8022,44 @@ def _dispatch_live_smc_research_lane(ctx):
             continue
 
         trade = _paper_smc_research_trade(candidate)
+        location_fields = _paper_smc_research_qualified_fields(candidate)
+        location_gate_extra = _confirm_smc_location_gate_log_fields(
+            candidate,
+            fields=location_fields,
+            mode="LIVE_SHADOW_ONLY",
+        )
+        smc_entry_v2_extra = _smc_entry_v2_shadow(
+            candidate,
+            fields=location_fields,
+            v1_decision="LIVE_SHADOW_ONLY",
+            v1_reason="live_decision_unchanged",
+            trade=trade,
+            now_ts=now_ts,
+        )
+        smc_entry_v2b_allowlist_extra = _smc_entry_v2b_allowlist_shadow(
+            candidate,
+            fields=location_fields,
+            trade=trade,
+            mode="LIVE_SHADOW_ONLY",
+        )
+        _smc_entry_v2_shadow_write(
+            candidate,
+            location_fields,
+            smc_entry_v2_extra,
+            v1_decision="LIVE_SHADOW_ONLY",
+            v1_reason="live_decision_unchanged",
+            now_ts=now_ts,
+        )
+        _smc_entry_v2b_allowlist_shadow_write(
+            candidate,
+            location_fields,
+            smc_entry_v2b_allowlist_extra,
+            execution_mode="live",
+            v1_decision="LIVE_SHADOW_ONLY",
+            v1_reason="live_decision_unchanged",
+            trade=trade,
+            now_ts=now_ts,
+        )
 
         prefilter_ok, prefilter_stage, prefilter_reason, prefilter_detail = _live_smc_research_prefilter(
             candidate,
@@ -5508,13 +8080,18 @@ def _dispatch_live_smc_research_lane(ctx):
                     "PREFILTER_REJECT",
                     prefilter_reason,
                     trade=trade,
-                    extra=_live_smc_research_prefilter_extra(
-                        prefilter_stage,
-                        prefilter_reason,
-                        trade,
-                        ctx=ctx,
-                        detail=prefilter_detail,
-                    ),
+                    extra={
+                        **_live_smc_research_prefilter_extra(
+                            prefilter_stage,
+                            prefilter_reason,
+                            trade,
+                            ctx=ctx,
+                            detail=prefilter_detail,
+                        ),
+                        **location_gate_extra,
+                        **smc_entry_v2_extra,
+                        **smc_entry_v2b_allowlist_extra,
+                    },
                 )
             continue
 
@@ -5526,7 +8103,12 @@ def _dispatch_live_smc_research_lane(ctx):
             candidate,
             "OPEN_ATTEMPT",
             trade=trade,
-            extra=_live_smc_research_score_alignment_extra(trade),
+            extra={
+                **_live_smc_research_score_alignment_extra(trade),
+                **location_gate_extra,
+                **smc_entry_v2_extra,
+                **smc_entry_v2b_allowlist_extra,
+            },
         )
 
         trade_for_open = copy.deepcopy(trade)
@@ -5549,7 +8131,12 @@ def _dispatch_live_smc_research_lane(ctx):
                     "OPEN_FAILED",
                     "open_trade raised exception",
                     trade=trade_for_open,
-                    extra=_failure_extra,
+                    extra={
+                        **_failure_extra,
+                        **location_gate_extra,
+                        **smc_entry_v2_extra,
+                        **smc_entry_v2b_allowlist_extra,
+                    },
                 )
             raise
         if success:
@@ -5558,6 +8145,11 @@ def _dispatch_live_smc_research_lane(ctx):
                 candidate,
                 "OPEN_ACCEPTED",
                 trade=trade_for_open,
+                extra={
+                    **location_gate_extra,
+                    **smc_entry_v2_extra,
+                    **smc_entry_v2b_allowlist_extra,
+                },
             )
         else:
             _failure_extra = _live_smc_research_failure_extra(trade_for_open)
@@ -5576,9 +8168,13 @@ def _dispatch_live_smc_research_lane(ctx):
                     "OPEN_FAILED",
                     "open_trade returned falsy",
                     trade=trade_for_open,
-                    extra=_failure_extra,
+                    extra={
+                        **_failure_extra,
+                        **location_gate_extra,
+                        **smc_entry_v2_extra,
+                        **smc_entry_v2b_allowlist_extra,
+                    },
                 )
-
 
 def _paper_smc_main_candidate_type(candidate):
     candidate_type = str(candidate.get("candidate_type") or "").upper()

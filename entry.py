@@ -3722,6 +3722,49 @@ def _compute_shadow_score(symbol, entry_type, df_candle, df_ema, bos_type, h1_tr
     return score_v2, breakdown
 
 
+def _confirm_reject_acceptance_context(df15, atr=None, bos_level=None):
+    """Log-only level/ATR context for rejected CONFIRM signals.
+
+    Mirrors the accepted-signal confirm_entry_acceptance_context block
+    (same source rows: signal candle df15.iloc[-3], range df15.iloc[-20:-4],
+    break_level/pre_break_level = bos_level) so rejected research candidates
+    carry the same level fields for the BREAKOUT_ACCEPTANCE and
+    SMC_PA_SCORE_V3 shadows. Never gates, never scores, never mutates df15;
+    returns {} on any failure and never raises into the reject path.
+    """
+    try:
+        if df15 is None or len(df15) < 20:
+            return {}
+
+        def _ctx_float(value):
+            try:
+                if value is None or value == "":
+                    return None
+                out = float(value)
+                if out != out:
+                    return None
+                return out
+            except (TypeError, ValueError):
+                return None
+
+        _reject_candle = df15.iloc[-3]
+        _reject_range = df15.iloc[-20:-4]
+        return {
+            "candle_open": _ctx_float(_reject_candle["open"]),
+            "candle_high": _ctx_float(_reject_candle["high"]),
+            "candle_low": _ctx_float(_reject_candle["low"]),
+            "candle_close": _ctx_float(_reject_candle["close"]),
+            "atr": _ctx_float(atr),
+            "break_level": _ctx_float(bos_level),
+            "pre_break_level": _ctx_float(bos_level),
+            "nearest_htf_support": _ctx_float(_reject_range["low"].min()),
+            "nearest_htf_resistance": _ctx_float(_reject_range["high"].max()),
+            "context_source": "confirm_reject_level_wiring_v1",
+        }
+    except Exception:
+        return {}
+
+
 def _confirm_reject_structural_breakdown(
     symbol,
     reject_reason,
@@ -3800,6 +3843,12 @@ def _confirm_reject_structural_breakdown(
     ):
         if key in smc_copy:
             logged[key] = smc_copy.get(key)
+    # Log-only: rejected candidates carry the same level/ATR context as
+    # accepted signals so the shadow logs are auditable. Only set when the
+    # reject site actually had the data (never invents levels).
+    _reject_acceptance_ctx = _dict_copy(fields.get("confirm_entry_acceptance_context"))
+    if _reject_acceptance_ctx:
+        logged["confirm_entry_acceptance_context"] = _reject_acceptance_ctx
     return logged
 
 
@@ -6933,6 +6982,9 @@ def confirm_pipeline(symbol, df, cls, df15, df1h, df4h=None, df1d=None):
                 "rr": rr,
                 "signal_created_ts": _confirm_signal_created_ts,
                 "signal_detected_ts": _confirm_signal_detected_ts,
+                "confirm_entry_acceptance_context": _confirm_reject_acceptance_context(
+                    df15, atr=atr, bos_level=bos_level
+                ),
             },
         )
         print(f"[CONFIRM REJECT] {symbol} | RR tệ rr={rr:.2f} < 1.5")
@@ -7018,6 +7070,9 @@ def confirm_pipeline(symbol, df, cls, df15, df1h, df4h=None, df1d=None):
             "exhaustion_cls": exhaustion_cls,
             "signal_created_ts": _confirm_signal_created_ts,
             "signal_detected_ts": _confirm_signal_detected_ts,
+            "confirm_entry_acceptance_context": _confirm_reject_acceptance_context(
+                df15, atr=atr, bos_level=bos_level
+            ),
         },
     ):
         return None
