@@ -399,7 +399,12 @@ def main():
         {"actual_realized_r": 0.5, "rr_unconfirmed": "false", "entry_type": "CONFIRM_SMC_RESEARCH"},
         {"actual_realized_r": 5.0, "rr_unconfirmed": "true", "entry_type": "CONFIRM_SMC_RESEARCH"},
     ]
-    health, reasons, metrics = rh.classify_live(close_rows=close_rows, decision_rows=[], min_lock_rows=[])
+    health, reasons, metrics = rh.classify_live(
+        close_rows=close_rows,
+        decision_rows=[],
+        min_lock_rows=[],
+        live_state={"trades": []},
+    )
     check("R8", "unconfirmed RR excluded from net_R/PF (net_r=1.0, n=2 confirmed)",
           metrics.get("net_r") == 1.0 and metrics.get("live_closed_n") == 2, f"metrics={metrics}")
     check("R8", "unconfirmed counted in live_unconfirmed_rr_n",

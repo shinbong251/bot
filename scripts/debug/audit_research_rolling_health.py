@@ -408,20 +408,108 @@ def live_close_rows(decision_rows=None, live_trade_rows=None):
     return out
 
 
-def live_state_has_confirmed_research_sl(state=None):
+def live_research_open_positions(state=None):
     if state is None:
         state = read_json(LIVE_STATE)
     trades = state.get("trades") if isinstance(state, dict) else state
     if not isinstance(trades, list):
-        return False
+        return []
+    out = []
     for trade in trades:
+        if not isinstance(trade, dict):
+            continue
         if str(trade.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
             continue
         if str(trade.get("status") or "OPEN").upper() != "OPEN":
             continue
+        out.append(trade)
+    return out
+
+
+def live_state_has_confirmed_research_sl(state=None):
+    for trade in live_research_open_positions(state):
         if trade.get("exchange_sl_id") not in (None, "") and fnum(trade.get("exchange_sl_price_confirmed")) is not None:
             return True
     return False
+
+
+def sl_sync_identity(row):
+    keys = []
+    for field in ("trade_id", "research_join_key", "symbol", "side"):
+        value = str(row.get(field) or "").strip().upper()
+        if value:
+            keys.append((field, value))
+    return tuple(keys)
+
+
+def sl_sync_rows_match(left, right):
+    left_keys = dict(sl_sync_identity(left))
+    right_keys = dict(sl_sync_identity(right))
+    for field in ("trade_id", "research_join_key"):
+        if left_keys.get(field) and left_keys.get(field) == right_keys.get(field):
+            return True
+    return (
+        left_keys.get("symbol")
+        and left_keys.get("side")
+        and left_keys.get("symbol") == right_keys.get("symbol")
+        and left_keys.get("side") == right_keys.get("side")
+    )
+
+
+def min_lock_row_failed(row):
+    reason = str(row.get("reason") or row.get("event_type") or "")
+    sync_result = str(row.get("sync_result") or "")
+    return "FAILED" in reason.upper() or sync_result.lower() == "false"
+
+
+def min_lock_row_succeeded(row):
+    reason = str(row.get("reason") or row.get("event_type") or "")
+    sync_result = str(row.get("sync_result") or "")
+    done = str(row.get("done", row.get("min_lock_075_done", "")) or "")
+    return (
+        "SYNC_OK" in reason.upper()
+        or sync_result.lower() == "true"
+        or done.lower() == "true"
+    )
+
+
+def min_lock_failure_resolved(failed_row, min_lock_rows, failed_idx):
+    for later in min_lock_rows[failed_idx + 1:]:
+        if str(later.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        if sl_sync_rows_match(failed_row, later) and min_lock_row_succeeded(later):
+            return True
+    return False
+
+
+def open_trade_has_unresolved_sl_sync_risk(trade, min_lock_rows):
+    if trade.get("exchange_sl_id") in (None, ""):
+        return True
+    if fnum(trade.get("exchange_sl_price_confirmed")) is None:
+        return True
+    fail_count = int(fnum(trade.get("sl_sync_fail_count"), 0) or 0)
+    has_error = trade.get("exchange_sl_sync_error") not in (None, "")
+    if not fail_count and not has_error:
+        return False
+    for row in reversed(min_lock_rows):
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        if sl_sync_rows_match(trade, row) and min_lock_row_succeeded(row):
+            return False
+    return True
+
+
+def decision_sl_sync_text(row):
+    text = " ".join(str(row.get(field) or "") for field in ("decision", "reason", "prefilter_reason", "prefilter_detail", "fail_reason"))
+    lower = text.lower()
+    if not ("sl sync" in lower or "sl_sync" in lower or "sl missing" in lower or "missing sl" in lower):
+        return ""
+    if (
+        "live_micro_blocked_sl_sync" in lower
+        or "live_micro_blocked_sl_sync".upper() in text
+    ) and not any(token in lower for token in ("missing exchange", "exchange sl not confirmed", "sl missing", "missing sl")):
+        return ""
+    return lower
 
 
 def live_safety_issues(decision_rows=None, min_lock_rows=None, live_state=None):
@@ -429,28 +517,174 @@ def live_safety_issues(decision_rows=None, min_lock_rows=None, live_state=None):
     min_lock_rows = min_lock_rows if min_lock_rows is not None else read_jsonl(LIVE_MIN_LOCK)
     warnings = []
     critical = []
-    sl_sync_ok = live_state_has_confirmed_research_sl(live_state)
+    open_positions = live_research_open_positions(live_state)
+    has_open_research = bool(open_positions)
+    sl_sync_ok = any(
+        trade.get("exchange_sl_id") not in (None, "")
+        and fnum(trade.get("exchange_sl_price_confirmed")) is not None
+        for trade in open_positions
+    )
+    if has_open_research:
+        for trade in open_positions:
+            if open_trade_has_unresolved_sl_sync_risk(trade, min_lock_rows):
+                critical.append("live_sl_sync_failure")
     for row in decision_rows:
         if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
             continue
-        text = " ".join(str(row.get(field) or "") for field in ("decision", "reason", "prefilter_reason", "prefilter_detail", "fail_reason"))
-        lower = text.lower()
+        lower = " ".join(str(row.get(field) or "") for field in ("decision", "reason", "prefilter_reason", "prefilter_detail", "fail_reason")).lower()
+        sl_text = decision_sl_sync_text(row)
         if "reconcile" in lower:
             warnings.append("live_reconcile_warning")
-        if "unmanaged" in lower or "missing exchange" in lower or "local state" in lower:
+        if (
+            "unmanaged" in lower
+            or "local state" in lower
+            or ("missing exchange" in lower and not sl_text)
+        ):
             critical.append("live_exchange_local_state_consistency_issue")
-        if ("sl sync" in lower or "sl_sync" in lower) and not sl_sync_ok:
-            critical.append("live_sl_sync_failure")
-    for row in min_lock_rows:
+        if sl_text:
+            warnings.append("historical_sl_sync_failure_resolved_or_flat_warning")
+    for idx, row in enumerate(min_lock_rows):
         if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
             continue
-        reason = str(row.get("reason") or "")
-        sync_result = str(row.get("sync_result") or "")
-        if ("FAILED" in reason.upper() or sync_result.lower() == "false") and not sl_sync_ok:
-            critical.append("live_sl_sync_failure")
-    if sl_sync_ok:
+        if min_lock_row_failed(row):
+            warnings.append("historical_sl_sync_failure_resolved_or_flat_warning")
+            if min_lock_failure_resolved(row, min_lock_rows, idx):
+                warnings.append("historical_min_lock_sync_failure_resolved")
+            elif has_open_research:
+                warnings.append("historical_min_lock_sync_failure_unresolved_warning")
+    if has_open_research and sl_sync_ok:
         warnings.append("SL_SYNC_OK")
     return sorted(set(warnings)), sorted(set(critical))
+
+
+def _close_sort_ts(row):
+    value = fnum(row.get("_sort_ts"))
+    if value is not None:
+        return value
+    return row_ts(row)
+
+
+def live_open_identity_key(trade):
+    stable = trade.get("id") or trade.get("trade_id") or trade.get("client_order_id") or trade.get("clientOrderId")
+    if stable not in (None, ""):
+        return f"id:{stable}"
+    join = trade.get("research_join_key") or trade.get("research_dedup_key") or trade.get("dedup_key")
+    if join not in (None, ""):
+        return f"key:{join}"
+    return "|".join(
+        str(trade.get(field) or "")
+        for field in ("symbol", "side", "entry_time")
+    )
+
+
+def open_trade_confirmed_healthy(trade):
+    """A currently-open research trade that is safe to treat as a fresh probe.
+
+    Requires: entry actually filled and confirmed, exchange SL present and
+    confirmed, and no pending SL-sync failure. This intentionally mirrors the
+    current-safety gates so a stale historical loss streak is only downgraded
+    when the newer live open is genuinely clean.
+    """
+    if not isinstance(trade, dict):
+        return False
+    entry_unconfirmed = str(trade.get("entry_price_unconfirmed") or "").lower() in ("true", "1", "yes")
+    if entry_unconfirmed:
+        return False
+    entry_source = str(trade.get("entry_source") or "").lower()
+    entry_state = str(trade.get("entry_state") or "").upper()
+    entry_confirmed = entry_source == "actual_exchange_fill" or entry_state == "ENTRY_CONFIRMED"
+    if not entry_confirmed:
+        return False
+    if trade.get("exchange_sl_id") in (None, ""):
+        return False
+    if fnum(trade.get("exchange_sl_price_confirmed")) is None:
+        return False
+    if int(fnum(trade.get("sl_sync_fail_count"), 0) or 0) != 0:
+        return False
+    return True
+
+
+def live_loss_streak_meta(confirmed_closes, consecutive_losses, live_net, critical, live_state, all_closes=None):
+    """Distinguish a current trailing loss streak from a stale historical one.
+
+    A streak is considered stale (no longer current) when newer live research
+    activity exists AFTER the most recent loss close that produced the streak,
+    and that newer activity is not itself a continuing loss. Newer activity is
+    either:
+      * a newer, confirmed, healthy live research OPEN still present in
+        live_state (opened after the streak's last loss), or
+      * a newer live CLOSE whose MOST RECENT realized R is non-negative
+        (win/BE). This covers probes that were opened after the streak but have
+        already CLOSED (so they are no longer in live_state) and were excluded
+        from the confirmed sample because their exit price was an estimate
+        (rr_unconfirmed). A newer closing LOSS keeps the streak current so an
+        ongoing losing run still blocks.
+    The streak is never downgraded while there is a current safety failure
+    (critical) or a hard rolling-net breach.
+    """
+    meta = {
+        "last_live_close_key": "",
+        "last_live_open_key": "",
+        "loss_streak_current": False,
+        "loss_streak_stale_after_new_open": False,
+    }
+    if confirmed_closes:
+        meta["last_live_close_key"] = live_close_dedup_key(confirmed_closes[-1])
+    if consecutive_losses < 3:
+        return meta
+    streak_rows = confirmed_closes[-consecutive_losses:] if consecutive_losses else []
+    last_loss_ts = max((_close_sort_ts(row) for row in streak_rows), default=0.0)
+    newer_open = None
+    newer_open_ts = None
+    for trade in live_research_open_positions(live_state):
+        open_ts = fnum(trade.get("entry_time"))
+        if open_ts is None or open_ts <= last_loss_ts:
+            continue
+        if not open_trade_confirmed_healthy(trade):
+            continue
+        if newer_open_ts is None or open_ts > newer_open_ts:
+            newer_open = trade
+            newer_open_ts = open_ts
+    # A newer live CLOSE after the streak also makes the historical streak stale
+    # when a non-negative (win/BE) close has interrupted it. A newer closing loss
+    # must keep the streak current so an ongoing losing run still blocks, BUT a
+    # single fresh loss that follows an intervening win/BE must NOT pin the stale
+    # historical streak as current: that win/BE already broke the run, and the
+    # fresh loss is a separate, short run. We therefore locate the MOST RECENT
+    # non-negative post-streak close and only keep the streak current when the
+    # loss run that resumed after it has itself reached the pause threshold
+    # (>=3). This recognises closed probes (e.g. rr_unconfirmed estimated exits)
+    # that are no longer present in live_state open positions and were excluded
+    # from the confirmed sample.
+    newer_nonloss_close = False
+    newer_close_key = ""
+    if all_closes:
+        post_streak_closes = [row for row in all_closes if _close_sort_ts(row) > last_loss_ts]
+        if post_streak_closes:
+            post_streak_sorted = sorted(post_streak_closes, key=_close_sort_ts)
+            last_nonneg_idx = None
+            for idx in range(len(post_streak_sorted) - 1, -1, -1):
+                close_r = fnum(post_streak_sorted[idx].get("actual_realized_r"))
+                if close_r is not None and close_r >= 0:
+                    last_nonneg_idx = idx
+                    break
+            if last_nonneg_idx is not None:
+                trailing_losses_after_nonneg = 0
+                for row in post_streak_sorted[last_nonneg_idx + 1:]:
+                    close_r = fnum(row.get("actual_realized_r"))
+                    if close_r is not None and close_r < 0:
+                        trailing_losses_after_nonneg += 1
+                if trailing_losses_after_nonneg < 3:
+                    newer_nonloss_close = True
+                    newer_close_key = live_close_dedup_key(post_streak_sorted[last_nonneg_idx])
+    stale = (bool(newer_open) or newer_nonloss_close) and not critical and live_net > -2.0
+    if newer_open is not None:
+        meta["last_live_open_key"] = live_open_identity_key(newer_open)
+    elif newer_nonloss_close:
+        meta["last_live_open_key"] = newer_close_key
+    meta["loss_streak_stale_after_new_open"] = stale
+    meta["loss_streak_current"] = (consecutive_losses >= 3) and not stale
+    return meta
 
 
 def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_state=None, live_trade_rows=None):
@@ -482,7 +716,9 @@ def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_
         else:
             break
     if consecutive_losses >= 3:
-        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+        _streak_metrics = {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+        _streak_metrics.update(live_loss_streak_meta(confirmed_closes, consecutive_losses, live_net, critical, live_state, all_closes=closes))
+        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], _streak_metrics
     if live_net <= -2.0:
         return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
     if consecutive_losses in (1, 2):

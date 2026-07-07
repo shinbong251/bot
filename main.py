@@ -106,12 +106,40 @@ def _build_executors():
 # =====================================================================
 
 _LIVE_SL_AUDIT_INTERVAL = 180  # 3 minutes (FIX 4 — reduce mismatch detection delay)
+_ROLLING_HEALTH_REFRESH_INTERVAL = 5 * 60
+
+
+def _has_live_executor(executors):
+    return any(getattr(ctx, "execution_mode", None) == "live" for ctx in executors or [])
+
+
+def _refresh_runtime_research_health(now=None):
+    now = time.time() if now is None else now
+    try:
+        from scripts.debug.audit_research_rolling_health import build_summary
+        row = build_summary(source="runtime_health_refresh", write_summary=True)
+        return True, row
+    except Exception:
+        write_runtime_error("RUNTIME_RESEARCH_HEALTH_REFRESH", traceback.format_exc())
+        return False, {"ts": now, "source": "runtime_health_refresh_error"}
+
+
+def _maybe_refresh_runtime_research_health(executors, last_refresh_ts, now=None):
+    now = time.time() if now is None else now
+    if not _has_live_executor(executors):
+        return last_refresh_ts, False, {}
+    if last_refresh_ts and now - last_refresh_ts < _ROLLING_HEALTH_REFRESH_INTERVAL:
+        return last_refresh_ts, False, {}
+    ok, row = _refresh_runtime_research_health(now=now)
+    return now, ok, row
+
 
 def scan_loop(executors):
     global RUNNING
     _fail_count       = 0
     _last_heartbeat   = {ctx.name: time.time() for ctx in executors}
     _last_sl_audit    = {ctx.name: 0 for ctx in executors}
+    _last_health_refresh = 0
 
     from signal_dispatcher import dispatch_to_executor
     from execution import check_quarantine_ttl
@@ -124,10 +152,36 @@ def scan_loop(executors):
         from execution import scan_phase as _scan_phase
         _use_shared_scan = True
 
+    if _has_live_executor(executors):
+        _last_health_refresh, _ok, _row = _maybe_refresh_runtime_research_health(
+            executors,
+            _last_health_refresh,
+        )
+        if _ok:
+            print(
+                "[RUNTIME HEALTH REFRESH] "
+                f"paper={_row.get('paper_health')} "
+                f"live={_row.get('live_health')} "
+                f"promotion={_row.get('promotion_status')}"
+            )
+
     while RUNNING:
         start = time.time()
         try:
             print("\n===== SCAN CYCLE =====")
+            now = time.time()
+            _last_health_refresh, _ok, _row = _maybe_refresh_runtime_research_health(
+                executors,
+                _last_health_refresh,
+                now=now,
+            )
+            if _ok:
+                print(
+                    "[RUNTIME HEALTH REFRESH] "
+                    f"paper={_row.get('paper_health')} "
+                    f"live={_row.get('live_health')} "
+                    f"promotion={_row.get('promotion_status')}"
+                )
 
             if _use_shared_scan:
                 # Shared scan — runs ONCE, dispatches to all executors
