@@ -1365,6 +1365,46 @@ def _sl_r_from_trade(t):
         return None
 
 
+def _sl_exchange_confirmation_note(t, exec_mode):
+    """Messaging-only descriptor of exchange-stop confirmation state.
+
+    Returns wording ONLY. Does NOT change any decision, SL mutation, sync, or
+    order behavior, and never runs any execution path. A stop counts as
+    exchange-confirmed only when exchange_sl_price_confirmed is a real numeric
+    price; None/""/False (or a missing confirmation) reads as pending. Paper
+    has no exchange, so the note is empty there and paper messages are unchanged.
+    """
+    if exec_mode not in ("live", "testnet"):
+        return ""
+    _confirmed = t.get("exchange_sl_price_confirmed")
+    if isinstance(_confirmed, bool) or not isinstance(_confirmed, (int, float)):
+        return "local SL updated; exchange confirmation pending"
+    return "exchange SL confirmed"
+
+
+def _sl_confirmation_suffix(t, exec_mode):
+    """Messaging-only: '\n(<note>)' suffix for SL-move alerts, or '' for paper."""
+    _note = _sl_exchange_confirmation_note(t, exec_mode)
+    return f"\n({_note})" if _note else ""
+
+
+def _close_fee_slippage_note(t, exec_mode):
+    """Messaging-only fee/slippage caveat for BE / near-zero live closes.
+
+    Returns wording ONLY. Does NOT change any decision, PnL, RR, or order
+    behavior. Paper closes (no real fills) are left unchanged.
+    """
+    if exec_mode not in ("live", "testnet"):
+        return ""
+    try:
+        _rr = float(t.get("rr_real") or 0)
+    except (TypeError, ValueError):
+        _rr = 0.0
+    if str(t.get("status") or "").upper() == "BE" or abs(_rr) < 0.05:
+        return "raw BE; net may be slightly negative after fees/slippage"
+    return ""
+
+
 def _send_trail_update_telegram(t, exec_mode, mode_prefix, sl_r, management_context=None):
     label = engine_label(t, live_mode=(exec_mode == "live"))
     sl_r_text = "n/a" if sl_r is None else round(sl_r, 2)
@@ -1381,6 +1421,7 @@ def _send_trail_update_telegram(t, exec_mode, mode_prefix, sl_r, management_cont
             f"🔁 {label} • TRAIL UPDATE\n"
             f"{t['symbol']} {t.get('side', '')}\n"
             f"SL → {round(t['sl'], 6)} ({sl_r_text}R)"
+            + _sl_confirmation_suffix(t, exec_mode)
         )
     if exec_mode != "paper":
         _send_management_telegram(
@@ -4000,12 +4041,14 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
         t["sl_audit_trade_saved"] = True
 
     if not t.get("sl_audit_close_alert_sent"):
+        _audit_fee_slip = _close_fee_slippage_note(t, getattr(ctx, "execution_mode", None))
         msg = (
             f"[SL AUDIT CLOSE] {symbol}\n"
             f"Exit: {fmt_price(exit_price, symbol)}\n"
             f"RR: {t.get('rr_real', 0)}R\n"
             f"Source: {exit_price_source} | Reason: {source}"
             f"{chr(10) + 'RR estimate / fill unconfirmed' if t.get('rr_unconfirmed') else ''}"
+            f"{chr(10) + '⚠️ ' + _audit_fee_slip if _audit_fee_slip else ''}"
         )
         try:
             send_telegram(msg, prefix=ctx.mode_prefix)
@@ -6430,7 +6473,8 @@ def update_trades(fast_mode=False, ctx=None):
                             )
                             _management_send(
                                 f"⚡ {t['symbol']} MOMENTUM LOCK ({round(_r_now,2)}R)\n"
-                                f"SL → +0.3R: {fmt_price(t['sl'], t['symbol'])}",
+                                f"SL → +0.3R: {fmt_price(t['sl'], t['symbol'])}"
+                                + _sl_confirmation_suffix(t, _exec_mode),
                                 "momentum_lock",
                                 category="be_move",
                                 old_sl=_decision_sl_before,
@@ -6450,7 +6494,8 @@ def update_trades(fast_mode=False, ctx=None):
                             )
                             _management_send(
                                 f"⚡ {t['symbol']} MOMENTUM LOCK ({round(_r_now,2)}R)\n"
-                                f"SL → +0.3R: {fmt_price(t['sl'], t['symbol'])}",
+                                f"SL → +0.3R: {fmt_price(t['sl'], t['symbol'])}"
+                                + _sl_confirmation_suffix(t, _exec_mode),
                                 "momentum_lock",
                                 category="be_move",
                                 old_sl=_decision_sl_before,
@@ -6476,7 +6521,8 @@ def update_trades(fast_mode=False, ctx=None):
                             )
                             _management_send(
                                 f"🛡️ {t['symbol']} SL → BE (0.7R)\n"
-                                f"SL → {fmt_price(entry, t['symbol'])}",
+                                f"SL → {fmt_price(entry, t['symbol'])}"
+                                + _sl_confirmation_suffix(t, _exec_mode),
                                 "breakeven_move",
                                 category="be_move",
                                 old_sl=_decision_sl_before,
@@ -6496,7 +6542,8 @@ def update_trades(fast_mode=False, ctx=None):
                             )
                             _management_send(
                                 f"🛡️ {t['symbol']} SL → BE (0.7R)\n"
-                                f"SL → {fmt_price(entry, t['symbol'])}",
+                                f"SL → {fmt_price(entry, t['symbol'])}"
+                                + _sl_confirmation_suffix(t, _exec_mode),
                                 "breakeven_move",
                                 category="be_move",
                                 old_sl=_decision_sl_before,
@@ -6525,7 +6572,8 @@ def update_trades(fast_mode=False, ctx=None):
                                 _management_send(
                                     f"🛡️ {symbol} BE PROTECT\n"
                                     f"Max: {round(t['max_profit_r'], 2)}R | Momentum weak\n"
-                                    f"SL → {fmt_price(entry, symbol)}",
+                                    f"SL → {fmt_price(entry, symbol)}"
+                                    + _sl_confirmation_suffix(t, _exec_mode),
                                     "breakeven_protect",
                                     category="be_move",
                                     old_sl=_decision_sl_before,
@@ -6545,7 +6593,8 @@ def update_trades(fast_mode=False, ctx=None):
                                 _management_send(
                                     f"🛡️ {symbol} BE PROTECT\n"
                                     f"Max: {round(t['max_profit_r'], 2)}R | Momentum weak\n"
-                                    f"SL → {fmt_price(entry, symbol)}",
+                                    f"SL → {fmt_price(entry, symbol)}"
+                                    + _sl_confirmation_suffix(t, _exec_mode),
                                     "breakeven_protect",
                                     category="be_move",
                                     old_sl=_decision_sl_before,
@@ -7674,6 +7723,8 @@ def update_trades(fast_mode=False, ctx=None):
                 pnl_str = fmt_pnl(t["rr_real"], risk_amt)
                 max_r = round(t.get("max_profit_r", 0), 2)
                 _rr_note = "\nRR estimate / fill unconfirmed" if t.get("rr_unconfirmed") else ""
+                _fee_slip = _close_fee_slippage_note(t, _exec_mode)
+                _fee_note = f"\n⚠️ {_fee_slip}" if _fee_slip else ""
 
                 if ctx is not None and ctx.execution_mode == "testnet":
                     _tn_icon = "✅" if t["rr_real"] >= 0 else "❌"
@@ -7681,6 +7732,7 @@ def update_trades(fast_mode=False, ctx=None):
                     msg = (
                         f"{_tn_icon} {t['symbol']} {_rr_sign}{round(t['rr_real'], 1)}R\n"
                         f"Bal: {round(_account_balance, 1)}"
+                        f"{_fee_note}"
                     )
                 else:
                     balance_line = f"Balance: {round(_account_balance, 2)}$"
@@ -7710,7 +7762,7 @@ def update_trades(fast_mode=False, ctx=None):
                             f"{status_icon} {t['symbol']} | {exit_text}\n"
                             f"E: {fmt_price(entry_real, t['symbol'])} → X: {fmt_price(exit_real, t['symbol'])}\n"
                             f"PnL: {pnl_str}\n"
-                            f"{_ana_line}{_rr_note}\n"
+                            f"{_ana_line}{_rr_note}{_fee_note}\n"
                             f"{balance_line} | {format_vn_time(time.time())}"
                         )
 
