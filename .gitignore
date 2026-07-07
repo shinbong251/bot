@@ -24,12 +24,18 @@ Thumbs.db
 
 # runtime / local state
 bot_instance.lock
+runtime_errors.log
 *_state.json
 *_state.json.bak*
 *_state.json.tmp*
+paper_state.before_*.json
 *.corrupted.*.json
 *.pre_*.bak
 *.tmp.*
+*.swp
+.swp
+config.before_*.json
+config.before_*.py
 bot_last_run.log
 *_trades.csv
 trades_v4.csv
