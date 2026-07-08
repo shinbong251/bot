@@ -72,6 +72,21 @@ def fnum(value, default=None):
         return default
 
 
+def config_bool(value, default=False):
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def fmt(value):
     if value is None:
         return "n/a"
@@ -718,6 +733,21 @@ def classify_live(close_rows=None, decision_rows=None, min_lock_rows=None, live_
     if consecutive_losses >= 3:
         _streak_metrics = {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
         _streak_metrics.update(live_loss_streak_meta(confirmed_closes, consecutive_losses, live_net, critical, live_state, all_closes=closes))
+        cfg = read_json(CONFIG_JSON)
+        demote_enabled = config_bool(cfg.get("live_health_stale_streak_demote_enabled"), False)
+        dormancy_hours = fnum(cfg.get("live_health_stale_streak_dormancy_hours"), 48.0)
+        newest_close_ts = max((_close_sort_ts(row) for row in confirmed_closes[-consecutive_losses:]), default=0.0)
+        dormancy_age_hours = ((time.time() - newest_close_ts) / 3600.0) if newest_close_ts > 0 else 0.0
+        if (
+            demote_enabled
+            and dormancy_hours is not None
+            and dormancy_age_hours >= dormancy_hours
+            and _streak_metrics.get("loss_streak_current") is False
+        ):
+            return "YELLOW", [
+                f"live_consecutive_losses={consecutive_losses}>=3",
+                f"stale_streak_demoted_dormancy_hours={round(dormancy_age_hours, 2)}",
+            ], _streak_metrics
         return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], _streak_metrics
     if live_net <= -2.0:
         return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
