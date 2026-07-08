@@ -125,6 +125,8 @@ def load_config():
         "paper_smc_research_qualified_max_open": 3,
         "paper_smc_research_qualified_max_new_trades": 131,
         "paper_smc_research_qualified_min_rr": 2.0,
+        "paper_smc_research_location_gate_enabled": False,
+        "live_smc_research_location_gate_enabled": False,
         "paper_smc_main_enabled": False,
         "paper_smc_main_candidate_types": [
             "ACCEPTED_CONFIRM",

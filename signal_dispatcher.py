@@ -4447,6 +4447,20 @@ def _confirm_smc_location_gate_log_fields(candidate, fields=None, mode="SHADOW_O
     }
 
 
+def _paper_smc_research_location_gate_blocks(fields):
+    return (
+        bool(config.get("paper_smc_research_location_gate_enabled", False))
+        and _confirm_smc_location_gate_would_block(fields)
+    )
+
+
+SMC_ENTRY_V2_SHADOW_VERSION = "v0.1_shadow"
+SMC_ENTRY_V2_SHADOW_LOG = os.path.join("logs", "smc_entry_v2_shadow.jsonl")
+SMC_ENTRY_V2B_ALLOWLIST_VERSION = "v0.1_shadow"
+SMC_ENTRY_V2B_ALLOWLIST_LABEL = "SHORT_EXTENDED_SCORE_2_3"
+SMC_ENTRY_V2B_ALLOWLIST_LOG = os.path.join("logs", "smc_entry_v2b_allowlist_shadow.jsonl")
+
+
 def _smc_entry_v2_text(value):
     if value is None:
         return ""
@@ -6421,6 +6435,7 @@ def _paper_smc_research_qualified_decision_log(
     first_seen_ts=None,
     current_seen_ts=None,
     slot_wait_secs=None,
+    decision_extra=None,
 ):
     try:
         now_ts = now_ts or time.time()
@@ -6558,6 +6573,11 @@ def _paper_smc_research_qualified_decision_log(
                 "smc_entry_v2b_forward_mode",
             )
         })
+        if isinstance(decision_extra, dict):
+            row.update({
+                str(key): _json_safe_copy(value)
+                for key, value in decision_extra.items()
+            })
         _smc_entry_v2_shadow_write(
             candidate,
             fields,
@@ -6868,6 +6888,37 @@ def _dispatch_paper_smc_research_qualified_lane(ctx):
                 cap_block_skipped=cap_block_skipped,
                 max_new=max_new,
                 opened_total=opened_total,
+            )
+            continue
+
+        if _paper_smc_research_location_gate_blocks(fields):
+            location_gate_extra = _confirm_smc_location_gate_log_fields(
+                candidate,
+                fields=fields,
+                mode="PAPER_GATE",
+            )
+            location_gate_extra.update({
+                "decision": "PREFILTER_REJECT",
+                "reason": "PAPER_LOCATION_GATE_BLOCK",
+                "fallback_reason": entry_fallback_shadow.get("research_fallback_reason"),
+                "location_gate_reason": _confirm_smc_location_gate_reason(fields),
+            })
+            _paper_smc_research_qualified_decision_log(
+                candidate,
+                True,
+                "PREFILTER_REJECT",
+                "PAPER_LOCATION_GATE_BLOCK",
+                fields=fields,
+                now_ts=now_ts,
+                qualified_eval_ts=qualified_eval_ts,
+                dispatch_ts=dispatch_ts,
+                open_count_at_decision=open_count_at_decision,
+                max_open=max_open,
+                cap_enabled=cap_enabled,
+                cap_block_skipped=cap_block_skipped,
+                max_new=max_new,
+                opened_total=opened_total,
+                decision_extra=location_gate_extra,
             )
             continue
 

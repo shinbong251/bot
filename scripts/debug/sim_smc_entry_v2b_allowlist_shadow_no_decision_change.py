@@ -106,6 +106,16 @@ def case_h_paper_payload_unchanged_except_extra():
     ok("smc_entry_v2b_allowlist_reason" in merged, "H V2B field present")
 
 
+def case_i_location_gate_unchanged():
+    before_false = sd._paper_smc_research_location_gate_blocks({
+        "confirm_smc_entry_location_would_block": True,
+    })
+    _ = shadow()
+    after_false = sd._paper_smc_research_location_gate_blocks({
+        "confirm_smc_entry_location_would_block": True,
+    })
+    ok(before_false == after_false, "I PAPER_LOCATION_GATE predicate unchanged")
+
 
 def case_j_v2_shadow_unchanged():
     c = candidate()
@@ -150,6 +160,7 @@ def main():
     case_f_missing_score()
     case_g_live_payload_unchanged_except_extra()
     case_h_paper_payload_unchanged_except_extra()
+    case_i_location_gate_unchanged()
     case_j_v2_shadow_unchanged()
     case_k_no_execution_order_path()
     case_live_prefilter_reason_still_same()
