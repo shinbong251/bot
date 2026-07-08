@@ -20,6 +20,7 @@ from notifier import send_entry, send_exit, send_tp_break, send_testnet_entry, s
 from helper import check_correlation, check_signal_cooldown, dynamic_giveback, stats, compression_watchlist, signal_state
 from telegram import send_telegram, send_telegram_gated
 import telegram_dedup
+import live_alert_throttle
 from bos import get_volatility
 from pool_pipeline import fetch, fetch_multi, build_pool_pipeline, get_symbols_pool, fetch_ticker, fetch_cached, fetch_cached_with_meta
 from entry import analyze, swing_pipeline, build_trade, reset_scan_filter_summary, print_scan_filter_summary, get_strategy_observability_counters, update_reversal_shadow_outcomes, update_swing_retest_shadow_outcomes, update_early_cont_shadow_outcomes, update_confirm_structural_outcomes, update_paper_smc_v0_2_shadow_outcomes, update_paper_smc_main_open_geometry_observer
@@ -31,6 +32,9 @@ MAX_CONFIRM_PER_CYCLE = 3
 _paper_trail_update_last_sent = {}
 _LIVE_SAFETY_BLOCK_TELEGRAM_TTL_SECS = 15 * 60
 _live_safety_block_telegram_last_sent = {}
+_LIVE_STOP_UPDATE_ALERT_THROTTLE_SECS = 300.0
+_LIVE_STOP_UPDATE_ALERT_MILESTONES = {3, 5, 10, 20, 50}
+_live_stop_update_failed_telegram_state = {}
 
 SIGNAL_TYPE_SUMMARY_ORDER = ("CONFIRM", "SWING_RETEST", "REVERSAL_CONFIRM", "EARLY_CONT")
 STRATEGY_OBSERVABILITY_FIELDS = [
@@ -65,6 +69,7 @@ _btc_m15_shadow_cache = {}  # keyed "BTCUSDT" → latest raw router row
 _TRADE_MGMT_FRESHNESS_LOG = os.path.join("logs", "trade_management_freshness.jsonl")
 _PAPER_TRADE_QUALITY_LOG = os.path.join("logs", "paper_trade_quality_observations.jsonl")
 _PAPER_DD_PAUSE_LOG = os.path.join("logs", "paper_dd_pause_events.jsonl")
+_LIVE_STOP_UPDATE_FAILURE_LOG = os.path.join("logs", "live_stop_update_failures.jsonl")
 _TRADE_MGMT_CHECK_THROTTLE_SECS = 600
 _TRADE_MGMT_CACHE_MAX_AGE_SECS = 120
 _paper_dd_warn_only_breach_active = False
@@ -2063,6 +2068,7 @@ def _send_management_telegram(
     suppressed=False,
     suppress_reason=None,
     throttle_rule=None,
+    throttle_key=None,
     dedup_key=None,
 ):
     """Preserve the existing send behavior while appending timing metadata."""
@@ -2166,8 +2172,11 @@ def _send_management_telegram(
             ),
             "gated": metadata.get("gated", True) if category is not None else False,
             "suppressed": effective_suppressed,
+            "telegram_suppressed": effective_suppressed,
             "suppress_reason": effective_reason,
+            "attempted_send": bool(attempt_send),
             "throttle_rule": throttle_rule,
+            "throttle_key": throttle_key,
             "old_sl": context.get("old_sl"),
             "new_sl": context.get("new_sl"),
             "entry_price": t.get("entry_real") or t.get("entry"),
@@ -3904,6 +3913,64 @@ def _safe_numeric_value(value):
         return None
 
 
+def _live_stop_update_failure_key(t, current_confirmed_sl, pending_target_sl, exchange_sl_id):
+    return telegram_dedup.build_key(
+        "live_stop_update_failed",
+        t.get("symbol"),
+        t.get("side"),
+        current_confirmed_sl,
+        pending_target_sl,
+        exchange_sl_id,
+    )
+
+
+def _should_send_live_stop_update_failure_telegram(
+    key,
+    severity,
+    consecutive_failures,
+    old_protection_retained=True,
+    now=None,
+):
+    if not old_protection_retained:
+        return True, "unprotected_bypass"
+
+    now = time.time() if now is None else float(now)
+    previous = _live_stop_update_failed_telegram_state.get(key)
+    if not previous:
+        _live_stop_update_failed_telegram_state[key] = {
+            "last_sent_ts": now,
+            "last_severity": severity,
+        }
+        return True, "first"
+
+    if previous.get("last_severity") != severity:
+        previous["last_sent_ts"] = now
+        previous["last_severity"] = severity
+        return True, "severity_changed"
+
+    if int(consecutive_failures or 0) in _LIVE_STOP_UPDATE_ALERT_MILESTONES:
+        previous["last_sent_ts"] = now
+        previous["last_severity"] = severity
+        return True, "milestone"
+
+    last_sent = float(previous.get("last_sent_ts") or 0.0)
+    if now - last_sent >= _LIVE_STOP_UPDATE_ALERT_THROTTLE_SECS:
+        previous["last_sent_ts"] = now
+        previous["last_severity"] = severity
+        return True, "ttl"
+
+    return False, "throttled"
+
+
+def _write_live_stop_update_failure_event(row):
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(_LIVE_STOP_UPDATE_FAILURE_LOG)), exist_ok=True)
+        with open(_LIVE_STOP_UPDATE_FAILURE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    except Exception as exc:
+        print(f"[LIVE STOP UPDATE LOG] event write failed: {exc}")
+
+
 def _warn_missing_tp_reconstructed_orphan(t: dict):
     if not t.get("reconstructed_from_orphan") or t.get("_missing_tp_reconstructed_orphan_warned"):
         return
@@ -5340,22 +5407,66 @@ def _sync_testnet_trailing_sl(t, ctx, old_sl=None, current_price=None):
         t["exchange_sl_sync_error"] = result.get("error") or str(result)
         t["exchange_sl_sync_error_ts"] = time.time()
         t["sl_sync_fail_count"] = int(t.get("sl_sync_fail_count") or 0) + 1
+        _current_confirmed_sl = t.get("exchange_sl_price_confirmed")
+        _pending_target_sl = new_sl
+        _exchange_sl_id = t.get("exchange_sl_id") or old_sl_id
+        _old_protection_retained = bool(_exchange_sl_id) and result.get("old_protection_retained", True) is not False
+        _failure_severity = "high" if t["sl_sync_fail_count"] >= 3 else "critical"
+        _failure_key = _live_stop_update_failure_key(
+            t,
+            _current_confirmed_sl,
+            _pending_target_sl,
+            _exchange_sl_id,
+        )
+        _send_failure_telegram, _telegram_throttle_reason = _should_send_live_stop_update_failure_telegram(
+            _failure_key,
+            _failure_severity,
+            t["sl_sync_fail_count"],
+            old_protection_retained=_old_protection_retained,
+        )
+        _write_live_stop_update_failure_event({
+            "ts": time.time(),
+            "event_type": "live_stop_update_failed",
+            "execution_mode": ctx.execution_mode,
+            "symbol": t.get("symbol"),
+            "side": t.get("side"),
+            "current_confirmed_sl": _current_confirmed_sl,
+            "pending_target_sl": _pending_target_sl,
+            "exchange_sl_id": _exchange_sl_id,
+            "consecutive_failures": t["sl_sync_fail_count"],
+            "severity": _failure_severity,
+            "old_protection_retained": _old_protection_retained,
+            "error": result.get("error") or str(result),
+            "telegram_alert_sent": _send_failure_telegram,
+            "telegram_throttle_reason": _telegram_throttle_reason,
+            "telegram_dedup_key": _failure_key,
+        })
+        _protection_text = (
+            f"Old protection retained at {_old_sl_str}"
+            if _old_protection_retained
+            else "old protection NOT confirmed retained"
+        )
         print(
             f"{_critical_label} {t['symbol']} Stop update failed — "
-            f"Old protection retained at {_old_sl_str}. error={result.get('error')}"
+            f"{_protection_text}. error={result.get('error')}"
         )
-        send_telegram(
-            f"{_critical_label} {t['symbol']} Stop update failed — "
-            f"Old protection retained at {_old_sl_str}",
-            prefix=ctx.mode_prefix,
-            channel="alerts",
-        )
-        if t["sl_sync_fail_count"] >= 3:
+        if _send_failure_telegram and t["sl_sync_fail_count"] >= 3:
+            _high_severity_protection_text = (
+                "old protection still retained"
+                if _old_protection_retained
+                else "old protection NOT confirmed retained"
+            )
             send_telegram(
                 f"{_critical_label} {t['symbol']} HIGH-SEVERITY stop update failure — "
-                f"old protection still retained; consecutive_failures={t['sl_sync_fail_count']} "
-                f"current_confirmed_sl={t.get('exchange_sl_price_confirmed')} "
-                f"pending_target_sl={new_sl}",
+                f"{_high_severity_protection_text}; consecutive_failures={t['sl_sync_fail_count']} "
+                f"current_confirmed_sl={_current_confirmed_sl} "
+                f"pending_target_sl={_pending_target_sl}",
+                prefix=ctx.mode_prefix,
+                channel="alerts",
+            )
+        elif _send_failure_telegram:
+            send_telegram(
+                f"{_critical_label} {t['symbol']} Stop update failed — {_protection_text}",
                 prefix=ctx.mode_prefix,
                 channel="alerts",
             )
@@ -5499,6 +5610,28 @@ def _close_live_exchange_position_for_local_exit(t: dict, ctx, exit_type: str) -
     return True
 
 
+def _sl_audit_resync_current_price(t):
+    """Best-effort current price already available on the trade for the
+    SL-AUDIT forced-resync immediate-trigger guard.
+
+    No market data is fetched here; only fields the management cycle may
+    already have persisted are consulted (current-price semantics only, not
+    favorable/adverse extremes which are side-inconsistent). Returns a positive
+    float, or None when no usable price is available — in which case the caller
+    logs SL_AUDIT_RESYNC_PRICE_UNAVAILABLE_GUARD_BYPASS and preserves the prior
+    behavior (resync proceeds without the inner immediate-trigger guard).
+    """
+    for _field in (
+        "current_price_used_in_decision",
+        "last_mark_price",
+        "last_price",
+    ):
+        _val = _safe_numeric_value(t.get(_field))
+        if _val is not None and _val > 0:
+            return _val
+    return None
+
+
 def audit_exchange_sl(ctx):
     """
     P3 — Exchange SL Guarantee System.
@@ -5551,7 +5684,41 @@ def audit_exchange_sl(ctx):
         if t.get("exchange_sl_sync_pending") and sl_id and qty:
             _pending_sl = t["exchange_sl_sync_pending"]
             print(f"[SL AUDIT] {symbol} exchange_sl_sync_pending={round(_pending_sl, 6)} — forcing resync")
-            _pending_sync_ok = _sync_testnet_trailing_sl(t, ctx, old_sl=t.get("exchange_sl_price_confirmed"))
+            # Safety hardening: the forced resync places t["sl"] on the exchange.
+            # _sync_testnet_trailing_sl's inner immediate-trigger guard is skipped
+            # when current_price is None, so a stop that would self-trigger could be
+            # pushed here. Pass the best already-available current price and, when
+            # one exists, block the resync up-front if the stop is immediately
+            # triggerable. When no price is available, preserve the prior behavior.
+            _audit_current_price = _sl_audit_resync_current_price(t)
+            _audit_proposed_stop = _safe_numeric_value(t.get("sl"))
+            _audit_resync_blocked = False
+            if _audit_current_price is None:
+                print(
+                    f"[SL AUDIT] {symbol} SL_AUDIT_RESYNC_PRICE_UNAVAILABLE_GUARD_BYPASS "
+                    f"proposed_stop={_audit_proposed_stop} side={t.get('side')} "
+                    "— no current price in audit cycle; immediate-trigger guard not evaluated"
+                )
+            elif _audit_proposed_stop is not None:
+                _audit_side = str(t.get("side") or "").upper()
+                _audit_immediately_triggerable = (
+                    (_audit_side == "LONG" and _audit_current_price <= _audit_proposed_stop)
+                    or (_audit_side == "SHORT" and _audit_current_price >= _audit_proposed_stop)
+                )
+                if _audit_immediately_triggerable:
+                    _audit_resync_blocked = True
+                    print(
+                        f"[SL AUDIT] {symbol} SL_AUDIT_RESYNC_IMMEDIATE_TRIGGER_GUARD "
+                        f"current_price={_audit_current_price} proposed_stop={_audit_proposed_stop} "
+                        f"side={_audit_side} — forced resync blocked; existing exchange stop retained"
+                    )
+            if _audit_resync_blocked:
+                _pending_sync_ok = False
+            else:
+                _pending_sync_ok = _sync_testnet_trailing_sl(
+                    t, ctx, old_sl=t.get("exchange_sl_price_confirmed"),
+                    current_price=_audit_current_price,
+                )
             if _pending_sync_ok:
                 save_open_trades(ctx.trades, ctx.state_file)
                 print(f"[SL AUDIT] {symbol} pending sync resolved → {round(_pending_sl, 6)}")
@@ -6381,7 +6548,11 @@ def update_trades(fast_mode=False, ctx=None):
                 "message_price_source": _price_meta_5m.get("price_source") or "unknown",
             }
 
-            def _management_send(msg, alert_type, category=None, **extra):
+            def _management_send(msg, alert_type, category=None,
+                                 attempt_send=True, suppressed=False,
+                                 suppress_reason=None, throttle_rule=None,
+                                 throttle_key=None,
+                                 **extra):
                 management_context = dict(_management_context_base)
                 management_context.update(extra)
                 management_context.setdefault("event_detected_ts", time.time())
@@ -6414,6 +6585,11 @@ def update_trades(fast_mode=False, ctx=None):
                     category=category,
                     management_context=management_context,
                     dedup_key=_dedup_key,
+                    attempt_send=attempt_send,
+                    suppressed=suppressed,
+                    suppress_reason=suppress_reason,
+                    throttle_rule=throttle_rule,
+                    throttle_key=throttle_key,
                 )
     
             entry_real = t.get("entry_real") or t.get("entry")
@@ -6710,12 +6886,85 @@ def update_trades(fast_mode=False, ctx=None):
                             )
 
                             _lml_log_event = None
+                            # Telegram-throttle bookkeeping for the informational
+                            # immediate-trigger skip alert. Defaults below cover the
+                            # branches that do not emit that alert so the jsonl row
+                            # build never references an unset name.
+                            _lml_telegram_throttled = False
+                            _lml_throttle_key = None
+                            _lml_throttle_repeat_count = None
+                            _lml_throttle_reason = None
+                            _lml_last_sent_age_sec = None
+                            _lml_throttle_milestone = None
+                            _lml_min_send_spacing_sec = None
+                            _lml_stale_symbol_suppressed = False
                             if _lml_should_move and _lml_immediately_triggerable:
                                 _lml_sync_result = False
                                 _lml_log_event = "MIN_LOCK_075_LIVE_IMMEDIATE_TRIGGER_GUARD"
                                 t["min_lock_skipped_reason"] = "immediately_triggerable_before_local_sl_mutation"
                                 t["min_lock_skipped_ts"] = time.time()
                                 t["exchange_sl_sync_pending"] = _lml_floor
+
+                                # ---- Stale-symbol guard --------------------------------
+                                # A live-management alert must never fire for a symbol
+                                # that is not currently OPEN. In this path t is always
+                                # OPEN (loop guard at status check), so this is defensive.
+                                _lml_symbol_open = live_alert_throttle.is_symbol_open(
+                                    t.get("symbol"), _trades
+                                )
+
+                                # ---- Emergency protection bypass -----------------------
+                                # If the position is actually unprotected, never throttle:
+                                # alert immediately. exchange_sl_sync_pending is NOT a
+                                # bypass trigger here because this very skip sets it; the
+                                # previously confirmed exchange SL remains in force, so the
+                                # position stays protected by its existing stop.
+                                _lml_unprotected = (
+                                    not t.get("exchange_sl_id")
+                                    or t.get("exchange_sl_price_confirmed") in (None, "")
+                                    or int(t.get("sl_sync_fail_count") or 0) >= 3
+                                    or bool(t.get("entry_price_unconfirmed"))
+                                    or t.get("entry_state") != "ENTRY_CONFIRMED"
+                                    or bool(t.get("exchange_order_state_unknown"))
+                                )
+
+                                # ---- Throttle key (salient fields force re-send) -------
+                                # Float fields are rounded inside the helper so the
+                                # same persisting skip maps to one byte-stable key
+                                # (repeat_count increments; cooldown applies), while a
+                                # real SL/floor change still yields a new key -> resend.
+                                _lml_throttle_key = live_alert_throttle.build_min_lock_075_throttle_key(
+                                    t, _lml_floor
+                                )
+                                _lml_throttle_decision = live_alert_throttle.should_send(
+                                    _lml_throttle_key
+                                )
+                                _lml_throttle_repeat_count = _lml_throttle_decision["repeat_count"]
+                                _lml_throttle_reason = _lml_throttle_decision["throttle_reason"]
+                                _lml_last_sent_age_sec = _lml_throttle_decision["last_sent_age_sec"]
+                                _lml_throttle_milestone = _lml_throttle_decision.get("milestone")
+                                _lml_min_send_spacing_sec = _lml_throttle_decision.get("min_send_spacing_sec")
+
+                                if not _lml_symbol_open:
+                                    # Do not Telegram-spam a non-open symbol.
+                                    _lml_stale_symbol_suppressed = True
+                                    _lml_telegram_throttled = True
+                                    _lml_throttle_reason = "stale_symbol_suppressed"
+                                    print(
+                                        "[LIVE_MANAGEMENT_STALE_SYMBOL_ALERT_SUPPRESSED] "
+                                        f"symbol={t.get('symbol')} side={t.get('side')} "
+                                        "event_type=LIVE_MIN_LOCK_075 "
+                                        "reason=immediately_triggerable_before_local_sl_mutation "
+                                        "source=execution._lml_immediate_trigger_guard"
+                                    )
+                                else:
+                                    if _lml_unprotected:
+                                        _lml_send_telegram = True
+                                        _lml_throttle_reason = "emergency_bypass_unprotected"
+                                    else:
+                                        _lml_send_telegram = bool(_lml_throttle_decision["send"])
+                                    _lml_telegram_throttled = not _lml_send_telegram
+
                                 _management_send(
                                     f"[LIVE_MIN_LOCK_075] {t.get('symbol')} skipped\n"
                                     "reason=immediately_triggerable_before_local_sl_mutation",
@@ -6725,6 +6974,13 @@ def update_trades(fast_mode=False, ctx=None):
                                     new_sl=_lml_current_sl,
                                     proposed_sl=_lml_floor,
                                     min_lock_skipped_reason=t["min_lock_skipped_reason"],
+                                    attempt_send=not _lml_telegram_throttled,
+                                    suppressed=_lml_telegram_throttled,
+                                    suppress_reason=(
+                                        _lml_throttle_reason if _lml_telegram_throttled else None
+                                    ),
+                                    throttle_rule="live_min_lock_075_immediate_trigger",
+                                    throttle_key=_lml_throttle_key,
                                 )
                             elif _lml_should_move:
                                 t["sl"] = _lml_floor
@@ -6779,6 +7035,14 @@ def update_trades(fast_mode=False, ctx=None):
                                     "mfe_r": t.get("max_profit_r"),
                                     "sync_result": str(_lml_sync_result),
                                     "min_lock_075_done": t.get("min_lock_075_done"),
+                                    "telegram_throttled": _lml_telegram_throttled,
+                                    "throttle_key": _lml_throttle_key,
+                                    "repeat_count": _lml_throttle_repeat_count,
+                                    "throttle_reason": _lml_throttle_reason,
+                                    "last_sent_age_sec": _lml_last_sent_age_sec,
+                                    "milestone": _lml_throttle_milestone,
+                                    "min_send_spacing_sec": _lml_min_send_spacing_sec,
+                                    "stale_symbol_suppressed": _lml_stale_symbol_suppressed,
                                 }
                                 _lml_log_path = os.path.join(
                                     "logs",
