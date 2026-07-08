@@ -81,6 +81,9 @@ def main():
     sd.config["live_research_loss_streak_pause_count"] = 3
     sd.config["live_research_micro_pause_hours"] = 3
     sd.config["live_research_rolling_net_pause_r"] = -2.0
+    sd.config["max_live_research_trades"] = 1
+    sd.config["live_risk_per_trade"] = 0.005
+    sd.config["live_max_portfolio_risk"] = 0.005
 
     try:
         values = _interleave([1.0] * 25, [-0.8333333333] * 25)
@@ -334,7 +337,7 @@ def main():
         results.append(_assert(
             "3 consecutive losses => pause 3h",
             ok is False
-            and reason == "live_micro_pause"
+            and reason == "LIVE_MICRO_BLOCKED_LOSS_STREAK"
             and detail.get("pause_reason") == "LIVE_MICRO_PAUSE_3_LOSS_STREAK"
             and round(detail.get("pause_until") - now) == 10800,
             f"ok={ok} reason={reason} detail={detail}",
@@ -356,7 +359,7 @@ def main():
         results.append(_assert(
             "during pause => PREFILTER_REJECT live_micro_pause",
             ok is False
-            and reason == "live_micro_pause"
+            and reason == "LIVE_MICRO_BLOCKED_LOSS_STREAK"
             and detail.get("pause_remaining_sec") == 3540,
             f"ok={ok} reason={reason} detail={detail}",
         ))
@@ -383,8 +386,11 @@ def main():
             health_rows=[{"paper_health": "RED"}],
         )
         results.append(_assert(
-            "after 3h and paper health RED => still blocked by paper health",
-            ok is False and reason == "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+            "after 3h and paper health RED => micro allowed with warning",
+            ok is True
+            and reason == ""
+            and detail.get("pause_reason") == "LIVE_MICRO_WARN_PAPER_HEALTH_RED_ALLOWED"
+            and detail.get("micro_allowed_despite_paper_red") is True,
             f"ok={ok} reason={reason} detail={detail}",
         ))
 
@@ -402,7 +408,7 @@ def main():
         results.append(_assert(
             "live rolling net <= -2R => pause 3h",
             ok is False
-            and reason == "live_micro_pause"
+            and reason == "LIVE_MICRO_BLOCKED_ROLLING_NET"
             and detail.get("pause_reason") == "LIVE_MICRO_PAUSE_ROLLING_NET"
             and round(detail.get("pause_until") - now) == 10800,
             f"ok={ok} reason={reason} detail={detail}",

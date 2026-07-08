@@ -125,6 +125,12 @@ def case_g_live_payload_extra_only():
     ok("v2_shadow_status" in merged, "G live payload has extra shadow field")
 
 
+def case_h_a3_warn_allow_unchanged():
+    payload = {"action": "WARN_ALLOW", "pause_reason": "LIVE_MICRO_WARN_PAPER_HEALTH_RED_ALLOWED"}
+    before = dict(payload)
+    _ = sd._smc_entry_v2_shadow(candidate("LONG"), fields())
+    ok(payload == before, "H A3 WARN_ALLOW unchanged")
+
 
 def case_i_live_prefilter_reasons_unchanged():
     def rr_case():
@@ -172,6 +178,7 @@ def main():
     case_e_late_chase_skip()
     case_f_missing_exact_features_coarse()
     case_g_live_payload_extra_only()
+    case_h_a3_warn_allow_unchanged()
     case_i_live_prefilter_reasons_unchanged()
     case_j_no_order_path_touched()
     print("VERDICT: PASS")

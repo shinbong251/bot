@@ -7259,6 +7259,7 @@ _LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join("logs", "live_smc_research_decisi
 _LIVE_RESEARCH_MICRO_PAUSE_LOG = os.path.join("logs", "live_research_micro_pause.jsonl")
 _RESEARCH_ROLLING_HEALTH_LOG = os.path.join("logs", "research_rolling_health.jsonl")
 _LIVE_TRADES_CSV = "live_trades.csv"
+_LIVE_RESEARCH_HEALTH_ROW_MAX_AGE_SECS = 15 * 60
 _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS = 15 * 60
 _live_smc_research_terminal_failures = {}
 
@@ -7457,11 +7458,13 @@ def _live_research_micro_metrics(close_rows=None, decision_rows=None, live_trade
         decision_rows=decision_rows,
         live_trade_rows=live_trade_rows,
     )
-    values = [
-        _live_research_micro_float(row.get("actual_realized_r"))
-        for row in rows
-    ]
-    values = [value for value in values if value is not None]
+    realized_rows = []
+    for row in rows:
+        realized = _live_research_micro_float(row.get("actual_realized_r"))
+        if realized is None:
+            continue
+        realized_rows.append((row, realized))
+    values = [value for _, value in realized_rows]
     loss_streak = 0
     for value in reversed(values):
         if value < 0:
@@ -7469,10 +7472,14 @@ def _live_research_micro_metrics(close_rows=None, decision_rows=None, live_trade
         else:
             break
     rolling_values = values[-20:]
+    last_live_close_key = ""
+    if realized_rows:
+        last_live_close_key = _live_research_close_dedup_key(realized_rows[-1][0])
     return {
         "live_loss_streak": loss_streak,
         "live_rolling_net_r": round(sum(rolling_values), 4) if rolling_values else 0.0,
         "live_closed_count": len(values),
+        "last_live_close_key": last_live_close_key,
     }
 
 
@@ -7498,6 +7505,46 @@ def _live_research_micro_latest_pause(now_ts=None, pause_rows=None):
     return latest, None
 
 
+def _live_research_micro_latest_pause_for_reason(pause_reason, pause_rows=None):
+    rows = pause_rows if pause_rows is not None else _live_research_micro_read_jsonl(
+        _LIVE_RESEARCH_MICRO_PAUSE_LOG
+    )
+    latest = None
+    for row in rows:
+        if str(row.get("event_type") or "") != "LIVE_RESEARCH_MICRO_PAUSE":
+            continue
+        if str(row.get("pause_reason") or "") != str(pause_reason or ""):
+            continue
+        if latest is None or _live_research_micro_float(row.get("ts"), 0.0) >= _live_research_micro_float(latest.get("ts"), 0.0):
+            latest = row
+    return latest
+
+
+def _live_research_micro_pause_arm_identity(row):
+    row = row if isinstance(row, dict) else {}
+    live_closed_count = row.get("pause_armed_live_closed_count", row.get("live_closed_count"))
+    live_closed_count = _live_research_micro_float(live_closed_count)
+    if live_closed_count is not None:
+        live_closed_count = int(live_closed_count)
+    last_live_close_key = str(
+        row.get("pause_armed_last_live_close_key", row.get("last_live_close_key", ""))
+        or ""
+    )
+    return live_closed_count, last_live_close_key
+
+
+def _live_research_micro_same_pause_arm_identity(current_payload, previous_pause):
+    previous_count, previous_key = _live_research_micro_pause_arm_identity(previous_pause)
+    current_count, current_key = _live_research_micro_pause_arm_identity(current_payload)
+    if previous_count is None:
+        return False
+    if current_count != previous_count:
+        return False
+    if previous_key and current_key and previous_key != current_key:
+        return False
+    return True
+
+
 def _live_research_micro_latest_paper_health(health_rows=None):
     rows = health_rows if health_rows is not None else _live_research_micro_read_jsonl(
         _RESEARCH_ROLLING_HEALTH_LOG
@@ -7507,6 +7554,198 @@ def _live_research_micro_latest_paper_health(health_rows=None):
         if value:
             return value
     return "UNKNOWN"
+
+
+def _live_research_micro_latest_health_row(health_rows=None):
+    rows = health_rows if health_rows is not None else _live_research_micro_read_jsonl(
+        _RESEARCH_ROLLING_HEALTH_LOG
+    )
+    for row in reversed(rows):
+        if isinstance(row, dict):
+            return row
+    return {}
+
+
+def _live_research_micro_health_row_freshness(health_row, now_ts=None):
+    now_ts = time.time() if now_ts is None else now_ts
+    threshold = _LIVE_RESEARCH_HEALTH_ROW_MAX_AGE_SECS
+    if not isinstance(health_row, dict) or not health_row:
+        return {
+            "health_row_status": "MISSING",
+            "health_row_fresh": False,
+            "health_row_stale": True,
+            "health_row_ts": None,
+            "health_row_age_sec": None,
+            "health_row_stale_threshold_sec": threshold,
+            "health_row_warning": "LIVE_HEALTH_ROW_STALE_WARN",
+        }
+    row_ts = _live_research_micro_float(health_row.get("ts"))
+    if row_ts is None:
+        return {
+            "health_row_status": "INVALID_TS",
+            "health_row_fresh": False,
+            "health_row_stale": True,
+            "health_row_ts": None,
+            "health_row_age_sec": None,
+            "health_row_stale_threshold_sec": threshold,
+            "health_row_warning": "LIVE_HEALTH_ROW_STALE_WARN",
+        }
+    age_sec = max(0.0, now_ts - row_ts)
+    stale = age_sec > threshold
+    return {
+        "health_row_status": "STALE" if stale else "FRESH",
+        "health_row_fresh": not stale,
+        "health_row_stale": stale,
+        "health_row_ts": row_ts,
+        "health_row_age_sec": round(age_sec, 3),
+        "health_row_stale_threshold_sec": threshold,
+        "health_row_warning": "LIVE_HEALTH_ROW_STALE_WARN" if stale else "",
+    }
+
+
+def _live_research_micro_config_status():
+    cap_raw = config.get("max_live_research_trades", 1)
+    risk_raw = config.get("live_risk_per_trade", 0)
+    portfolio_raw = config.get("live_max_portfolio_risk", 0)
+    try:
+        cap = int(cap_raw)
+    except (TypeError, ValueError):
+        cap = 1
+    risk = _live_research_micro_float(risk_raw)
+    portfolio = _live_research_micro_float(portfolio_raw)
+    is_micro = (
+        cap <= 1
+        and risk is not None
+        and risk <= 0.005
+        and portfolio is not None
+        and portfolio <= 0.005
+    )
+    return {
+        "max_live_research_trades": cap,
+        "live_risk_per_trade": risk,
+        "live_max_portfolio_risk": portfolio,
+        "scale_block": not is_micro,
+    }
+
+
+def _live_research_micro_health_status(health_row, metrics, freshness=None):
+    health_row = health_row if isinstance(health_row, dict) else {}
+    freshness = freshness if isinstance(freshness, dict) else {}
+    row_fresh = bool(freshness.get("health_row_fresh"))
+    live_metrics = health_row.get("live_metrics")
+    if not isinstance(live_metrics, dict):
+        live_metrics = {}
+    reasons = health_row.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = [] if reasons in (None, "") else [reasons]
+    reason_text = " ".join(str(reason) for reason in reasons).lower()
+    live_health = str(health_row.get("live_health") or "UNKNOWN").upper() if row_fresh else "UNKNOWN"
+    live_loss_streak = int(_live_research_micro_float(metrics.get("live_loss_streak"), 0) or 0)
+    live_rolling_net_r = _live_research_micro_float(
+        metrics.get("live_rolling_net_r", 0.0),
+    )
+    live_unconfirmed_rr_n = int(_live_research_micro_float(
+        live_metrics.get("live_unconfirmed_rr_n") if row_fresh else 0,
+        0,
+    ) or 0)
+    current_sl_failure_reasons = {
+        "live_sl_sync_failure",
+        "sl missing",
+        "missing sl",
+        "missing exchange sl",
+        "exchange sl not confirmed",
+    }
+    live_sl_sync_failure = any(
+        str(reason).strip().lower() in current_sl_failure_reasons
+        for reason in reasons
+    ) if row_fresh else False
+    # NOTE: live_unconfirmed_rr_n counts CLOSED research trades whose exit price
+    # was an estimate (rr_unconfirmed on the historical close row). Those are
+    # settled positions with a known realized R and confirmed entries; the
+    # health producer treats them as benign (excluded from the confirmed
+    # sample). They are NOT a current-position safety failure, so they no longer
+    # drive entry_unconfirmed. Genuine in-flight unconfirmed entries are detected
+    # from live state via _live_research_current_entry_unconfirmed(ctx), and from
+    # explicit health-row reason phrases below.
+    entry_unconfirmed = (
+        "entry_unconfirmed" in reason_text
+        or "entry unconfirmed" in reason_text
+        or "entry fill unconfirmed" in reason_text
+    ) if row_fresh else False
+    runtime_error = ("runtime error" in reason_text or "exception" in reason_text) if row_fresh else False
+    loss_streak_current = bool(live_metrics.get("loss_streak_current")) if row_fresh else False
+    loss_streak_stale_after_new_open = bool(live_metrics.get("loss_streak_stale_after_new_open")) if row_fresh else False
+    last_live_open_key = str(live_metrics.get("last_live_open_key") or "") if row_fresh else ""
+    last_live_close_key = str(live_metrics.get("last_live_close_key") or "") if row_fresh else ""
+    return {
+        "live_health": live_health,
+        "raw_live_health": str(health_row.get("live_health") or "UNKNOWN").upper(),
+        "live_reasons": reasons,
+        "live_loss_streak": live_loss_streak,
+        "live_rolling_net_r": live_rolling_net_r,
+        "live_sl_sync_failure": live_sl_sync_failure,
+        "live_unconfirmed_rr_n": live_unconfirmed_rr_n,
+        "entry_unconfirmed": entry_unconfirmed,
+        "runtime_error": runtime_error,
+        "loss_streak_current": loss_streak_current,
+        "loss_streak_stale_after_new_open": loss_streak_stale_after_new_open,
+        "last_live_open_key": last_live_open_key,
+        "last_live_close_key": last_live_close_key,
+    }
+
+
+def _live_research_current_sl_sync_failure(ctx):
+    missing = []
+    for trade in getattr(ctx, "trades", []) or []:
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("status", "OPEN") or "OPEN").upper() != "OPEN":
+            continue
+        if str(trade.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        owner = str(trade.get("owner") or "bot").lower()
+        if owner != "bot":
+            continue
+        if not trade.get("exchange_sl_id"):
+            missing.append(str(trade.get("symbol") or ""))
+            continue
+        confirmed = trade.get("exchange_sl_price_confirmed")
+        if confirmed in (None, "", False):
+            missing.append(str(trade.get("symbol") or ""))
+    return missing
+
+
+def _live_research_current_entry_unconfirmed(ctx):
+    """Currently-open research positions whose entry/exchange state is unconfirmed.
+
+    Scoped to OPEN positions only. Mirrors the inverse of the producer's
+    open_trade_confirmed_healthy() current-safety checks. A CLOSED trade whose
+    exit price was an estimate (rr_unconfirmed on the historical close row) is a
+    settled position with a known realized R and must NOT appear here.
+    """
+    missing = []
+    for trade in getattr(ctx, "trades", []) or []:
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("status", "OPEN") or "OPEN").upper() != "OPEN":
+            continue
+        if str(trade.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        owner = str(trade.get("owner") or "bot").lower()
+        if owner != "bot":
+            continue
+        if str(trade.get("entry_price_unconfirmed") or "").lower() in ("true", "1", "yes"):
+            missing.append(str(trade.get("symbol") or ""))
+            continue
+        if trade.get("exchange_order_state_unknown") in (True, "true", "1", "yes"):
+            missing.append(str(trade.get("symbol") or ""))
+            continue
+        entry_source = str(trade.get("entry_source") or "").lower()
+        entry_state = str(trade.get("entry_state") or "").upper()
+        entry_confirmed = entry_source == "actual_exchange_fill" or entry_state == "ENTRY_CONFIRMED"
+        if not entry_confirmed:
+            missing.append(str(trade.get("symbol") or ""))
+    return missing
 
 
 def _live_research_has_unmanaged_research_position(ctx):
@@ -7536,27 +7775,238 @@ def _live_research_micro_pause_status(
         3.0,
     )
     pause_secs = max(0.0, pause_hours * 3600.0)
+    health_row = _live_research_micro_latest_health_row(health_rows=health_rows)
+    config_status = _live_research_micro_config_status()
+    health_freshness = _live_research_micro_health_row_freshness(health_row, now_ts=now_ts)
+    live_status = _live_research_micro_health_status(health_row, metrics, freshness=health_freshness)
+    paper_health = _live_research_micro_latest_paper_health(health_rows=health_rows)
+    current_sl_missing_symbols = _live_research_current_sl_sync_failure(ctx)
+    current_entry_unconfirmed_symbols = _live_research_current_entry_unconfirmed(ctx)
+    health_warnings = []
+    if health_freshness.get("health_row_stale"):
+        health_warnings.append("LIVE_HEALTH_ROW_STALE_WARN")
     payload = {
         "event_type": "LIVE_RESEARCH_MICRO_PAUSE",
         "ts": now_ts,
         "pause_until": None,
         "pause_remaining_sec": 0,
-        "live_loss_streak": metrics.get("live_loss_streak", 0),
-        "live_rolling_net_r": metrics.get("live_rolling_net_r", 0.0),
-        "paper_health": _live_research_micro_latest_paper_health(health_rows=health_rows),
+        "paper_health": paper_health,
+        "paper_active_health": paper_health,
+        "live_health": live_status.get("live_health"),
+        "raw_live_health": live_status.get("raw_live_health"),
+        "live_reasons": live_status.get("live_reasons"),
+        "live_loss_streak": live_status.get("live_loss_streak"),
+        "live_rolling_net_r": live_status.get("live_rolling_net_r"),
+        "live_sl_sync_failure": live_status.get("live_sl_sync_failure"),
+        "current_sl_missing_symbols": current_sl_missing_symbols,
+        "current_entry_unconfirmed_symbols": current_entry_unconfirmed_symbols,
+        "live_unconfirmed_rr_n": live_status.get("live_unconfirmed_rr_n"),
+        "live_closed_count": metrics.get("live_closed_count", 0),
+        "last_live_close_key": metrics.get("last_live_close_key", ""),
+        "max_live_research_trades": config_status.get("max_live_research_trades"),
+        "live_risk_per_trade": config_status.get("live_risk_per_trade"),
+        "live_max_portfolio_risk": config_status.get("live_max_portfolio_risk"),
+        "micro_allowed_despite_paper_red": False,
+        "scale_block": bool(config_status.get("scale_block")),
+        "health_warnings": health_warnings,
         "action": "ALLOW",
     }
+    payload.update(health_freshness)
 
     if not bool(config.get("live_research_micro_pause_enabled", True)):
         return True, "", payload
+
+    if payload.get("scale_block") and payload.get("health_row_stale"):
+        payload.update({
+            "pause_reason": "LIVE_SCALE_BLOCKED_STALE_HEALTH",
+            "action": "BLOCK_SCALE",
+        })
+        _live_research_micro_write(payload)
+        return False, "LIVE_SCALE_BLOCKED_STALE_HEALTH", payload
+
+    if payload.get("paper_health") == "RED" and payload.get("scale_block"):
+        # Option A3: paper RED becomes WARN_ONLY for live scale ONLY when the
+        # config flag is set AND every live-side safety condition holds. The
+        # default mode ("BLOCK") preserves the original hard-block behavior
+        # exactly. Cap/risk are never altered by this policy.
+        paper_red_mode = str(config.get("live_paper_red_scale_mode", "BLOCK") or "BLOCK")
+        paper_red_open_live_count = (
+            _live_smc_research_open_count(ctx) if ctx is not None else None
+        )
+        paper_red_max_live = config_status.get("max_live_research_trades")
+        paper_red_rolling_net_r = _live_research_micro_float(
+            live_status.get("live_rolling_net_r"), None
+        )
+        paper_red_conditions = {
+            "mode_warn_only": paper_red_mode == "WARN_ONLY_WHEN_LIVE_HEALTH_OK",
+            "live_rolling_net_r_positive": (
+                paper_red_rolling_net_r is not None and paper_red_rolling_net_r > 0
+            ),
+            "loss_streak_not_current": not bool(live_status.get("loss_streak_current")),
+            "no_entry_unconfirmed": not current_entry_unconfirmed_symbols,
+            "no_sl_missing": not current_sl_missing_symbols,
+            "no_sl_sync_failure": not bool(live_status.get("live_sl_sync_failure")),
+            "health_row_fresh": bool(health_freshness.get("health_row_fresh")),
+            "cap_room": (
+                isinstance(paper_red_open_live_count, int)
+                and isinstance(paper_red_max_live, int)
+                and paper_red_open_live_count < paper_red_max_live
+            ),
+        }
+        # Safety extension: even when the A3 conditions pass, never WARN_ALLOW
+        # while a live runtime error is flagged or an active micro-pause window
+        # is armed. These mirror the downstream runtime_error / active-pause
+        # blocks that the early WARN_ALLOW return would otherwise bypass.
+        paper_red_runtime_error = bool(live_status.get("runtime_error"))
+        _paper_red_latest_pause, _paper_red_active_pause_until = (
+            _live_research_micro_latest_pause(now_ts=now_ts, pause_rows=pause_rows)
+        )
+        paper_red_pause_remaining_sec = (
+            round(max(0.0, _paper_red_active_pause_until - now_ts), 3)
+            if _paper_red_active_pause_until
+            else 0
+        )
+        paper_red_active_pause = bool(
+            _paper_red_active_pause_until and paper_red_pause_remaining_sec > 0
+        )
+        payload.update({
+            "paper_red_ignored": False,
+            "paper_red_ignore_reason": "",
+            "original_paper_health": payload.get("paper_health"),
+            "original_paper_active_health": payload.get("paper_active_health"),
+            "live_paper_red_scale_mode": paper_red_mode,
+            "live_rolling_net_r": live_status.get("live_rolling_net_r"),
+            "loss_streak_current": bool(live_status.get("loss_streak_current")),
+            "current_entry_unconfirmed_symbols": current_entry_unconfirmed_symbols,
+            "current_sl_missing_symbols": current_sl_missing_symbols,
+            "live_sl_sync_failure": bool(live_status.get("live_sl_sync_failure")),
+            "health_row_fresh": bool(health_freshness.get("health_row_fresh")),
+            "open_live_count": paper_red_open_live_count,
+            "max_live_research_trades": paper_red_max_live,
+            "paper_red_conditions": paper_red_conditions,
+            "runtime_error_blocker": paper_red_runtime_error,
+            "active_pause_blocker": paper_red_active_pause,
+            "pause_until": _paper_red_active_pause_until,
+            "pause_remaining_sec": paper_red_pause_remaining_sec,
+        })
+        if all(paper_red_conditions.values()):
+            if paper_red_runtime_error:
+                payload.update({
+                    "paper_red_ignored": False,
+                    "paper_red_ignore_reason": "RUNTIME_ERROR_BLOCKER",
+                    "pause_reason": "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+                    "action": "BLOCK_SCALE",
+                })
+                _live_research_micro_write(payload)
+                return False, "LIVE_SCALE_BLOCKED_PAPER_HEALTH", payload
+            if paper_red_active_pause:
+                payload.update({
+                    "paper_red_ignored": False,
+                    "paper_red_ignore_reason": "ACTIVE_MICRO_PAUSE_BLOCKER",
+                    "pause_reason": "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+                    "action": "BLOCK_SCALE",
+                })
+                _live_research_micro_write(payload)
+                return False, "LIVE_SCALE_BLOCKED_PAPER_HEALTH", payload
+            payload.update({
+                "paper_red_ignored": True,
+                "paper_red_ignore_reason": "LIVE_HEALTH_OK_AND_ROLLING_POSITIVE",
+                "pause_reason": "LIVE_SCALE_WARN_PAPER_HEALTH_RED_ALLOWED",
+                "micro_allowed_despite_paper_red": True,
+                "action": "WARN_ALLOW_SCALE",
+            })
+            _live_research_micro_write(payload)
+            return True, "", payload
+        _paper_red_failed = [k for k, v in paper_red_conditions.items() if not v]
+        payload.update({
+            "paper_red_ignore_reason": "BLOCKED:" + ",".join(_paper_red_failed),
+            "pause_reason": "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+            "action": "BLOCK_SCALE",
+        })
+        _live_research_micro_write(payload)
+        return False, "LIVE_SCALE_BLOCKED_PAPER_HEALTH", payload
+
+    if payload.get("scale_block") and live_status.get("live_health") == "RED":
+        # Current-safety failures must always hard-block, regardless of streak staleness.
+        _current_safety_block = bool(
+            live_status.get("live_sl_sync_failure")
+            or live_status.get("entry_unconfirmed")
+            or current_sl_missing_symbols
+            or current_entry_unconfirmed_symbols
+        )
+        _rolling_hard_threshold = _live_research_micro_float(
+            config.get("live_research_rolling_net_pause_r", -2.0),
+            -2.0,
+        )
+        _rolling_net_block = (
+            _live_research_micro_float(live_status.get("live_rolling_net_r"), 0.0) or 0.0
+        ) <= _rolling_hard_threshold
+        _stale_streak = bool(live_status.get("loss_streak_stale_after_new_open"))
+        _current_streak = bool(live_status.get("loss_streak_current"))
+        payload.update({
+            "loss_streak_current": _current_streak,
+            "loss_streak_stale_after_new_open": _stale_streak,
+            "last_live_open_key": live_status.get("last_live_open_key", ""),
+            "last_live_close_key": live_status.get("last_live_close_key", payload.get("last_live_close_key", "")),
+        })
+        if _stale_streak and not _current_safety_block and not _rolling_net_block:
+            payload.update({
+                "pause_reason": "LIVE_SCALE_WARN_STALE_LOSS_STREAK_AFTER_NEW_OPEN",
+                "scale_block_cause": "stale_loss_streak_after_new_open",
+                "action": "WARN_ALLOW_SCALE",
+            })
+            _live_research_micro_write(payload)
+            return True, "", payload
+        if _current_safety_block:
+            _scale_block_reason = "LIVE_SCALE_BLOCKED_LIVE_HEALTH"
+            _scale_block_cause = "current_safety"
+        elif _rolling_net_block:
+            _scale_block_reason = "LIVE_SCALE_BLOCKED_LIVE_HEALTH"
+            _scale_block_cause = "rolling_net_hard"
+        elif _current_streak:
+            _scale_block_reason = "LIVE_SCALE_BLOCKED_LIVE_LOSS_STREAK_CURRENT"
+            _scale_block_cause = "current_loss_streak"
+        else:
+            _scale_block_reason = "LIVE_SCALE_BLOCKED_LIVE_HEALTH"
+            _scale_block_cause = "live_health"
+        payload.update({
+            "pause_reason": _scale_block_reason,
+            "scale_block_cause": _scale_block_cause,
+            "action": "BLOCK_SCALE",
+        })
+        _live_research_micro_write(payload)
+        return False, _scale_block_reason, payload
+
+    if live_status.get("live_sl_sync_failure") or live_status.get("entry_unconfirmed") or current_sl_missing_symbols or current_entry_unconfirmed_symbols:
+        payload.update({
+            "pause_reason": "LIVE_MICRO_BLOCKED_SL_SYNC",
+            "action": "BLOCK",
+        })
+        _live_research_micro_write(payload)
+        return False, "LIVE_MICRO_BLOCKED_SL_SYNC", payload
+
+    if live_status.get("runtime_error"):
+        payload.update({
+            "pause_reason": "LIVE_MICRO_BLOCKED_LIVE_HEALTH",
+            "action": "BLOCK",
+        })
+        _live_research_micro_write(payload)
+        return False, "LIVE_MICRO_BLOCKED_LIVE_HEALTH", payload
 
     latest_pause, active_pause_until = _live_research_micro_latest_pause(
         now_ts=now_ts,
         pause_rows=pause_rows,
     )
     if active_pause_until:
+        active_pause_reason = str(latest_pause.get("pause_reason") or "LIVE_MICRO_PAUSE_ACTIVE")
+        active_block_reason = "live_micro_pause"
+        if active_pause_reason == "LIVE_MICRO_PAUSE_3_LOSS_STREAK":
+            active_block_reason = "LIVE_MICRO_BLOCKED_LOSS_STREAK"
+        elif active_pause_reason == "LIVE_MICRO_PAUSE_ROLLING_NET":
+            active_block_reason = "LIVE_MICRO_BLOCKED_ROLLING_NET"
         payload.update({
-            "pause_reason": str(latest_pause.get("pause_reason") or "LIVE_MICRO_PAUSE_ACTIVE"),
+            "pause_reason": active_pause_reason,
+            "block_reason": active_block_reason,
             "pause_until": active_pause_until,
             "pause_remaining_sec": round(max(0.0, active_pause_until - now_ts), 3),
             "live_loss_streak": _live_research_micro_float(
@@ -7567,10 +8017,29 @@ def _live_research_micro_pause_status(
                 latest_pause.get("live_rolling_net_r"),
                 payload.get("live_rolling_net_r"),
             ),
+            "live_closed_count": int(_live_research_micro_float(
+                latest_pause.get("live_closed_count"),
+                payload.get("live_closed_count"),
+            ) or 0),
+            "last_live_close_key": str(
+                latest_pause.get("last_live_close_key")
+                or payload.get("last_live_close_key")
+                or ""
+            ),
+            "pause_armed_live_closed_count": int(_live_research_micro_float(
+                latest_pause.get("pause_armed_live_closed_count", latest_pause.get("live_closed_count")),
+                payload.get("live_closed_count"),
+            ) or 0),
+            "pause_armed_last_live_close_key": str(
+                latest_pause.get("pause_armed_last_live_close_key")
+                or latest_pause.get("last_live_close_key")
+                or payload.get("last_live_close_key")
+                or ""
+            ),
             "action": "BLOCK",
         })
         _live_research_micro_write(payload)
-        return False, "live_micro_pause", payload
+        return False, active_block_reason, payload
 
     pause_reason = ""
     streak_threshold = int(config.get("live_research_loss_streak_pause_count", 3) or 3)
@@ -7578,21 +8047,71 @@ def _live_research_micro_pause_status(
         config.get("live_research_rolling_net_pause_r", -2.0),
         -2.0,
     )
-    if metrics.get("live_loss_streak", 0) >= streak_threshold:
+    if live_status.get("live_loss_streak", 0) >= streak_threshold:
         pause_reason = "LIVE_MICRO_PAUSE_3_LOSS_STREAK"
-    elif metrics.get("live_rolling_net_r", 0.0) <= rolling_threshold:
+    elif live_status.get("live_rolling_net_r", 0.0) <= rolling_threshold:
         pause_reason = "LIVE_MICRO_PAUSE_ROLLING_NET"
 
     if pause_reason:
+        block_reason = (
+            "LIVE_MICRO_BLOCKED_LOSS_STREAK"
+            if pause_reason == "LIVE_MICRO_PAUSE_3_LOSS_STREAK"
+            else "LIVE_MICRO_BLOCKED_ROLLING_NET"
+        )
+        previous_pause = _live_research_micro_latest_pause_for_reason(
+            pause_reason,
+            pause_rows=pause_rows,
+        )
+        if (
+            previous_pause is not None
+            and _live_research_micro_same_pause_arm_identity(payload, previous_pause)
+        ):
+            previous_pause_until = _live_research_micro_float(previous_pause.get("pause_until"))
+            payload.update({
+                "pause_reason": pause_reason,
+                "previous_pause_until": previous_pause_until,
+                "pause_until": None,
+                "pause_remaining_sec": 0,
+                "reason": "MICRO_PAUSE_NOT_REARMED_STALE_STREAK",
+                "action": "ALLOW_AFTER_PAUSE_EXPIRY_NO_NEW_CLOSE",
+            })
+            _live_research_micro_write(payload)
+            if latest_pause is not None and _live_research_has_unmanaged_research_position(ctx):
+                payload.update({
+                    "pause_reason": "LIVE_MICRO_PAUSE_UNMANAGED_LIVE_POSITION",
+                    "pause_until": now_ts + pause_secs,
+                    "pause_remaining_sec": round(pause_secs, 3),
+                    "action": "EXTEND_AND_BLOCK",
+                })
+                _live_research_micro_write(payload)
+                return False, "live_micro_pause", payload
+            if live_status.get("live_health") == "RED":
+                payload.update({
+                    "pause_reason": "LIVE_MICRO_BLOCKED_LIVE_HEALTH",
+                    "action": "BLOCK",
+                })
+                _live_research_micro_write(payload)
+                return False, "LIVE_MICRO_BLOCKED_LIVE_HEALTH", payload
+            if payload.get("paper_health") == "RED":
+                payload.update({
+                    "pause_reason": "LIVE_MICRO_WARN_PAPER_HEALTH_RED_ALLOWED",
+                    "micro_allowed_despite_paper_red": True,
+                    "action": "ALLOW_AFTER_PAUSE_EXPIRY_NO_NEW_CLOSE",
+                })
+                _live_research_micro_write(payload)
+            return True, "", payload
         pause_until = now_ts + pause_secs
         payload.update({
             "pause_reason": pause_reason,
+            "block_reason": block_reason,
             "pause_until": pause_until,
             "pause_remaining_sec": round(pause_secs, 3),
+            "pause_armed_live_closed_count": int(metrics.get("live_closed_count", 0) or 0),
+            "pause_armed_last_live_close_key": metrics.get("last_live_close_key", ""),
             "action": "SET_AND_BLOCK",
         })
         _live_research_micro_write(payload)
-        return False, "live_micro_pause", payload
+        return False, block_reason, payload
 
     if latest_pause is not None:
         if _live_research_has_unmanaged_research_position(ctx):
@@ -7604,13 +8123,35 @@ def _live_research_micro_pause_status(
             })
             _live_research_micro_write(payload)
             return False, "live_micro_pause", payload
-        if payload.get("paper_health") == "RED":
+        if live_status.get("live_health") == "RED":
             payload.update({
-                "pause_reason": "LIVE_SCALE_BLOCKED_PAPER_HEALTH",
+                "pause_reason": "LIVE_MICRO_BLOCKED_LIVE_HEALTH",
                 "action": "BLOCK",
             })
             _live_research_micro_write(payload)
-            return False, "LIVE_SCALE_BLOCKED_PAPER_HEALTH", payload
+            return False, "LIVE_MICRO_BLOCKED_LIVE_HEALTH", payload
+
+    if live_status.get("live_health") == "RED":
+        payload.update({
+            "pause_reason": "LIVE_MICRO_BLOCKED_LIVE_HEALTH",
+            "action": "BLOCK",
+        })
+        _live_research_micro_write(payload)
+        return False, "LIVE_MICRO_BLOCKED_LIVE_HEALTH", payload
+
+    if payload.get("paper_health") == "RED":
+        payload.update({
+            "pause_reason": "LIVE_MICRO_WARN_PAPER_HEALTH_RED_ALLOWED",
+            "micro_allowed_despite_paper_red": True,
+            "action": "WARN_ALLOW",
+        })
+        _live_research_micro_write(payload)
+    elif payload.get("health_row_stale"):
+        payload.update({
+            "pause_reason": "LIVE_HEALTH_ROW_STALE_WARN",
+            "action": "WARN_ALLOW",
+        })
+        _live_research_micro_write(payload)
 
     return True, "", payload
 
@@ -7810,6 +8351,105 @@ def _live_smc_research_gate_reason_code(reason):
     return "live_research_gate_reject"
 
 
+def _live_smc_research_min_notional_prefilter(trade):
+    trade = trade if isinstance(trade, dict) else {}
+    symbol = str(trade.get("symbol") or "").upper()
+    try:
+        entry = float(trade.get("entry"))
+        sl = float(trade.get("sl"))
+    except (TypeError, ValueError):
+        return True, {}
+
+    sl_distance = abs(entry - sl)
+    if entry <= 0 or sl <= 0 or sl_distance <= 0:
+        return True, {}
+    sl_pct = sl_distance / entry
+
+    try:
+        from exchange import live_executor as _live_executor
+        execution_balance = _live_executor.get_execution_balance()
+    except Exception:
+        execution_balance = None
+    execution_balance = _live_research_micro_float(execution_balance)
+    live_risk_per_trade = _live_research_micro_float(config.get("live_risk_per_trade"))
+    if execution_balance is None or execution_balance <= 0 or live_risk_per_trade is None or live_risk_per_trade <= 0:
+        return False, {
+            "min_notional_prefilter_reason": "execution_balance_or_live_risk_unavailable",
+            "symbol": symbol,
+            "execution_balance": execution_balance,
+            "live_risk_per_trade": live_risk_per_trade,
+            "entry": entry,
+            "sl": sl,
+            "sl_distance": sl_distance,
+            "sl_pct": sl_pct,
+        }
+
+    score = _live_research_micro_float(trade.get("score"), 0.0) or 0.0
+    min_score = _live_smc_research_min_open_score()
+    effective_risk_pct = live_risk_per_trade * 0.5 if score < min_score else live_risk_per_trade
+    risk_amount = execution_balance * effective_risk_pct
+    projected_notional = risk_amount / sl_pct if sl_pct > 0 else 0.0
+
+    filters = None
+    try:
+        from exchange.precision import get_symbol_filters
+        filters = get_symbol_filters(symbol)
+    except Exception:
+        filters = None
+    if filters is None:
+        return False, {
+            "min_notional_prefilter_reason": "min_notional_lookup_failed",
+            "symbol": symbol,
+            "execution_balance": execution_balance,
+            "live_risk_per_trade": live_risk_per_trade,
+            "effective_risk_pct": effective_risk_pct,
+            "risk_amount": risk_amount,
+            "entry": entry,
+            "sl": sl,
+            "sl_distance": sl_distance,
+            "sl_pct": sl_pct,
+            "projected_notional": projected_notional,
+            "min_notional": None,
+            "min_notional_floor_allowed": bool(config.get("min_notional_floor_allowed", False)),
+        }
+
+    min_notional = _live_research_micro_float(filters.get("min_notional"), 0.0) or 0.0
+    floor_risk_amount = min_notional * sl_pct
+    floor_risk_pct_of_balance = (
+        floor_risk_amount / execution_balance
+        if execution_balance > 0
+        else None
+    )
+    min_notional_floor_allowed = bool(config.get("min_notional_floor_allowed", False))
+    would_floor_violate_cap = floor_risk_amount > (execution_balance * live_risk_per_trade)
+    detail = {
+        "symbol": symbol,
+        "execution_balance": execution_balance,
+        "live_risk_per_trade": live_risk_per_trade,
+        "effective_risk_pct": effective_risk_pct,
+        "risk_amount": risk_amount,
+        "entry": entry,
+        "sl": sl,
+        "sl_distance": sl_distance,
+        "sl_pct": sl_pct,
+        "projected_notional": projected_notional,
+        "min_notional": min_notional,
+        "floor_risk_amount": floor_risk_amount,
+        "floor_risk_pct_of_balance": floor_risk_pct_of_balance,
+        "min_notional_floor_allowed": min_notional_floor_allowed,
+        "would_floor_violate_cap": would_floor_violate_cap,
+    }
+    if min_notional <= 0 or projected_notional >= min_notional:
+        detail["min_notional_prefilter_passed"] = True
+        return True, detail
+
+    detail["min_notional_prefilter_reason"] = "projected_notional_below_min_notional"
+    if min_notional_floor_allowed and not would_floor_violate_cap:
+        detail["min_notional_floor_unsupported"] = True
+        detail["unsupported_floor_reason"] = "execution_validate_and_prepare_does_not_support_floor_sizing"
+    return False, detail
+
+
 def _live_smc_research_prefilter(candidate, trade, ctx):
     if not isinstance(trade, dict):
         return False, "trade_build", "invalid_trade", "trade builder did not return dict"
@@ -7879,6 +8519,10 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
     micro_ok, micro_reason, micro_detail = _live_research_micro_pause_status(ctx=ctx)
     if not micro_ok:
         return False, "live_micro_pause", micro_reason, micro_detail
+
+    notional_ok, notional_detail = _live_smc_research_min_notional_prefilter(trade)
+    if not notional_ok:
+        return False, "live_min_notional", "LIVE_MIN_NOTIONAL_PREFILTER", notional_detail
 
     try:
         from exchange import live_executor as _live_executor
