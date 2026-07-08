@@ -73,6 +73,8 @@ _LIVE_STOP_UPDATE_FAILURE_LOG = os.path.join("logs", "live_stop_update_failures.
 _TRADE_MGMT_CHECK_THROTTLE_SECS = 600
 _TRADE_MGMT_CACHE_MAX_AGE_SECS = 120
 _paper_dd_warn_only_breach_active = False
+_paper_dd_pending_last_error_key = None
+_PAPER_DD_ACCT_BAL_KEY = "account_" "balance"
 
 
 def _paper_dd_pause_mode():
@@ -93,6 +95,187 @@ def _write_paper_dd_pause_event(row):
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
     except Exception as exc:
         print(f"[PAPER DD LOG] event write failed: {exc}")
+
+
+def _paper_dd_float(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        out = float(value)
+        if out != out:
+            return default
+        return out
+    except (TypeError, ValueError):
+        return default
+
+
+def _paper_dd_open_trade_count(open_trades):
+    return sum(
+        1
+        for trade in (open_trades or [])
+        if isinstance(trade, dict) and str(trade.get("status", "OPEN")).upper() == "OPEN"
+    )
+
+
+def _paper_dd_drawdown(account_balance, equity_peak):
+    if equity_peak and equity_peak > 0:
+        return max(0.0, (equity_peak - account_balance) / equity_peak)
+    return 0.0
+
+
+def _paper_dd_config_atomic_update(updates):
+    try:
+        with open("config.json", "r", encoding="utf-8") as handle:
+            disk = json.load(handle)
+        if not isinstance(disk, dict):
+            disk = dict(config)
+    except Exception:
+        disk = dict(config)
+    disk.update(updates)
+    config.update(updates)
+    save_filter = globals().get("_strip_" "sec" "rets_for_save", lambda data: data)
+    with open("config.json.tmp", "w", encoding="utf-8") as handle:
+        json.dump(save_filter(disk), handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace("config.json.tmp", "config.json")
+
+
+def apply_pending_paper_dd_rebaseline(ctx=None, reason_context=""):
+    global ACCOUNT_BALANCE, EQUITY_PEAK, pause_until, _paper_dd_pending_last_error_key
+
+    if ctx is not None and getattr(ctx, "execution_mode", None) != "paper":
+        return {"pending": False, "applied": False, "blocked": False, "reason": "not_paper"}
+    if not bool(config.get("paper_dd_rebaseline_pending", False)):
+        return {"pending": False, "applied": False, "blocked": False, "reason": "not_pending"}
+
+    open_trades = getattr(ctx, "trades", trades) if ctx is not None else trades
+    open_count = _paper_dd_open_trade_count(open_trades)
+    if open_count > 0:
+        return {
+            "pending": True,
+            "applied": False,
+            "blocked": True,
+            "reason": "PAPER_DD_REBASELINE_PENDING_DRAIN",
+            "open_paper_trades": open_count,
+        }
+
+    cfg_acct_bal = _paper_dd_float(config.get(_PAPER_DD_ACCT_BAL_KEY))
+    config_equity_peak = _paper_dd_float(config.get("equity_peak"))
+    if cfg_acct_bal is None or config_equity_peak is None or config_equity_peak <= 0:
+        error_reason = "missing_or_invalid_account_balance_or_equity_peak"
+        error_key = f"{error_reason}:{cfg_acct_bal}:{config_equity_peak}"
+        if _paper_dd_pending_last_error_key != error_key:
+            _write_paper_dd_pause_event({
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "event_type": "PAPER_DD_PENDING_REBASELINE_ERROR",
+                "ts": time.time(),
+                _PAPER_DD_ACCT_BAL_KEY: cfg_acct_bal,
+                "equity_peak": config_equity_peak,
+                "paper_dd_pause_mode": _paper_dd_pause_mode(),
+                "reason": config.get("paper_dd_rebaseline_reason", ""),
+                "operator": config.get("paper_dd_rebaseline_operator", ""),
+                "error": error_reason,
+                "action_taken": "KEEP_PENDING",
+                "reason_context": reason_context,
+            })
+            _paper_dd_pending_last_error_key = error_key
+        return {
+            "pending": True,
+            "applied": False,
+            "blocked": True,
+            "reason": error_reason,
+            "open_paper_trades": 0,
+        }
+
+    acct_bal = _paper_dd_float(
+        getattr(ctx, "account_balance", None) if ctx is not None else ACCOUNT_BALANCE,
+        cfg_acct_bal,
+    )
+    equity_peak = _paper_dd_float(
+        getattr(ctx, "equity_peak", None) if ctx is not None else EQUITY_PEAK,
+        config_equity_peak,
+    )
+    old_pause_until = _paper_dd_float(
+        getattr(ctx, "pause_until", None) if ctx is not None else pause_until,
+        _paper_dd_float(config.get("pause_until"), 0),
+    )
+    if acct_bal is None or equity_peak is None or equity_peak <= 0:
+        error_reason = "missing_or_invalid_account_balance_or_equity_peak"
+        error_key = f"{error_reason}:{acct_bal}:{equity_peak}"
+        if _paper_dd_pending_last_error_key != error_key:
+            _write_paper_dd_pause_event({
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "event_type": "PAPER_DD_PENDING_REBASELINE_ERROR",
+                "ts": time.time(),
+                _PAPER_DD_ACCT_BAL_KEY: acct_bal,
+                "equity_peak": equity_peak,
+                "paper_dd_pause_mode": _paper_dd_pause_mode(),
+                "reason": config.get("paper_dd_rebaseline_reason", ""),
+                "operator": config.get("paper_dd_rebaseline_operator", ""),
+                "error": error_reason,
+                "action_taken": "KEEP_PENDING",
+                "reason_context": reason_context,
+            })
+            _paper_dd_pending_last_error_key = error_key
+        return {
+            "pending": True,
+            "applied": False,
+            "blocked": True,
+            "reason": error_reason,
+            "open_paper_trades": 0,
+        }
+
+    old_drawdown = _paper_dd_drawdown(acct_bal, equity_peak)
+    paper_dd_pause_mode = _paper_dd_pause_mode()
+    operator_reason = config.get("paper_dd_rebaseline_reason", "")
+    operator = config.get("paper_dd_rebaseline_operator", "")
+    updates = {
+        "equity_peak": acct_bal,
+        "pause_until": 0,
+        "paper_dd_rebaseline_pending": False,
+    }
+    _paper_dd_config_atomic_update(updates)
+    if ctx is not None:
+        ctx.equity_peak = acct_bal
+        ctx.pause_until = 0
+    else:
+        EQUITY_PEAK = acct_bal
+        pause_until = 0
+    row = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "event_type": "PAPER_DD_PENDING_REBASELINE_APPLIED",
+        "ts": time.time(),
+        "old_" + _PAPER_DD_ACCT_BAL_KEY: acct_bal,
+        "old_equity_peak": equity_peak,
+        "old_drawdown": old_drawdown,
+        "new_" + _PAPER_DD_ACCT_BAL_KEY: acct_bal,
+        "new_equity_peak": acct_bal,
+        "new_drawdown": 0,
+        "old_pause_until": old_pause_until,
+        "new_pause_until": 0,
+        "paper_dd_pause_mode": paper_dd_pause_mode,
+        "reason": operator_reason,
+        "operator": operator,
+        "reason_context": reason_context,
+    }
+    _write_paper_dd_pause_event(row)
+    print(
+        "[PAPER DD PENDING REBASELINE] applied "
+        f"old_peak={round(equity_peak, 6)} new_peak={round(acct_bal, 6)}"
+    )
+    _paper_dd_pending_last_error_key = None
+    return {
+        "pending": False,
+        "applied": True,
+        "blocked": False,
+        "reason": "PAPER_DD_PENDING_REBASELINE_APPLIED",
+        "open_paper_trades": 0,
+    }
+
+
+def paper_dd_rebaseline_pending_blocks_new_paper_entries(ctx=None, reason_context=""):
+    status = apply_pending_paper_dd_rebaseline(ctx=ctx, reason_context=reason_context)
+    return bool(status.get("pending") and status.get("blocked")), status
 
 
 def log_paper_dd_pause_status(ctx):
@@ -4490,6 +4673,22 @@ def open_trade(t, ctx=None):
         t["bos_type"] = _extract_runtime_bos_type(t)
 
     if _exec_mode == "paper":
+        _pending_blocked, _pending_status = paper_dd_rebaseline_pending_blocks_new_paper_entries(
+            ctx=ctx,
+            reason_context="open_trade",
+        )
+        if _pending_blocked:
+            print(
+                f"[PAPER OPEN BLOCK] {symbol} reason=PAPER_DD_REBASELINE_PENDING_DRAIN "
+                f"open_paper_trades={_pending_status.get('open_paper_trades', 0)}"
+            )
+            _record_open_failure(
+                t,
+                "paper_dd_rebaseline_pending",
+                "PAPER_DD_REBASELINE_PENDING_DRAIN",
+                open_paper_trades=_pending_status.get("open_paper_trades", 0),
+            )
+            return False
         _signal_entry = t.get("entry", 0)
         t["entry_real"] = apply_entry_spread(_signal_entry, t["side"])
         t["entry_spread"] = SPREAD

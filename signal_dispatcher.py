@@ -10605,7 +10605,13 @@ def dispatch_to_executor(signals, ctx):
       always observes every valid signal that LIVE may execute, preserving its
       role as a broad research/analytics/observability layer.
     """
-    from execution import open_trade, ENTRY_COOLDOWN, LOSS_COOLDOWN, update_signal_state
+    from execution import (
+        open_trade,
+        ENTRY_COOLDOWN,
+        LOSS_COOLDOWN,
+        update_signal_state,
+        paper_dd_rebaseline_pending_blocks_new_paper_entries,
+    )
     from config import config
 
     # ===== PAUSE CHECK =====
@@ -10622,6 +10628,26 @@ def dispatch_to_executor(signals, ctx):
                 if _accepted:
                     _log_paper_signal_observation(_sig, "executor_paused", ctx)
         return
+
+    if ctx.execution_mode == "paper":
+        _pending_blocked, _pending_status = paper_dd_rebaseline_pending_blocks_new_paper_entries(
+            ctx=ctx,
+            reason_context="dispatch_to_executor",
+        )
+        if _pending_blocked:
+            print(
+                "[PAPER DD REBASELINE PENDING] drain open paper trades before new entries "
+                f"open_paper_trades={_pending_status.get('open_paper_trades', 0)}"
+            )
+            for _sig in signals:
+                _accepted, _ = strategy_execution_filter(_sig, ctx)
+                if _accepted:
+                    _log_paper_signal_observation(
+                        _sig,
+                        "PAPER_DD_REBASELINE_PENDING_DRAIN",
+                        ctx,
+                    )
+            return
 
     # ===== DD RESET CHECK =====
     if ctx.pause_until > 0 and time.time() >= ctx.pause_until:
