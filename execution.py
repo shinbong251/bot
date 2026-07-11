@@ -3376,6 +3376,10 @@ def apply_sl_gap_to_stop_fill(sl_price: float, side: str, gap: float, entry: flo
     if sl_price is None or sl_price <= 0 or gap <= 0:
         return sl_price
     if entry is not None and entry > 0:
+        if side == "LONG" and sl_price > entry:
+            return sl_price
+        if side == "SHORT" and sl_price < entry:
+            return sl_price
         risk_distance = abs(entry - sl_price)
         if risk_distance > 0:
             gap_points = min(risk_distance * gap, risk_distance * SL_GAP_MAX_R)
