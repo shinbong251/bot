@@ -20,6 +20,11 @@ import csv as _csv_mod
 
 from notifier import format_vn_time
 from config import config
+from state_manager import (
+    canary_attach_open_attribution,
+    canary_config_status,
+    canary_preflight_open,
+)
 
 _paper_observation_last_sent = {}
 _paper_smc_research_dedup_keys = set()
@@ -2077,6 +2082,12 @@ def live_execution_filter(signal, ctx):
         )
         _log_live_slot_decision(signal, ctx, reason)
         return False, reason
+
+    _canary_status = canary_config_status()
+    if _canary_status.get("enabled"):
+        _canary = canary_preflight_open(signal, open_trades=getattr(ctx, "trades", []))
+        if not _canary.get("ok"):
+            return False, _canary.get("reason", "canary_preflight_reject")
 
     return True, ""
 
@@ -7446,6 +7457,15 @@ _RESEARCH_ROLLING_HEALTH_LOG = os.path.join("logs", "research_rolling_health.jso
 _LIVE_TRADES_CSV = "live_trades.csv"
 _LIVE_RESEARCH_HEALTH_ROW_MAX_AGE_SECS = 15 * 60
 _LIVE_SMC_RESEARCH_TERMINAL_FAILURE_TTL_SECS = 15 * 60
+# The live micro gate only needs recent close outcomes, latest pause rows, and
+# latest health rows. These bounds are larger than the active windows (20 live
+# closes, latest pause per reason, latest health row) while staying small enough
+# that a candidate evaluation cannot scale with multi-hundred-MB JSONL logs.
+_LIVE_RESEARCH_MICRO_DEFAULT_TAIL_ROWS = 2500
+_LIVE_RESEARCH_MICRO_DECISION_TAIL_ROWS = 2500
+_LIVE_RESEARCH_MICRO_PAUSE_TAIL_ROWS = 10000
+_LIVE_RESEARCH_MICRO_HEALTH_TAIL_ROWS = 2000
+_LIVE_RESEARCH_MICRO_TAIL_BLOCK_BYTES = 1024 * 1024
 _live_smc_research_terminal_failures = {}
 
 
@@ -7504,22 +7524,69 @@ def _live_research_micro_float(value, default=None):
         return default
 
 
-def _live_research_micro_read_jsonl(path):
-    rows = []
+def _live_research_micro_tail_line_bytes(
+    path,
+    max_rows,
+    block_bytes=_LIVE_RESEARCH_MICRO_TAIL_BLOCK_BYTES,
+):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        max_rows = _LIVE_RESEARCH_MICRO_DEFAULT_TAIL_ROWS
+    if max_rows <= 0:
+        return []
+    try:
+        block_bytes = max(4096, int(block_bytes))
+    except (TypeError, ValueError):
+        block_bytes = _LIVE_RESEARCH_MICRO_TAIL_BLOCK_BYTES
+
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            if position <= 0:
+                return []
+
+            chunks = []
+            newline_count = 0
+            while position > 0 and newline_count <= max_rows:
+                read_size = min(block_bytes, position)
+                position -= read_size
+                handle.seek(position)
+                chunk = handle.read(read_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+
+        if not chunks:
+            return []
+        lines = b"".join(reversed(chunks)).splitlines()
+        if len(lines) > max_rows:
+            lines = lines[-max_rows:]
+        return lines
     except FileNotFoundError:
         return []
     except Exception:
         return []
+
+
+def _live_research_micro_read_jsonl(path, max_rows=None):
+    if max_rows is None:
+        max_rows = _LIVE_RESEARCH_MICRO_DEFAULT_TAIL_ROWS
+    rows = []
+    for raw_line in _live_research_micro_tail_line_bytes(path, max_rows=max_rows):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return rows
 
 
@@ -7592,7 +7659,8 @@ def _live_research_csv_close_rows(live_trade_rows=None):
 
 def _live_research_decision_close_rows(decision_rows=None):
     rows = decision_rows if decision_rows is not None else _live_research_micro_read_jsonl(
-        _LIVE_SMC_RESEARCH_DECISION_LOG
+        _LIVE_SMC_RESEARCH_DECISION_LOG,
+        max_rows=_LIVE_RESEARCH_MICRO_DECISION_TAIL_ROWS,
     )
     out = []
     for row in rows:
@@ -7671,7 +7739,8 @@ def _live_research_micro_metrics(close_rows=None, decision_rows=None, live_trade
 def _live_research_micro_latest_pause(now_ts=None, pause_rows=None):
     now_ts = time.time() if now_ts is None else now_ts
     rows = pause_rows if pause_rows is not None else _live_research_micro_read_jsonl(
-        _LIVE_RESEARCH_MICRO_PAUSE_LOG
+        _LIVE_RESEARCH_MICRO_PAUSE_LOG,
+        max_rows=_LIVE_RESEARCH_MICRO_PAUSE_TAIL_ROWS,
     )
     latest = None
     for row in rows:
@@ -7692,7 +7761,8 @@ def _live_research_micro_latest_pause(now_ts=None, pause_rows=None):
 
 def _live_research_micro_latest_pause_for_reason(pause_reason, pause_rows=None):
     rows = pause_rows if pause_rows is not None else _live_research_micro_read_jsonl(
-        _LIVE_RESEARCH_MICRO_PAUSE_LOG
+        _LIVE_RESEARCH_MICRO_PAUSE_LOG,
+        max_rows=_LIVE_RESEARCH_MICRO_PAUSE_TAIL_ROWS,
     )
     latest = None
     for row in rows:
@@ -7732,7 +7802,8 @@ def _live_research_micro_same_pause_arm_identity(current_payload, previous_pause
 
 def _live_research_micro_latest_paper_health(health_rows=None):
     rows = health_rows if health_rows is not None else _live_research_micro_read_jsonl(
-        _RESEARCH_ROLLING_HEALTH_LOG
+        _RESEARCH_ROLLING_HEALTH_LOG,
+        max_rows=_LIVE_RESEARCH_MICRO_HEALTH_TAIL_ROWS,
     )
     for row in reversed(rows):
         value = str(row.get("paper_active_health") or row.get("paper_health") or "").upper()
@@ -7743,7 +7814,8 @@ def _live_research_micro_latest_paper_health(health_rows=None):
 
 def _live_research_micro_latest_health_row(health_rows=None):
     rows = health_rows if health_rows is not None else _live_research_micro_read_jsonl(
-        _RESEARCH_ROLLING_HEALTH_LOG
+        _RESEARCH_ROLLING_HEALTH_LOG,
+        max_rows=_LIVE_RESEARCH_MICRO_HEALTH_TAIL_ROWS,
     )
     for row in reversed(rows):
         if isinstance(row, dict):
@@ -7949,12 +8021,34 @@ def _live_research_micro_pause_status(
     ctx=None,
     now_ts=None,
     close_rows=None,
+    decision_rows=None,
     live_trade_rows=None,
     pause_rows=None,
     health_rows=None,
 ):
     now_ts = time.time() if now_ts is None else now_ts
-    metrics = _live_research_micro_metrics(close_rows=close_rows, live_trade_rows=live_trade_rows)
+    if close_rows is None and decision_rows is None:
+        decision_rows = _live_research_micro_read_jsonl(
+            _LIVE_SMC_RESEARCH_DECISION_LOG,
+            max_rows=_LIVE_RESEARCH_MICRO_DECISION_TAIL_ROWS,
+        )
+    if close_rows is None and live_trade_rows is None:
+        live_trade_rows = _live_research_micro_read_csv(_LIVE_TRADES_CSV)
+    if pause_rows is None:
+        pause_rows = _live_research_micro_read_jsonl(
+            _LIVE_RESEARCH_MICRO_PAUSE_LOG,
+            max_rows=_LIVE_RESEARCH_MICRO_PAUSE_TAIL_ROWS,
+        )
+    if health_rows is None:
+        health_rows = _live_research_micro_read_jsonl(
+            _RESEARCH_ROLLING_HEALTH_LOG,
+            max_rows=_LIVE_RESEARCH_MICRO_HEALTH_TAIL_ROWS,
+        )
+    metrics = _live_research_micro_metrics(
+        close_rows=close_rows,
+        decision_rows=decision_rows,
+        live_trade_rows=live_trade_rows,
+    )
     pause_hours = _live_research_micro_float(
         config.get("live_research_micro_pause_hours", 3),
         3.0,
@@ -8923,6 +9017,29 @@ def _dispatch_live_smc_research_lane(ctx):
                     },
                 )
             continue
+
+        if canary_config_status().get("enabled"):
+            _canary_live_research = canary_preflight_open(
+                trade,
+                open_trades=getattr(ctx, "trades", []),
+            )
+            if not _canary_live_research.get("ok"):
+                _canary_reason = _canary_live_research.get("reason", "canary_live_research_prefilter_reject")
+                _live_smc_research_log(
+                    candidate,
+                    "PREFILTER_REJECT",
+                    _canary_reason,
+                    trade=trade,
+                    extra={
+                        "prefilter_stage": "canary",
+                        "prefilter_reason": _canary_reason,
+                        "canary_reject_reason": _canary_reason,
+                        **location_gate_extra,
+                        **smc_entry_v2_extra,
+                        **smc_entry_v2b_allowlist_extra,
+                    },
+                )
+                continue
 
         active_failure = _live_smc_research_active_terminal_failure(candidate, trade, now_ts=now_ts)
         if active_failure:
@@ -11071,6 +11188,16 @@ def dispatch_to_executor(signals, ctx):
         entry_attempted.add(symbol)
 
         if ctx.execution_mode == "live":
+            if canary_config_status().get("enabled"):
+                _canary_dispatch = canary_preflight_open(sig, open_trades=getattr(ctx, "trades", []))
+                if not _canary_dispatch.get("ok"):
+                    _canary_reason = _canary_dispatch.get("reason", "canary_pre_open_reject")
+                    print(
+                        f"[LIVE CANARY] Rejected: {symbol} {sig.get('side', '')} "
+                        f"score={round(sig.get('score', 0), 1)} - {_canary_reason}"
+                    )
+                    _log_live_rejection(symbol, sig.get("side", ""), sig.get("score", 0), _canary_reason)
+                    continue
             max_live = _get_max_live_trades()
             with ctx.lock:
                 open_live_count, pending_live_count, effective_live_count = _live_slot_snapshot(ctx)
@@ -11131,6 +11258,17 @@ def dispatch_to_executor(signals, ctx):
         t = copy.deepcopy(sig)
         if ctx.execution_mode == "live":
             t["bos_type"] = _normalize_live_bos_type(t.get("bos_type"))
+            if canary_config_status().get("enabled"):
+                _canary_snapshot = canary_preflight_open(t, open_trades=getattr(ctx, "trades", []))
+                if not _canary_snapshot.get("ok"):
+                    _canary_reason = _canary_snapshot.get("reason", "canary_snapshot_reject")
+                    print(
+                        f"[LIVE CANARY] Rejected: {symbol} {t.get('side', '')} "
+                        f"score={round(t.get('score', 0), 1)} - {_canary_reason}"
+                    )
+                    _log_live_rejection(symbol, t.get("side", ""), t.get("score", 0), _canary_reason)
+                    continue
+                canary_attach_open_attribution(t, _canary_snapshot)
         success = open_trade(t, ctx)
         if success:
             if ctx.execution_mode == "paper" and str(t.get("entry_type") or "").upper() == "CONFIRM":

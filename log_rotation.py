@@ -12,6 +12,8 @@ ROTATION_TARGETS = [
     "scan_ema_log.csv",
     "scan_feature_snapshots.jsonl",
     "qualified_latency_waterfall.jsonl",
+    "paper_smc_main_gate_shadow.jsonl",
+    "structural_context_samples.jsonl",
     "runtime_errors.log",
 ]
 

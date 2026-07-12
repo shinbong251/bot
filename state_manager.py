@@ -5,6 +5,7 @@ import json
 import numpy as np
 import traceback
 import threading
+import copy
 from datetime import datetime
 from notifier import format_vn_time
 from helper import _should_log, ensure_columns
@@ -35,7 +36,37 @@ TRADE_CSV_HEADERS = [
     "time_spent_above_1r","trailing_phase_at_exit","max_r_after_partial",
     "signal_created_ts",
     "exchange_fill_price","entry_source","entry_price_unconfirmed","rr_unconfirmed",
+    "canary_epoch","canary_candidate_id","canary_open_sequence","canary_enabled_at_open",
 ]
+
+CANARY_STATE_FILE = os.path.join(BASE_DIR, "canary_state.json")
+CANARY_SUPPORTED_CANDIDATES = {"INCUMBENT_LIVE_CONFIRM"}
+CANARY_DEFAULT_CONFIG = {
+    "canary_enabled": False,
+    "canary_epoch": "",
+    "canary_candidate_id": "INCUMBENT_LIVE_CONFIRM",
+    "canary_max_open": 2,
+    "canary_max_total_trades": 50,
+    "canary_max_cum_loss_r": -8.0,
+    "canary_max_consecutive_losses": 5,
+}
+CANARY_DEFAULT_STATE = {
+    "schema_version": 1,
+    "canary_epoch": "",
+    "candidate_id": "INCUMBENT_LIVE_CONFIRM",
+    "opened_total": 0,
+    "closed_total": 0,
+    "cum_realized_r": 0.0,
+    "consecutive_losses": 0,
+    "abort_latched": False,
+    "abort_reason": "",
+    "abort_ts": None,
+    "opened_ids": [],
+    "counted_close_ids": [],
+}
+
+CANARY_ACTUAL_LANE_ENTRY_TYPE = "CONFIRM_SMC_RESEARCH"
+_CANARY_RUNTIME_ABORT_REASON = ""
 
 def log_path(filename):
     return os.path.join(LOG_DIR, filename)
@@ -211,6 +242,330 @@ def atomic_save_json(data, state_file):
                     except Exception:
                         pass
             raise
+
+def _load_hot_canary_config(config_path="config.json"):
+    cfg = dict(CANARY_DEFAULT_CONFIG)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+        if isinstance(disk, dict):
+            cfg.update(disk)
+            for key, value in CANARY_DEFAULT_CONFIG.items():
+                cfg.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def _canary_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def _canary_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def canary_fresh_state():
+    return copy.deepcopy(CANARY_DEFAULT_STATE)
+
+def canary_config_status(config_path="config.json"):
+    cfg = _load_hot_canary_config(config_path)
+    enabled = bool(cfg.get("canary_enabled", False))
+    candidate_id = str(cfg.get("canary_candidate_id") or "").strip()
+    epoch = str(cfg.get("canary_epoch") or "").strip()
+    max_open = _canary_int(cfg.get("canary_max_open"), -1)
+    max_total = _canary_int(cfg.get("canary_max_total_trades"), -1)
+    errors = []
+    if enabled:
+        if not epoch:
+            errors.append("canary_epoch_empty")
+        if candidate_id != "INCUMBENT_LIVE_CONFIRM":
+            errors.append(f"canary_candidate_id_not_actual_lane:{candidate_id}")
+        elif candidate_id not in CANARY_SUPPORTED_CANDIDATES:
+            errors.append(f"unsupported_candidate_id:{candidate_id}")
+        if max_open != 2:
+            errors.append(f"canary_max_open_must_be_2:{max_open}")
+        if max_total != 50 or max_total <= 0:
+            errors.append(f"canary_max_total_trades_must_be_50:{max_total}")
+        if not bool(cfg.get("live_smc_research_enabled", False)):
+            errors.append("live_smc_research_enabled_false")
+        if not bool(cfg.get("live_mode", False)):
+            errors.append("live_mode_false")
+        exec_mode = str(cfg.get("execution_mode") or "").strip().lower()
+        if exec_mode not in {"paper_live", "live"}:
+            errors.append(f"execution_mode_not_live:{exec_mode or 'missing'}")
+    return {
+        "enabled": enabled,
+        "epoch": epoch,
+        "candidate_id": candidate_id,
+        "max_open": max_open,
+        "max_total": max_total,
+        "max_cum_loss_r": _canary_float(cfg.get("canary_max_cum_loss_r"), -8.0),
+        "max_consecutive_losses": _canary_int(cfg.get("canary_max_consecutive_losses"), 5),
+        "errors": errors,
+    }
+
+def canary_candidate_id_for_trade(t):
+    if not isinstance(t, dict):
+        return ""
+    if str(t.get("entry_type") or "").upper() == CANARY_ACTUAL_LANE_ENTRY_TYPE:
+        return "INCUMBENT_LIVE_CONFIRM"
+    return ""
+
+def is_canary_incumbent_candidate(t):
+    return canary_candidate_id_for_trade(t) == "INCUMBENT_LIVE_CONFIRM"
+
+def canary_load_state(state_file=None):
+    path = state_file or CANARY_STATE_FILE
+    data = _load_json_with_permission_retry(path)
+    if not isinstance(data, dict):
+        raise ValueError("canary_state top-level JSON must be an object")
+    return data
+
+def _canary_validate_state_shape(state):
+    if not isinstance(state, dict):
+        return ["state_not_object"]
+    errors = []
+    expected_types = {
+        "schema_version": int,
+        "canary_epoch": str,
+        "candidate_id": str,
+        "opened_total": int,
+        "closed_total": int,
+        "cum_realized_r": (int, float),
+        "consecutive_losses": int,
+        "abort_latched": bool,
+        "abort_reason": str,
+        "opened_ids": list,
+        "counted_close_ids": list,
+    }
+    for key, expected in expected_types.items():
+        if key not in state:
+            errors.append(f"missing:{key}")
+        elif not isinstance(state.get(key), expected):
+            errors.append(f"invalid_type:{key}")
+    if "abort_ts" not in state:
+        errors.append("missing:abort_ts")
+    if state.get("schema_version") != 1:
+        errors.append("schema_version_not_1")
+    opened_ids = state.get("opened_ids") if isinstance(state.get("opened_ids"), list) else []
+    close_ids = state.get("counted_close_ids") if isinstance(state.get("counted_close_ids"), list) else []
+    if len(opened_ids) != len(set(map(str, opened_ids))):
+        errors.append("duplicate_opened_ids")
+    if len(close_ids) != len(set(map(str, close_ids))):
+        errors.append("duplicate_counted_close_ids")
+    opened_total = state.get("opened_total")
+    closed_total = state.get("closed_total")
+    if isinstance(opened_total, int) and isinstance(opened_ids, list) and opened_total != len(opened_ids):
+        errors.append("opened_total_opened_ids_mismatch")
+    if isinstance(closed_total, int) and isinstance(close_ids, list) and closed_total != len(close_ids):
+        errors.append("closed_total_counted_close_ids_mismatch")
+    if isinstance(opened_total, int) and isinstance(closed_total, int):
+        if opened_total < 0 or closed_total < 0 or closed_total > opened_total:
+            errors.append("invalid_open_close_totals")
+    return errors
+
+def _canary_trade_open_count(open_trades, status, exclude_trade=None):
+    epoch = status.get("epoch")
+    candidate_id = status.get("candidate_id")
+    count = 0
+    for trade in open_trades or []:
+        if trade is exclude_trade:
+            continue
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("status", "OPEN")).upper() != "OPEN":
+            continue
+        if trade.get("owner", "bot") != "bot":
+            continue
+        if (
+            trade.get("canary_enabled_at_open") is True
+            and str(trade.get("canary_epoch") or "") == epoch
+            and str(trade.get("canary_candidate_id") or "") == candidate_id
+        ):
+            count += 1
+    return count
+
+def _canary_open_epoch_conflict(open_trades, status):
+    expected_epoch = status.get("epoch")
+    for trade in open_trades or []:
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("status", "OPEN")).upper() != "OPEN":
+            continue
+        if trade.get("canary_enabled_at_open") is not True:
+            continue
+        if str(trade.get("canary_epoch") or "") != expected_epoch:
+            return True
+    return False
+
+def canary_latch(reason, state_file=None, config_path="config.json"):
+    global _CANARY_RUNTIME_ABORT_REASON
+    status = canary_config_status(config_path)
+    try:
+        state = canary_load_state(state_file)
+    except Exception as exc:
+        state = canary_fresh_state()
+        state["canary_epoch"] = status.get("epoch", "")
+        state["candidate_id"] = status.get("candidate_id", "INCUMBENT_LIVE_CONFIRM")
+        state["abort_latched"] = True
+        state["abort_reason"] = f"canary_state_unreadable_latch_not_persisted:{type(exc).__name__}:{reason or 'canary_abort'}"
+        state["abort_ts"] = time.time()
+        _CANARY_RUNTIME_ABORT_REASON = state["abort_reason"]
+        write_runtime_error("CANARY/canary_latch_state_unreadable", traceback.format_exc())
+        return state
+    state["abort_latched"] = True
+    state["abort_reason"] = str(reason or "canary_abort")
+    state["abort_ts"] = time.time()
+    try:
+        atomic_save_json(state, state_file or CANARY_STATE_FILE)
+    except Exception:
+        _CANARY_RUNTIME_ABORT_REASON = state["abort_reason"]
+        write_runtime_error("CANARY/canary_latch_persist_failed", traceback.format_exc())
+        return state
+    return state
+
+def canary_preflight_open(t, open_trades=None, state_file=None, config_path="config.json", exclude_trade=None):
+    status = canary_config_status(config_path)
+    if not status["enabled"]:
+        return {"ok": False, "enabled": False, "reason": "canary_disabled", "status": status, "state": None}
+    if status["errors"]:
+        return {"ok": False, "enabled": True, "reason": "canary_config_invalid:" + ",".join(status["errors"]), "status": status, "state": None}
+    if _CANARY_RUNTIME_ABORT_REASON:
+        return {"ok": False, "enabled": True, "reason": f"canary_runtime_abort_latched:{_CANARY_RUNTIME_ABORT_REASON}", "status": status, "state": None}
+    if canary_candidate_id_for_trade(t) != status["candidate_id"]:
+        return {"ok": False, "enabled": True, "reason": "canary_candidate_not_supported", "status": status, "state": None}
+    try:
+        state = canary_load_state(state_file)
+    except Exception as exc:
+        state = canary_fresh_state()
+        state["abort_latched"] = True
+        state["abort_reason"] = f"canary_state_unavailable:{type(exc).__name__}"
+        state["abort_ts"] = time.time()
+        return {"ok": False, "enabled": True, "reason": f"canary_state_unavailable:{type(exc).__name__}", "status": status, "state": state}
+    state_errors = _canary_validate_state_shape(state)
+    if state_errors:
+        if isinstance(state, dict):
+            state["abort_latched"] = True
+            state["abort_reason"] = "canary_state_invalid:" + ",".join(state_errors)
+            state["abort_ts"] = time.time()
+        return {"ok": False, "enabled": True, "reason": "canary_state_invalid:" + ",".join(state_errors), "status": status, "state": state}
+    if state.get("canary_epoch") != status["epoch"] or state.get("candidate_id") != status["candidate_id"]:
+        return {"ok": False, "enabled": True, "reason": "canary_state_epoch_or_candidate_mismatch", "status": status, "state": state}
+    if state.get("abort_latched"):
+        return {"ok": False, "enabled": True, "reason": f"canary_abort_latched:{state.get('abort_reason')}", "status": status, "state": state}
+    if _canary_open_epoch_conflict(open_trades, status):
+        canary_latch("canary_epoch_inconsistency_with_open_trade", state_file=state_file, config_path=config_path)
+        return {"ok": False, "enabled": True, "reason": "canary_epoch_inconsistency_latched", "status": status, "state": state}
+    if state.get("opened_total", 0) >= status["max_total"]:
+        return {"ok": False, "enabled": True, "reason": "canary_total_cap_reached", "status": status, "state": state}
+    open_count = _canary_trade_open_count(open_trades, status, exclude_trade=exclude_trade)
+    if open_count >= status["max_open"]:
+        return {"ok": False, "enabled": True, "reason": "canary_max_open_reached", "status": status, "state": state}
+    return {"ok": True, "enabled": True, "reason": "", "status": status, "state": state, "open_count": open_count}
+
+def canary_attach_open_attribution(t, preflight):
+    if not (isinstance(t, dict) and isinstance(preflight, dict) and preflight.get("ok")):
+        return t
+    status = preflight["status"]
+    state = preflight["state"]
+    t["canary_epoch"] = status["epoch"]
+    t["canary_candidate_id"] = status["candidate_id"]
+    t["canary_open_sequence"] = int(state.get("opened_total", 0)) + 1
+    t["canary_enabled_at_open"] = True
+    return t
+
+def _canary_trade_open_id(t):
+    for key in ("client_order_id", "exchange_client_id"):
+        value = str(t.get(key) or "").strip()
+        if value.startswith("BOT_"):
+            return value
+    return ""
+
+def canary_record_confirmed_open(t, open_trades=None, state_file=None, config_path="config.json"):
+    status = canary_config_status(config_path)
+    if not status["enabled"]:
+        return {"recorded": False, "reason": "canary_disabled"}
+    open_id = _canary_trade_open_id(t)
+    if open_id:
+        try:
+            existing_state = canary_load_state(state_file)
+            existing_errors = _canary_validate_state_shape(existing_state)
+            if not existing_errors and open_id in set(map(str, existing_state.get("opened_ids", []))):
+                try:
+                    t["canary_open_sequence"] = list(map(str, existing_state.get("opened_ids", []))).index(open_id) + 1
+                except ValueError:
+                    pass
+                return {
+                    "recorded": False,
+                    "idempotent": True,
+                    "reason": "canary_open_already_counted",
+                    "state": existing_state,
+                }
+        except Exception:
+            pass
+    preflight = canary_preflight_open(
+        t,
+        open_trades=open_trades,
+        state_file=state_file,
+        config_path=config_path,
+        exclude_trade=t,
+    )
+    if not preflight.get("ok"):
+        return {"recorded": False, "reason": preflight.get("reason")}
+    if not open_id:
+        canary_latch("canary_open_missing_bot_client_order_id", state_file=state_file, config_path=config_path)
+        return {"recorded": False, "reason": "canary_open_missing_bot_client_order_id"}
+    state = preflight["state"]
+    if state.get("opened_total", 0) >= preflight["status"]["max_total"]:
+        return {"recorded": False, "reason": "canary_total_cap_reached"}
+    state["opened_ids"].append(open_id)
+    state["opened_total"] = int(state.get("opened_total", 0)) + 1
+    t["canary_open_sequence"] = state["opened_total"]
+    t["canary_epoch"] = preflight["status"]["epoch"]
+    t["canary_candidate_id"] = preflight["status"]["candidate_id"]
+    t["canary_enabled_at_open"] = True
+    atomic_save_json(state, state_file or CANARY_STATE_FILE)
+    return {"recorded": True, "reason": "", "state": state}
+
+def canary_record_close(t, state_file=None, config_path="config.json"):
+    if not isinstance(t, dict) or t.get("canary_enabled_at_open") is not True:
+        return {"recorded": False, "reason": "not_canary_trade"}
+    status = canary_config_status(config_path)
+    if str(t.get("canary_epoch") or "") != status.get("epoch") or str(t.get("canary_candidate_id") or "") != status.get("candidate_id"):
+        return {"recorded": False, "reason": "canary_close_epoch_or_candidate_mismatch"}
+    try:
+        state = canary_load_state(state_file)
+    except Exception as exc:
+        return {"recorded": False, "reason": f"canary_state_unavailable:{type(exc).__name__}"}
+    state_errors = _canary_validate_state_shape(state)
+    if state_errors:
+        return {"recorded": False, "reason": "canary_state_invalid:" + ",".join(state_errors)}
+    close_id = _canary_trade_open_id(t)
+    if not close_id:
+        return {"recorded": False, "reason": "canary_close_missing_bot_client_order_id"}
+    if close_id in set(map(str, state.get("counted_close_ids", []))):
+        return {"recorded": False, "idempotent": True, "reason": "canary_close_already_counted", "state": state}
+    if close_id not in set(map(str, state.get("opened_ids", []))):
+        return {"recorded": False, "reason": "canary_close_without_counted_open"}
+    rr = _canary_float(t.get("rr_real"), 0.0)
+    state["counted_close_ids"].append(close_id)
+    state["closed_total"] = int(state.get("closed_total", 0)) + 1
+    state["cum_realized_r"] = round(float(state.get("cum_realized_r", 0.0)) + rr, 10)
+    state["consecutive_losses"] = int(state.get("consecutive_losses", 0)) + 1 if rr < 0 else 0
+    if state["cum_realized_r"] <= status.get("max_cum_loss_r", -8.0):
+        state["abort_latched"] = True
+        state["abort_reason"] = "canary_max_cum_loss_r_reached"
+        state["abort_ts"] = time.time()
+    elif state["consecutive_losses"] >= status.get("max_consecutive_losses", 5):
+        state["abort_latched"] = True
+        state["abort_reason"] = "canary_max_consecutive_losses_reached"
+        state["abort_ts"] = time.time()
+    atomic_save_json(state, state_file or CANARY_STATE_FILE)
+    return {"recorded": True, "reason": "", "state": state}
 
 def _state_kind(path):
     name = os.path.basename(path).lower()
@@ -535,6 +890,10 @@ def normalize_trade_schema(t):
     t.setdefault("entry_uncertain_ts", 0)
     t.setdefault("entry_uncertain_reason", "")
     t.setdefault("entry_not_found_ts", 0)
+    t.setdefault("canary_epoch", "")
+    t.setdefault("canary_candidate_id", "")
+    t.setdefault("canary_open_sequence", "")
+    t.setdefault("canary_enabled_at_open", False)
 
 def save_open_trades(trades, state_file=None):
     _file = state_file if state_file is not None else STATE_FILE
@@ -723,6 +1082,10 @@ def save_trade(t, trades_csv=None):
             "entry_source": t.get("entry_source", ""),
             "entry_price_unconfirmed": t.get("entry_price_unconfirmed", ""),
             "rr_unconfirmed": t.get("rr_unconfirmed", ""),
+            "canary_epoch": t.get("canary_epoch", ""),
+            "canary_candidate_id": t.get("canary_candidate_id", ""),
+            "canary_open_sequence": t.get("canary_open_sequence", ""),
+            "canary_enabled_at_open": t.get("canary_enabled_at_open", ""),
         }
 
         row = ensure_columns(row, headers)   # 👈 QUAN TRỌNG

@@ -15,6 +15,12 @@ from state_manager import (
     log_confirm_reject,
     write_runtime_error,
     log_exhaustion_counterfactual,
+    canary_attach_open_attribution,
+    canary_config_status,
+    canary_latch,
+    canary_preflight_open,
+    canary_record_close,
+    canary_record_confirmed_open,
 )
 from notifier import send_entry, send_exit, send_tp_break, send_testnet_entry, send_live_entry, fmt_price, fmt_pnl, format_vn_time, engine_label, paper_engine_name, format_paper_smc_close
 from helper import check_correlation, check_signal_cooldown, dynamic_giveback, stats, compression_watchlist, signal_state
@@ -639,6 +645,10 @@ def _tmf_build_row(
         "exchange_sl_sync_confirmed_ts": exchange_sl_sync_confirmed_ts,
         "exchange_sl_sync_failed": exchange_sl_sync_failed,
         "reason": reason_value,
+        "canary_epoch": t.get("canary_epoch"),
+        "canary_candidate_id": t.get("canary_candidate_id"),
+        "canary_open_sequence": t.get("canary_open_sequence"),
+        "canary_enabled_at_open": t.get("canary_enabled_at_open"),
     }
     return {k: _tmf_safe_scalar(v) for k, v in row.items() if _tmf_safe_scalar(v) not in ("",)}
 
@@ -3409,6 +3419,19 @@ def _quarantine_trade(t: dict, reason: str) -> bool:
       unrecoverable_stop_failure     — SL repair failed; manual intervention required
       exchange_desync_unrecoverable  — exchange state cannot be reconciled
     """
+    if t.get("canary_enabled_at_open") is True:
+        try:
+            _canary_status = canary_config_status()
+            if (
+                str(t.get("canary_epoch") or "") == str(_canary_status.get("epoch") or "")
+                and str(t.get("canary_candidate_id") or "") == str(_canary_status.get("candidate_id") or "")
+            ):
+                canary_latch(f"canary_trade_quarantined:{reason}")
+        except Exception as _canary_quarantine_exc:
+            print(
+                f"[LIVE CANARY] quarantine latch failed {t.get('symbol', 'UNKNOWN')} "
+                f"reason={reason} error={type(_canary_quarantine_exc).__name__}"
+            )
     if t.get("quarantined") and t.get("repair_disabled"):
         return False
     t["quarantined"] = True
@@ -4245,6 +4268,22 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
     else:
         t["status"] = "LOSE"
 
+    if t.get("canary_enabled_at_open") is True:
+        try:
+            _canary_close_result = canary_record_close(t)
+            if not (
+                _canary_close_result.get("recorded")
+                or _canary_close_result.get("idempotent")
+                or _canary_close_result.get("reason") == "not_canary_trade"
+            ):
+                _canary_reason = _canary_close_result.get("reason", "canary_audit_close_record_failed")
+                print(f"[LIVE CANARY] audit close accounting skipped {symbol} reason={_canary_reason}")
+                canary_latch(_canary_reason)
+        except Exception as _canary_close_exc:
+            _canary_reason = f"canary_audit_close_exception:{type(_canary_close_exc).__name__}"
+            print(f"[LIVE CANARY] audit close accounting failed {symbol} reason={_canary_reason}")
+            canary_latch(_canary_reason)
+
     open_ts = _safe_float_value(t.get("time"), 0.0)
     t["trade_age_minutes"] = round((now - open_ts) / 60, 1) if open_ts > 0 and now > open_ts else 0
     t["giveback_r"] = round(max(0.0, t.get("max_profit_r", 0) - t.get("rr_real", 0)), 2)
@@ -4675,6 +4714,14 @@ def open_trade(t, ctx=None):
     t["owner"] = "bot"
     if _exec_mode == "live":
         t["bos_type"] = _extract_runtime_bos_type(t)
+        _canary_start = canary_preflight_open(t, open_trades=_trades)
+        if _canary_start.get("enabled"):
+            if not _canary_start.get("ok"):
+                _reason = _canary_start.get("reason", "canary_preflight_reject")
+                print(f"[LIVE CANARY BLOCK] {symbol} reason={_reason}")
+                _record_open_failure(t, "canary_preflight", _reason)
+                return False
+            canary_attach_open_attribution(t, _canary_start)
 
     if _exec_mode == "paper":
         _pending_blocked, _pending_status = paper_dd_rebaseline_pending_blocks_new_paper_entries(
@@ -5129,6 +5176,24 @@ def open_trade(t, ctx=None):
                 stats["sent"] += 1
                 # â”€â”€ STEP 1: MARKET ENTRY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if _exec_mode == "live":
+                    _canary_pre_order = canary_preflight_open(t, open_trades=_trades, exclude_trade=t)
+                    if _canary_pre_order.get("enabled") and not _canary_pre_order.get("ok"):
+                        _reason = _canary_pre_order.get("reason", "canary_pre_order_reject")
+                        print(f"[LIVE CANARY BLOCK] {symbol} before market order reason={_reason}")
+                        _send_live_safety_block_telegram(symbol, _reason, prefix=_mode_prefix)
+                        with _lock:
+                            if t in _trades:
+                                _trades.remove(t)
+                        save_open_trades(_trades, _state_file)
+                        _record_open_failure(
+                            t,
+                            "canary_pre_order",
+                            _reason,
+                            **_execution_plan_failure_details(_prep),
+                        )
+                        return False
+                    if _canary_pre_order.get("ok"):
+                        canary_attach_open_attribution(t, _canary_pre_order)
                     _allowed, _reason = _check_live_runtime_safety_gate(
                         _tn,
                         t,
@@ -5210,6 +5275,8 @@ def open_trade(t, ctx=None):
                             )
                             return False
                         else:
+                            if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                                canary_latch("canary_entry_uncertain_unresolved")
                             save_open_trades(_trades, _state_file)
                             return True
                     else:
@@ -5264,6 +5331,8 @@ def open_trade(t, ctx=None):
                         )
                         return False
                     else:
+                        if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                            canary_latch("canary_entry_uncertain_unresolved")
                         save_open_trades(_trades, _state_file)
                         return True
 
@@ -5307,6 +5376,8 @@ def open_trade(t, ctx=None):
                         prefix=_mode_prefix,
                     )
                     if not _fill_confirmation.get("confirmed"):
+                        if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                            canary_latch("canary_entry_fill_unconfirmed")
                         save_open_trades(_trades, _state_file)
                         _record_open_failure(
                             t,
@@ -5352,6 +5423,15 @@ def open_trade(t, ctx=None):
                         f"[OWNERSHIP] {symbol} clientOrderId={_entry_cid!r} "
                         f"confirmed BOT-owned — ownership verified on exchange."
                     )
+                if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                    _canary_open_result = canary_record_confirmed_open(t, open_trades=_trades)
+                    if not (
+                        _canary_open_result.get("recorded")
+                        or _canary_open_result.get("idempotent")
+                    ):
+                        _canary_reason = _canary_open_result.get("reason", "canary_open_record_failed")
+                        print(f"[LIVE CANARY] confirmed open accounting failed {symbol} reason={_canary_reason}")
+                        canary_latch(_canary_reason)
 
                 # â”€â”€ STEP 2: STOP PLACEMENT (retry + emergency close) â”€â”€â”€â”€â”€
                 if t.get("sl"):
@@ -5378,6 +5458,8 @@ def open_trade(t, ctx=None):
 
                         if _open_algos is None:
                             t["sl_verification_uncertain"] = True
+                            if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                                canary_latch("canary_sl_verification_uncertain")
                             send_telegram(
                                 f"⚠️ {symbol} SL state UNCERTAIN — algo query failed.\n"
                                 f"Stop may exist on exchange. No emergency close.\n"
@@ -5423,6 +5505,8 @@ def open_trade(t, ctx=None):
                             )
 
                         if not _sl_result.get("success"):
+                            if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                                canary_latch("canary_stop_loss_retry_failed_emergency_close")
                             print(
                                 f"[{_exec_mode.upper()} CRITICAL] {symbol} STOP retry FAILED — "
                                 f"emergency close position"
@@ -8052,6 +8136,17 @@ def update_trades(fast_mode=False, ctx=None):
                     t["status"] = "WIN"
                 else:
                     t["status"] = "LOSE"
+
+                if _exec_mode == "live" and t.get("canary_enabled_at_open") is True:
+                    _canary_close_result = canary_record_close(t)
+                    if not (
+                        _canary_close_result.get("recorded")
+                        or _canary_close_result.get("idempotent")
+                    ):
+                        print(
+                            f"[LIVE CANARY] close accounting skipped {t.get('symbol')} "
+                            f"reason={_canary_close_result.get('reason')}"
+                        )
                 
                 if t.get("partial_done") and t["status"] == "OPEN":
                     continue
