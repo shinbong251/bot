@@ -70,6 +70,8 @@ def load_config():
         "live_research_loss_streak_pause_count": 3,
         "live_research_micro_pause_hours": 3,
         "live_research_rolling_net_pause_r": -2.0,
+        "live_health_stale_streak_demote_enabled": True,
+        "live_health_stale_streak_dormancy_hours": 48,
         "min_notional_floor_allowed": False,
         "research_health_baseline_ts": 0,
         "research_health_min_active_closed": 20,

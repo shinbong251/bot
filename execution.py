@@ -4242,6 +4242,8 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
     t["exit_type"] = "SL"
     t["close_reason"] = "exchange_sl_filled"
     t["close_time"] = now
+    t["close_ts"] = now
+    t["closed_at_unix"] = now
     t["exit_price"] = exit_price
     t["exit_price_source"] = exit_price_source
     t["entry_unconfirmed"] = bool(t.get("entry_price_unconfirmed"))
@@ -8067,6 +8069,8 @@ def update_trades(fast_mode=False, ctx=None):
                     t.setdefault("exit_price_source", "paper_model")
                     t["exit_unconfirmed"] = False
                 t["close_time"] = time.time()
+                t["close_ts"] = t["close_time"]
+                t["closed_at_unix"] = t["close_time"]
                 if _exec_mode == "paper" and t.get("exit_type") == "SL":
                     t["sl_before_0_5r"] = not bool(t.get("reached_0_5r"))
                     t["sl_before_1r"] = not bool(t.get("reached_1r"))

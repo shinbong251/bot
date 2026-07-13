@@ -6,6 +6,7 @@ import math
 import time
 import csv
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -114,6 +115,29 @@ def row_ts(row):
         if value is not None:
             return value
     return 0.0
+
+
+def parse_close_time(value, now_ts=None):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    numeric = fnum(text)
+    if numeric is not None:
+        return numeric
+    now_ts = time.time() if now_ts is None else now_ts
+    try:
+        base_year = datetime.fromtimestamp(now_ts, tz=timezone.utc).year
+    except Exception:
+        base_year = datetime.now(tz=timezone.utc).year
+    for fmt in ("%H:%M %d-%m-%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    try:
+        return datetime.strptime(f"{text}-{base_year}", "%H:%M %d-%m-%Y").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 def pf(values):
@@ -360,14 +384,15 @@ def live_close_dedup_key(row):
     )
 
 
-def live_csv_close_rows(live_trade_rows=None):
+def live_csv_close_rows(live_trade_rows=None, decision_rows=None):
     rows = live_trade_rows if live_trade_rows is not None else read_csv(LIVE_TRADES)
+    decision_index = None
     out = []
     for row in rows:
         if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
             continue
         status = str(row.get("status") or "").upper()
-        if status not in ("WIN", "LOSS", "CLOSED", "BREAKEVEN") and not row.get("close_time"):
+        if status not in ("WIN", "LOSS", "LOSE", "CLOSED", "BREAKEVEN", "BE") and not row.get("close_time"):
             continue
         realized = fnum(row.get("actual_realized_r", row.get("realized_r", row.get("rr_real", row.get("rr")))))
         if realized is None:
@@ -375,10 +400,40 @@ def live_csv_close_rows(live_trade_rows=None):
         item = dict(row)
         item["actual_realized_r"] = realized
         item["_live_close_source"] = "live_trades_csv"
-        item["_sort_ts"] = fnum(row.get("close_ts", row.get("closed_at_unix", row.get("signal_created_ts"))), 0.0) or 0.0
+        if decision_index is None and not has_live_close_sort_evidence(row):
+            decision_index = {live_close_dedup_key(row): row for row in live_decision_close_rows(decision_rows)}
+        item["_sort_ts"], item["_sort_ts_source"] = resolve_live_close_sort_ts(row, decision_index)
         out.append(item)
     out.sort(key=lambda item: item.get("_sort_ts", 0.0))
     return out
+
+
+def resolve_live_close_sort_ts(row, decision_index=None):
+    for field in ("close_ts", "closed_at_unix"):
+        value = fnum(row.get(field))
+        if value is not None and value > 0:
+            return value, field
+    parsed = parse_close_time(row.get("close_time"))
+    if parsed is not None and parsed > 0:
+        return parsed, "close_time"
+    decision = (decision_index or {}).get(live_close_dedup_key(row))
+    if isinstance(decision, dict):
+        value = fnum(decision.get("_sort_ts"))
+        if value is not None and value > 0:
+            return value, "decision_log"
+    fallback = fnum(row.get("signal_created_ts"), 0.0) or 0.0
+    if fallback > 0:
+        print(f"[LIVE CLOSE ORDER] legacy fallback without close evidence key={live_close_dedup_key(row)}")
+    return fallback, "legacy_signal_created_ts"
+
+
+def has_live_close_sort_evidence(row):
+    for field in ("close_ts", "closed_at_unix"):
+        value = fnum(row.get(field))
+        if value is not None and value > 0:
+            return True
+    parsed = parse_close_time(row.get("close_time"))
+    return parsed is not None and parsed > 0
 
 
 def live_decision_close_rows(decision_rows=None):
@@ -409,7 +464,7 @@ def live_decision_close_rows(decision_rows=None):
 
 def live_close_rows(decision_rows=None, live_trade_rows=None):
     decision_closes = live_decision_close_rows(decision_rows)
-    csv_closes = live_csv_close_rows(live_trade_rows)
+    csv_closes = live_csv_close_rows(live_trade_rows, decision_rows=decision_rows)
     merged = {}
     for row in decision_closes + csv_closes:
         key = live_close_dedup_key(row)

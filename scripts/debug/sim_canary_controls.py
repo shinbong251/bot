@@ -18,6 +18,7 @@ from state_manager import (
     canary_preflight_open,
     canary_record_close,
     canary_record_confirmed_open,
+    save_trade,
 )
 
 
@@ -317,6 +318,8 @@ def main():
             })
             ctx = DummyCtx(audit_loss)
             _assert(execution._finalize_audit_exchange_sl_close(audit_loss, ctx), "audit close finalized")
+            _assert(audit_loss.get("close_ts") == audit_loss.get("close_time"), "audit close persists close_ts")
+            _assert(audit_loss.get("closed_at_unix") == audit_loss.get("close_time"), "audit close persists closed_at_unix")
             audit_state = canary_load_state(state)
             _assert(audit_state["closed_total"] == 1 and audit_state["cum_realized_r"] == -1.0, "audit loss increments once")
             _assert(execution._finalize_audit_exchange_sl_close(audit_loss, ctx), "duplicate audit close replay safe")
@@ -364,6 +367,25 @@ def main():
             manual.update({"owner": "manual", "canary_enabled_at_open": False})
             _assert(not execution._finalize_audit_exchange_sl_close(manual, DummyCtx(manual)), "manual audit trade ignored")
             _assert(canary_load_state(state)["closed_total"] == 0, "manual/non-canary not counted")
+
+            normal_csv = os.path.join(td, "normal_close_trades.csv")
+            normal_closed = _trade(cid="BOT_NORMAL_E_x", rr=0.4)
+            normal_closed.update({
+                "id": "normal-close",
+                "time": 1000.0,
+                "close_time": 1200.0,
+                "close_ts": 1200.0,
+                "closed_at_unix": 1200.0,
+                "status": "WIN",
+                "exit_type": "TP",
+            })
+            save_trade(normal_closed, normal_csv)
+            with open(normal_csv, "r", encoding="utf-8") as handle:
+                header = handle.readline().strip().split(",")
+                row = handle.readline().strip().split(",")
+            saved = dict(zip(header, row))
+            _assert(saved.get("close_ts") == "1200.0", "normal close CSV persists close_ts")
+            _assert(saved.get("closed_at_unix") == "1200.0", "normal close CSV persists closed_at_unix")
         finally:
             execution.canary_record_close = original_record_close
             execution.canary_latch = original_latch

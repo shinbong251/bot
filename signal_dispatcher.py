@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from collections import Counter
 
 import csv as _csv_mod
@@ -7631,14 +7632,79 @@ def _live_research_close_dedup_key(row):
     )
 
 
-def _live_research_csv_close_rows(live_trade_rows=None):
+def _live_research_parse_close_time(value, now_ts=None):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    numeric = _live_research_micro_float(text)
+    if numeric is not None:
+        return numeric
+    now_ts = time.time() if now_ts is None else now_ts
+    try:
+        base_year = datetime.fromtimestamp(now_ts, tz=timezone.utc).year
+    except Exception:
+        base_year = datetime.now(tz=timezone.utc).year
+    for fmt in ("%H:%M %d-%m-%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.strptime(f"{text}-{base_year}", "%H:%M %d-%m-%Y").replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
+def _live_research_decision_close_index(decision_rows=None):
+    indexed = {}
+    for row in _live_research_decision_close_rows(decision_rows):
+        key = _live_research_close_dedup_key(row)
+        if key:
+            indexed[key] = row
+    return indexed
+
+
+def _live_research_resolve_close_sort_ts(row, decision_index=None):
+    for field in ("close_ts", "closed_at_unix"):
+        value = _live_research_micro_float(row.get(field))
+        if value is not None and value > 0:
+            return value, field
+    parsed = _live_research_parse_close_time(row.get("close_time"))
+    if parsed is not None and parsed > 0:
+        return parsed, "close_time"
+    decision = (decision_index or {}).get(_live_research_close_dedup_key(row))
+    if isinstance(decision, dict):
+        value = _live_research_micro_float(decision.get("_sort_ts"))
+        if value is not None and value > 0:
+            return value, "decision_log"
+    fallback = _live_research_micro_float(row.get("signal_created_ts"), 0.0) or 0.0
+    if fallback > 0:
+        print(
+            "[LIVE RESEARCH CLOSE ORDER] legacy fallback without close evidence "
+            f"key={_live_research_close_dedup_key(row)}"
+        )
+    return fallback, "legacy_signal_created_ts"
+
+
+def _live_research_has_close_sort_evidence(row):
+    for field in ("close_ts", "closed_at_unix"):
+        value = _live_research_micro_float(row.get(field))
+        if value is not None and value > 0:
+            return True
+    parsed = _live_research_parse_close_time(row.get("close_time"))
+    return parsed is not None and parsed > 0
+
+
+def _live_research_csv_close_rows(live_trade_rows=None, decision_rows=None):
     rows = live_trade_rows if live_trade_rows is not None else _live_research_micro_read_csv(_LIVE_TRADES_CSV)
+    decision_index = None
     out = []
     for row in rows:
         if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
             continue
         status = str(row.get("status") or "").upper()
-        if status not in ("WIN", "LOSS", "CLOSED", "BREAKEVEN") and not row.get("close_time"):
+        if status not in ("WIN", "LOSS", "LOSE", "CLOSED", "BREAKEVEN", "BE") and not row.get("close_time"):
             continue
         realized = _live_research_micro_float(
             row.get("actual_realized_r", row.get("realized_r", row.get("rr_real", row.get("rr"))))
@@ -7648,9 +7714,11 @@ def _live_research_csv_close_rows(live_trade_rows=None):
         item = dict(row)
         item["actual_realized_r"] = realized
         item["_live_close_source"] = "live_trades_csv"
-        item["_sort_ts"] = _live_research_micro_float(
-            row.get("close_ts", row.get("closed_at_unix", row.get("signal_created_ts"))),
-            0.0,
+        if decision_index is None and not _live_research_has_close_sort_evidence(row):
+            decision_index = _live_research_decision_close_index(decision_rows)
+        item["_sort_ts"], item["_sort_ts_source"] = _live_research_resolve_close_sort_ts(
+            row,
+            decision_index=decision_index,
         )
         out.append(item)
     out.sort(key=lambda row: row.get("_sort_ts", 0.0))
@@ -7692,7 +7760,7 @@ def _live_research_decision_close_rows(decision_rows=None):
 
 def _live_research_close_rows(decision_rows=None, live_trade_rows=None):
     decision_closes = _live_research_decision_close_rows(decision_rows)
-    csv_closes = _live_research_csv_close_rows(live_trade_rows)
+    csv_closes = _live_research_csv_close_rows(live_trade_rows, decision_rows=decision_rows)
     merged = {}
     for row in decision_closes + csv_closes:
         key = _live_research_close_dedup_key(row)
@@ -7883,6 +7951,49 @@ def _live_research_micro_config_status():
         "live_max_portfolio_risk": portfolio,
         "scale_block": not is_micro,
     }
+
+
+def _live_research_bounded_canary_posture(ctx, live_status, freshness):
+    status = canary_config_status()
+    detail = {
+        "bounded_canary_enabled": bool(status.get("enabled")),
+        "bounded_canary_valid": False,
+        "bounded_canary_reason": "",
+        "canary_status": status,
+    }
+    if not status.get("enabled"):
+        detail["bounded_canary_reason"] = "canary_disabled"
+        return False, detail
+    if status.get("errors"):
+        detail["bounded_canary_reason"] = "canary_config_invalid:" + ",".join(status.get("errors") or [])
+        return False, detail
+    if (
+        status.get("candidate_id") != "INCUMBENT_LIVE_CONFIRM"
+        or int(status.get("max_open") or -1) != 2
+        or int(status.get("max_total") or -1) != 50
+        or float(status.get("max_cum_loss_r") or 0) != -8.0
+        or int(status.get("max_consecutive_losses") or -1) != 5
+    ):
+        detail["bounded_canary_reason"] = "canary_bounds_invalid"
+        return False, detail
+    probe = {"entry_type": "CONFIRM_SMC_RESEARCH"}
+    preflight = canary_preflight_open(probe, open_trades=getattr(ctx, "trades", []) if ctx is not None else [])
+    detail["canary_preflight"] = preflight
+    if not preflight.get("ok"):
+        detail["bounded_canary_reason"] = preflight.get("reason", "canary_preflight_reject")
+        return False, detail
+    if not freshness.get("health_row_fresh"):
+        detail["bounded_canary_reason"] = "health_row_stale"
+        return False, detail
+    if bool(live_status.get("loss_streak_current")):
+        detail["bounded_canary_reason"] = "current_loss_streak"
+        return False, detail
+    if bool(live_status.get("runtime_error")):
+        detail["bounded_canary_reason"] = "runtime_error"
+        return False, detail
+    detail["bounded_canary_valid"] = True
+    detail["bounded_canary_reason"] = "valid_bounded_canary"
+    return True, detail
 
 
 def _live_research_micro_health_status(health_row, metrics, freshness=None):
@@ -8087,6 +8198,7 @@ def _live_research_micro_pause_status(
         "live_max_portfolio_risk": config_status.get("live_max_portfolio_risk"),
         "micro_allowed_despite_paper_red": False,
         "scale_block": bool(config_status.get("scale_block")),
+        "funnel_stage": "live_health_gate",
         "health_warnings": health_warnings,
         "action": "ALLOW",
     }
@@ -8132,6 +8244,15 @@ def _live_research_micro_pause_status(
                 and paper_red_open_live_count < paper_red_max_live
             ),
         }
+        bounded_canary_ok, bounded_canary_detail = _live_research_bounded_canary_posture(
+            ctx,
+            live_status,
+            health_freshness,
+        )
+        rolling_positive_ok = paper_red_conditions.pop("live_rolling_net_r_positive")
+        paper_red_conditions["bounded_canary_or_rolling_positive"] = (
+            bounded_canary_ok or rolling_positive_ok
+        )
         # Safety extension: even when the A3 conditions pass, never WARN_ALLOW
         # while a live runtime error is flagged or an active micro-pause window
         # is armed. These mirror the downstream runtime_error / active-pause
@@ -8163,6 +8284,7 @@ def _live_research_micro_pause_status(
             "open_live_count": paper_red_open_live_count,
             "max_live_research_trades": paper_red_max_live,
             "paper_red_conditions": paper_red_conditions,
+            "bounded_canary_posture": bounded_canary_detail,
             "runtime_error_blocker": paper_red_runtime_error,
             "active_pause_blocker": paper_red_active_pause,
             "pause_until": _paper_red_active_pause_until,
@@ -8802,6 +8924,7 @@ def _live_smc_research_prefilter(candidate, trade, ctx):
     notional_ok, notional_detail = _live_smc_research_min_notional_prefilter(trade)
     if not notional_ok:
         return False, "live_min_notional", "LIVE_MIN_NOTIONAL_PREFILTER", notional_detail
+    notional_detail["funnel_stage"] = "min_notional"
 
     try:
         from exchange import live_executor as _live_executor
@@ -9031,6 +9154,7 @@ def _dispatch_live_smc_research_lane(ctx):
                     _canary_reason,
                     trade=trade,
                     extra={
+                        "funnel_stage": "canary_preflight",
                         "prefilter_stage": "canary",
                         "prefilter_reason": _canary_reason,
                         "canary_reject_reason": _canary_reason,
@@ -9050,6 +9174,7 @@ def _dispatch_live_smc_research_lane(ctx):
             "OPEN_ATTEMPT",
             trade=trade,
             extra={
+                "funnel_stage": "OPEN_ATTEMPT",
                 **_live_smc_research_score_alignment_extra(trade),
                 **location_gate_extra,
                 **smc_entry_v2_extra,
@@ -9078,6 +9203,7 @@ def _dispatch_live_smc_research_lane(ctx):
                     "open_trade raised exception",
                     trade=trade_for_open,
                     extra={
+                        "funnel_stage": "OPEN_FAILED",
                         **_failure_extra,
                         **location_gate_extra,
                         **smc_entry_v2_extra,
@@ -9092,6 +9218,7 @@ def _dispatch_live_smc_research_lane(ctx):
                 "OPEN_ACCEPTED",
                 trade=trade_for_open,
                 extra={
+                    "funnel_stage": "OPEN_ACCEPTED",
                     **location_gate_extra,
                     **smc_entry_v2_extra,
                     **smc_entry_v2b_allowlist_extra,
@@ -9115,6 +9242,7 @@ def _dispatch_live_smc_research_lane(ctx):
                     "open_trade returned falsy",
                     trade=trade_for_open,
                     extra={
+                        "funnel_stage": "OPEN_FAILED",
                         **_failure_extra,
                         **location_gate_extra,
                         **smc_entry_v2_extra,

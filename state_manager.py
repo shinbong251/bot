@@ -37,6 +37,7 @@ TRADE_CSV_HEADERS = [
     "signal_created_ts",
     "exchange_fill_price","entry_source","entry_price_unconfirmed","rr_unconfirmed",
     "canary_epoch","canary_candidate_id","canary_open_sequence","canary_enabled_at_open",
+    "close_ts","closed_at_unix",
 ]
 
 CANARY_STATE_FILE = os.path.join(BASE_DIR, "canary_state.json")
@@ -1078,6 +1079,8 @@ def save_trade(t, trades_csv=None):
             "trailing_phase_at_exit": t.get("trailing_phase_at_exit", ""),
             "max_r_after_partial": t.get("max_r_after_partial", ""),
             "signal_created_ts": t.get("signal_created_ts", ""),
+            "close_ts": t.get("close_ts", t.get("close_time", "")),
+            "closed_at_unix": t.get("closed_at_unix", t.get("close_ts", t.get("close_time", ""))),
             "exchange_fill_price": t.get("exchange_fill_price", ""),
             "entry_source": t.get("entry_source", ""),
             "entry_price_unconfirmed": t.get("entry_price_unconfirmed", ""),
