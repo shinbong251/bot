@@ -5,6 +5,7 @@ import json
 import math
 import time
 import csv
+import heapq
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,31 @@ LIVE_STATE = ROOT / "live_state.json"
 LIVE_TRADES = ROOT / "live_trades.csv"
 SUMMARY_LOG = LOG_DIR / "research_rolling_health.jsonl"
 CONFIG_JSON = ROOT / "config.json"
+
+
+def iter_jsonl(path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(row, dict):
+                yield row
+
+
+def iter_csv(path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if isinstance(row, dict):
+                yield row
 
 
 def read_jsonl(path):
@@ -224,6 +250,348 @@ def metrics(rows):
         "side_split": split_metrics(rows, "side"),
         "phase_split": split_metrics(rows, "phase"),
         "regime_split": split_metrics(rows, "market_regime"),
+    }
+
+
+def _empty_metrics():
+    return {
+        "n": 0,
+        "raw_net_r": 0,
+        "raw_pf": None,
+        "calibrated_net_r_cap_1_0": 0,
+        "calibrated_pf_cap_1_0": None,
+        "calibrated_net_r_cap_1_2": 0,
+        "calibrated_pf_cap_1_2": None,
+        "win_rate": None,
+        "max_loss_streak": 0,
+        "max_drawdown_r": 0,
+        "gap_loss_count": 0,
+        "possible_overcharge_count": 0,
+        "side_split": {},
+        "phase_split": {},
+        "regime_split": {},
+    }
+
+
+class _TopRows:
+    def __init__(self, limit):
+        self.limit = max(0, int(limit or 0))
+        self._rows = []
+        self._seq = 0
+
+    def add(self, row):
+        if self.limit <= 0:
+            return
+        item = (row_ts(row), self._seq, row)
+        self._seq += 1
+        if len(self._rows) < self.limit:
+            heapq.heappush(self._rows, item)
+            return
+        if item > self._rows[0]:
+            heapq.heapreplace(self._rows, item)
+
+    def rows(self):
+        return [item[2] for item in sorted(self._rows)]
+
+
+class _MetricsAccumulator:
+    def __init__(self):
+        self.rows = 0
+        self.raw_sum = 0.0
+        self.raw_gains = 0.0
+        self.raw_losses = 0.0
+        self.raw_wins = 0
+        self.cap_1_0_sum = 0.0
+        self.cap_1_0_gains = 0.0
+        self.cap_1_0_losses = 0.0
+        self.cap_1_2_sum = 0.0
+        self.cap_1_2_gains = 0.0
+        self.cap_1_2_losses = 0.0
+        self.loss_streak = 0
+        self.max_loss_streak = 0
+        self.equity = 0.0
+        self.peak = 0.0
+        self.worst_drawdown = 0.0
+        self.gap_loss_count = 0
+        self.possible_overcharge_count = 0
+        self.side_values = defaultdict(_SplitAccumulator)
+        self.phase_values = defaultdict(_SplitAccumulator)
+        self.regime_values = defaultdict(_SplitAccumulator)
+
+    def add(self, row):
+        raw = fnum(row.get("raw_realized_r"))
+        if raw is None:
+            return
+        cap_1_0 = fnum(row.get("calibrated_r_cap_1_0"))
+        cap_1_2 = fnum(row.get("calibrated_r_cap_1_2"))
+        self.rows += 1
+        self.raw_sum += raw
+        if raw > 0:
+            self.raw_gains += raw
+            self.raw_wins += 1
+        elif raw < 0:
+            self.raw_losses += -raw
+        if cap_1_0 is not None:
+            self.cap_1_0_sum += cap_1_0
+            if cap_1_0 > 0:
+                self.cap_1_0_gains += cap_1_0
+                self.loss_streak = 0
+            elif cap_1_0 < 0:
+                self.cap_1_0_losses += -cap_1_0
+                self.loss_streak += 1
+                self.max_loss_streak = max(self.max_loss_streak, self.loss_streak)
+            else:
+                self.loss_streak = 0
+            self.equity += cap_1_0
+            self.peak = max(self.peak, self.equity)
+            self.worst_drawdown = min(self.worst_drawdown, self.equity - self.peak)
+        if cap_1_2 is not None:
+            self.cap_1_2_sum += cap_1_2
+            if cap_1_2 > 0:
+                self.cap_1_2_gains += cap_1_2
+            elif cap_1_2 < 0:
+                self.cap_1_2_losses += -cap_1_2
+        if row.get("is_gap_loss"):
+            self.gap_loss_count += 1
+        if row.get("possible_overcharge"):
+            self.possible_overcharge_count += 1
+        for field, buckets in (
+            ("side", self.side_values),
+            ("phase", self.phase_values),
+            ("market_regime", self.regime_values),
+        ):
+            raw_label = row.get(field)
+            if raw_label in (None, "") and field in ("phase", "market_regime"):
+                raw_label = (row.get("entry_context") or {}).get(field)
+            label = str(raw_label or "UNKNOWN").upper()
+            if cap_1_0 is not None:
+                buckets[label].add(cap_1_0)
+
+    def result(self):
+        if not self.rows:
+            return _empty_metrics()
+        return {
+            "n": self.rows,
+            "raw_net_r": round(self.raw_sum, 4),
+            "raw_pf": _pf_from_sums(self.raw_gains, self.raw_losses),
+            "calibrated_net_r_cap_1_0": round(self.cap_1_0_sum, 4),
+            "calibrated_pf_cap_1_0": _pf_from_sums(self.cap_1_0_gains, self.cap_1_0_losses),
+            "calibrated_net_r_cap_1_2": round(self.cap_1_2_sum, 4),
+            "calibrated_pf_cap_1_2": _pf_from_sums(self.cap_1_2_gains, self.cap_1_2_losses),
+            "win_rate": self.raw_wins / self.rows if self.rows else None,
+            "max_loss_streak": self.max_loss_streak,
+            "max_drawdown_r": round(abs(self.worst_drawdown), 4),
+            "gap_loss_count": self.gap_loss_count,
+            "possible_overcharge_count": self.possible_overcharge_count,
+            "side_split": _split_result(self.side_values),
+            "phase_split": _split_result(self.phase_values),
+            "regime_split": _split_result(self.regime_values),
+        }
+
+
+def _pf_from_sums(gains, losses):
+    if losses <= 0:
+        return None if gains <= 0 else float("inf")
+    return gains / losses
+
+
+class _SplitAccumulator:
+    def __init__(self):
+        self.n = 0
+        self.net = 0.0
+        self.gains = 0.0
+        self.losses = 0.0
+        self.wins = 0
+
+    def add(self, value):
+        self.n += 1
+        self.net += value
+        if value > 0:
+            self.gains += value
+            self.wins += 1
+        elif value < 0:
+            self.losses += -value
+
+    def result(self):
+        return {
+            "n": self.n,
+            "net_r": round(self.net, 4),
+            "pf": _pf_from_sums(self.gains, self.losses),
+            "win_rate": self.wins / self.n if self.n else None,
+        }
+
+
+def _split_result(values_by_label):
+    return {
+        label: agg.result()
+        for label, agg in sorted(
+            values_by_label.items(),
+            key=lambda item: (-item[1].n, item[0]),
+        )
+    }
+
+
+def _compact_shadow_row(row):
+    out = {}
+    for field in (
+        "trade_id",
+        "research_join_key",
+        "research_dedup_key",
+        "dedup_key",
+        "possible_overcharge",
+        "configured_sl_gap_r",
+        "execution_tier",
+        "gap_minus_mae_r",
+        "price_r",
+        "expected_sl_r_with_gap",
+    ):
+        if field in row:
+            out[field] = row.get(field)
+    return out
+
+
+def shadow_index_stream(path):
+    indexed = {}
+    for row in iter_jsonl(path):
+        compact = _compact_shadow_row(row)
+        key = row_key(compact)
+        if key:
+            indexed[key] = compact
+        trade_id = compact.get("trade_id")
+        if trade_id not in (None, ""):
+            indexed[str(trade_id)] = compact
+    return indexed
+
+
+def min_lock_key_set_stream(path):
+    keys = set()
+    for row in iter_jsonl(path):
+        key = row_key(row)
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _paper_close_candidates(row):
+    if row.get("event_type") in ("RESEARCH_CLOSED", "RESEARCH_CLOSE_MISSING_CONTEXT"):
+        yield row
+    for child in row.get("closed_since_last_summary") or []:
+        if isinstance(child, dict) and child.get("event_type") in (
+            "RESEARCH_CLOSED",
+            "RESEARCH_CLOSE_MISSING_CONTEXT",
+        ):
+            yield child
+
+
+def _enrich_paper_close_row(source, gap_shadow, min_lock_keys):
+    row = dict(source)
+    joined = gap_shadow.get(row_key(row)) or gap_shadow.get(str(row.get("trade_id") or ""))
+    if joined:
+        row["_gap_shadow_joined"] = True
+        for field in (
+            "possible_overcharge",
+            "configured_sl_gap_r",
+            "execution_tier",
+            "gap_minus_mae_r",
+            "price_r",
+            "expected_sl_r_with_gap",
+        ):
+            if field in joined and row.get(field) in (None, ""):
+                row[field] = joined[field]
+    else:
+        row["_gap_shadow_joined"] = False
+
+    raw_r = fnum(row.get("raw_realized_r", row.get("r_multiple")))
+    row["raw_realized_r"] = raw_r
+    close_reason = str(row.get("close_reason") or row.get("exit_type") or "").upper()
+    gap_r = fnum(row.get("configured_sl_gap_r", row.get("raw_sl_gap_r")))
+    is_gap_loss = bool(row.get("is_gap_loss"))
+    if not is_gap_loss:
+        is_gap_loss = (
+            close_reason == "SL"
+            and gap_r is not None
+            and gap_r > 0
+            and raw_r is not None
+            and raw_r < -1.0
+        )
+    if not is_gap_loss and close_reason == "SL" and raw_r is not None:
+        is_gap_loss = abs(raw_r + 1.5) < 1e-9 or abs(raw_r + 1.3) < 1e-9
+    row["is_gap_loss"] = is_gap_loss
+    row["configured_sl_gap_r"] = gap_r
+    row["calibrated_r_cap_1_0"] = (
+        max(raw_r, -1.0)
+        if is_gap_loss and raw_r is not None and raw_r <= -1.2
+        else raw_r
+    )
+    row["calibrated_r_cap_1_2"] = (
+        max(raw_r, -1.2)
+        if is_gap_loss and raw_r is not None and raw_r <= -1.2
+        else raw_r
+    )
+    entry_context = row.get("entry_context") if isinstance(row.get("entry_context"), dict) else {}
+    row["phase"] = row.get("phase") or entry_context.get("phase")
+    row["market_regime"] = row.get("market_regime") or entry_context.get("market_regime")
+    row["since_min_lock_active"] = row_key(row) in min_lock_keys
+    return row
+
+
+def paper_summary_stream(baseline_ts, min_active_closed):
+    gap_shadow = shadow_index_stream(PAPER_GAP_SHADOW)
+    min_lock_keys = min_lock_key_set_stream(PAPER_MIN_LOCK)
+    seen = set()
+    last100 = _TopRows(100)
+    active_last50 = _TopRows(50)
+    since_min_lock = _MetricsAccumulator()
+    active_count = 0
+
+    for source_row in iter_jsonl(PAPER_LIFECYCLE):
+        for candidate in _paper_close_candidates(source_row):
+            if str(candidate.get("entry_type") or "").upper() not in ("", "CONFIRM_SMC_RESEARCH"):
+                continue
+            ident = row_key(candidate)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            row = _enrich_paper_close_row(candidate, gap_shadow, min_lock_keys)
+            last100.add(row)
+            if row_ts(row) >= baseline_ts:
+                active_count += 1
+                active_last50.add(row)
+            if row.get("since_min_lock_active"):
+                since_min_lock.add(row)
+
+    last100_rows = last100.rows()
+    active_rows = active_last50.rows()
+    last20 = metrics(last100_rows[-20:])
+    last50 = metrics(last100_rows[-50:])
+    last100_metrics = metrics(last100_rows)
+    active_last20 = metrics(active_rows[-20:])
+    active_last50_metrics = metrics(active_rows[-50:])
+    legacy_health, legacy_reasons = classify_paper(last20, last50)
+    if active_count < min_active_closed:
+        active_health = "INSUFFICIENT_DATA"
+        active_reasons = [
+            f"active_closed_n={active_count}<{min_active_closed}",
+            "legacy_health_warning_only",
+        ]
+    else:
+        active_health, active_reasons = classify_paper(active_last20, active_last50_metrics)
+
+    gap_shadow.clear()
+    min_lock_keys.clear()
+    seen.clear()
+    return {
+        "last20": last20,
+        "last50": last50,
+        "last100": last100_metrics,
+        "active_last20": active_last20,
+        "active_last50": active_last50_metrics,
+        "active_closed_count": active_count,
+        "since_min_lock_active": since_min_lock.result(),
+        "legacy_health": legacy_health,
+        "legacy_reasons": legacy_reasons,
+        "active_health": active_health,
+        "active_reasons": active_reasons,
     }
 
 
@@ -627,6 +995,271 @@ def live_safety_issues(decision_rows=None, min_lock_rows=None, live_state=None):
     return sorted(set(warnings)), sorted(set(critical))
 
 
+def _compact_min_lock_row(row):
+    out = {}
+    for field in (
+        "entry_type",
+        "reason",
+        "event_type",
+        "sync_result",
+        "done",
+        "min_lock_075_done",
+        "trade_id",
+        "research_join_key",
+        "symbol",
+        "side",
+    ):
+        if field in row:
+            out[field] = row.get(field)
+    return out
+
+
+def min_lock_rows_stream():
+    rows = []
+    for row in iter_jsonl(LIVE_MIN_LOCK):
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        rows.append(_compact_min_lock_row(row))
+    return rows
+
+
+def _compact_live_decision_close(row, realized):
+    item = {}
+    for field in (
+        "id",
+        "trade_id",
+        "client_order_id",
+        "clientOrderId",
+        "symbol",
+        "side",
+        "entry_time",
+        "open_time",
+        "close_time",
+        "close_ts",
+        "closed_at_unix",
+        "ts",
+        "observed_at_unix",
+        "time",
+        "signal_created_ts",
+        "rr_unconfirmed",
+        "entry_unconfirmed",
+        "exit_unconfirmed",
+        "actual_realized_r",
+        "realized_r",
+        "rr_real",
+        "r_multiple",
+        "entry_type",
+        "decision",
+        "status",
+        "close_reason",
+    ):
+        if field in row:
+            item[field] = row.get(field)
+    item["actual_realized_r"] = realized
+    item["_live_close_source"] = "live_smc_research_decisions"
+    item["_sort_ts"] = row_ts(row)
+    return item
+
+
+def live_decision_scan_stream():
+    close_rows = []
+    warnings = []
+    critical = []
+    for row in iter_jsonl(LIVE_DECISIONS):
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        lower = " ".join(
+            str(row.get(field) or "")
+            for field in ("decision", "reason", "prefilter_reason", "prefilter_detail", "fail_reason")
+        ).lower()
+        sl_text = decision_sl_sync_text(row)
+        if "reconcile" in lower:
+            warnings.append("live_reconcile_warning")
+        if (
+            "unmanaged" in lower
+            or "local state" in lower
+            or ("missing exchange" in lower and not sl_text)
+        ):
+            critical.append("live_exchange_local_state_consistency_issue")
+        if sl_text:
+            warnings.append("historical_sl_sync_failure_resolved_or_flat_warning")
+
+        decision = str(row.get("decision") or "").upper()
+        status = str(row.get("status") or "").upper()
+        realized = fnum(
+            row.get(
+                "actual_realized_r",
+                row.get("realized_r", row.get("rr_real", row.get("r_multiple"))),
+            )
+        )
+        if realized is None:
+            continue
+        if "CLOSE" in decision or "CLOSED" in decision or status == "CLOSED" or row.get("close_reason"):
+            close_rows.append(_compact_live_decision_close(row, realized))
+    close_rows.sort(key=lambda item: item.get("_sort_ts", 0.0))
+    return close_rows, warnings, critical
+
+
+def live_safety_issues_stream(decision_warnings, decision_critical, min_lock_rows, live_state=None):
+    warnings = list(decision_warnings or [])
+    critical = list(decision_critical or [])
+    open_positions = live_research_open_positions(live_state)
+    has_open_research = bool(open_positions)
+    sl_sync_ok = any(
+        trade.get("exchange_sl_id") not in (None, "")
+        and fnum(trade.get("exchange_sl_price_confirmed")) is not None
+        for trade in open_positions
+    )
+    if has_open_research:
+        for trade in open_positions:
+            if open_trade_has_unresolved_sl_sync_risk_stream(trade, min_lock_rows):
+                critical.append("live_sl_sync_failure")
+    later_success_keys = set()
+    for row in reversed(min_lock_rows):
+        if str(row.get("entry_type") or "").upper() != "CONFIRM_SMC_RESEARCH":
+            continue
+        keys = _sl_sync_match_keys(row)
+        if min_lock_row_failed(row):
+            warnings.append("historical_sl_sync_failure_resolved_or_flat_warning")
+            if any(key in later_success_keys for key in keys):
+                warnings.append("historical_min_lock_sync_failure_resolved")
+            elif has_open_research:
+                warnings.append("historical_min_lock_sync_failure_unresolved_warning")
+        if min_lock_row_succeeded(row):
+            later_success_keys.update(keys)
+    if has_open_research and sl_sync_ok:
+        warnings.append("SL_SYNC_OK")
+    return sorted(set(warnings)), sorted(set(critical))
+
+
+def _sl_sync_match_keys(row):
+    keys = set()
+    identity = dict(sl_sync_identity(row))
+    for field in ("trade_id", "research_join_key"):
+        if identity.get(field):
+            keys.add((field, identity[field]))
+    if identity.get("symbol") and identity.get("side"):
+        keys.add(("symbol_side", identity["symbol"], identity["side"]))
+    return keys
+
+
+def open_trade_has_unresolved_sl_sync_risk_stream(trade, min_lock_rows):
+    if trade.get("exchange_sl_id") in (None, ""):
+        return True
+    if fnum(trade.get("exchange_sl_price_confirmed")) is None:
+        return True
+    fail_count = int(fnum(trade.get("sl_sync_fail_count"), 0) or 0)
+    has_error = trade.get("exchange_sl_sync_error") not in (None, "")
+    if not fail_count and not has_error:
+        return False
+    trade_keys = _sl_sync_match_keys(trade)
+    for row in reversed(min_lock_rows):
+        if min_lock_row_succeeded(row) and trade_keys.intersection(_sl_sync_match_keys(row)):
+            return False
+    return True
+
+
+def live_close_rows_stream(decision_closes):
+    csv_closes = live_csv_close_rows(
+        live_trade_rows=list(iter_csv(LIVE_TRADES)),
+        decision_rows=decision_closes,
+    )
+    merged = {}
+    for row in decision_closes + csv_closes:
+        key = live_close_dedup_key(row)
+        if key not in merged:
+            merged[key] = row
+            continue
+        if merged[key].get("_live_close_source") != "live_trades_csv" and row.get("_live_close_source") == "live_trades_csv":
+            merged[key] = row
+    out = list(merged.values())
+    out.sort(key=lambda item: item.get("_sort_ts", row_ts(item)))
+    return out
+
+
+def classify_live_compact(closes, warnings, critical, live_state=None):
+    unconfirmed_rows = [
+        row for row in closes
+        if str(row.get("rr_unconfirmed") or "").lower() in ("true", "1", "yes")
+        or str(row.get("entry_unconfirmed") or "").lower() in ("true", "1", "yes")
+        or str(row.get("exit_unconfirmed") or "").lower() in ("true", "1", "yes")
+    ]
+    confirmed_closes = [row for row in closes if row not in unconfirmed_rows]
+    values = [fnum(row.get("actual_realized_r")) for row in confirmed_closes]
+    values = [value for value in values if value is not None]
+    reasons = []
+    unconfirmed_n = len(unconfirmed_rows)
+    if critical:
+        live_net = round(sum(values), 4)
+        streak = max_loss_streak(values)
+        return "RED", critical, {"n": len(values), "net_r": live_net, "consecutive_losses": streak, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": streak, "live_unconfirmed_rr_n": unconfirmed_n}
+    if len(values) == 0:
+        reason = "live_no_confirmed_rr_trades" if unconfirmed_n else "live_no_closed_research_trades"
+        return "UNKNOWN", [reason] + warnings, {"n": 0, "net_r": 0.0, "consecutive_losses": 0, "live_closed_n": 0, "live_rolling_net_r": 0.0, "live_loss_streak": 0, "live_unconfirmed_rr_n": unconfirmed_n}
+    live_net = round(sum(values), 4)
+    consecutive_losses = 0
+    for value in reversed(values):
+        if value < 0:
+            consecutive_losses += 1
+        else:
+            break
+    if consecutive_losses >= 3:
+        _streak_metrics = {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+        _streak_metrics.update(live_loss_streak_meta(confirmed_closes, consecutive_losses, live_net, critical, live_state, all_closes=closes))
+        cfg = read_json(CONFIG_JSON)
+        demote_enabled = config_bool(cfg.get("live_health_stale_streak_demote_enabled"), False)
+        dormancy_hours = fnum(cfg.get("live_health_stale_streak_dormancy_hours"), 48.0)
+        newest_close_ts = max((_close_sort_ts(row) for row in confirmed_closes[-consecutive_losses:]), default=0.0)
+        dormancy_age_hours = ((time.time() - newest_close_ts) / 3600.0) if newest_close_ts > 0 else 0.0
+        if (
+            demote_enabled
+            and dormancy_hours is not None
+            and dormancy_age_hours >= dormancy_hours
+            and _streak_metrics.get("loss_streak_current") is False
+        ):
+            return "YELLOW", [
+                f"live_consecutive_losses={consecutive_losses}>=3",
+                f"stale_streak_demoted_dormancy_hours={round(dormancy_age_hours, 2)}",
+            ], _streak_metrics
+        return "RED", [f"live_consecutive_losses={consecutive_losses}>=3"], _streak_metrics
+    if live_net <= -2.0:
+        return "RED", [f"live_net_r={live_net}<=-2R"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+    if consecutive_losses in (1, 2):
+        reasons.append(f"live_consecutive_losses={consecutive_losses}")
+    blocking_warnings = [warning for warning in warnings if warning != "SL_SYNC_OK"]
+    if blocking_warnings:
+        reasons.extend(blocking_warnings)
+    if reasons:
+        return "YELLOW", reasons + [warning for warning in warnings if warning == "SL_SYNC_OK"], {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+    green_reasons = ["live_closed_small_sample_no_critical_failure"] + [warning for warning in warnings if warning == "SL_SYNC_OK"]
+    if unconfirmed_n:
+        green_reasons.append(f"live_unconfirmed_rr_excluded={unconfirmed_n}")
+    return "GREEN", green_reasons, {"n": len(values), "net_r": live_net, "consecutive_losses": consecutive_losses, "live_closed_n": len(values), "live_rolling_net_r": live_net, "live_loss_streak": consecutive_losses, "live_unconfirmed_rr_n": unconfirmed_n}
+
+
+def live_summary_stream(live_state=None):
+    live_state = read_json(LIVE_STATE) if live_state is None else live_state
+    min_lock_rows = min_lock_rows_stream()
+    decision_closes, decision_warnings, decision_critical = live_decision_scan_stream()
+    warnings, critical = live_safety_issues_stream(
+        decision_warnings,
+        decision_critical,
+        min_lock_rows,
+        live_state=live_state,
+    )
+    closes = live_close_rows_stream(decision_closes)
+    live_health, live_reasons, live_metrics = classify_live_compact(
+        closes,
+        warnings,
+        critical,
+        live_state=live_state,
+    )
+    min_lock_rows.clear()
+    decision_closes.clear()
+    closes.clear()
+    return live_health, live_reasons, live_metrics
+
+
 def _close_sort_ts(row):
     value = fnum(row.get("_sort_ts"))
     if value is not None:
@@ -832,6 +1465,65 @@ def promotion_status(paper_health, live_health, last50, active_n=None, min_activ
 
 
 def build_summary(source="audit_script", write_summary=True):
+    cfg = read_json(CONFIG_JSON)
+    baseline_ts = fnum(cfg.get("research_health_baseline_ts"), 0.0) or 0.0
+    min_active_closed = int(cfg.get("research_health_min_active_closed", 20) or 20)
+    use_active_only = bool(cfg.get("research_health_use_active_only_for_live_scale", True))
+    paper_summary = paper_summary_stream(baseline_ts, min_active_closed)
+    last20 = paper_summary["last20"]
+    last50 = paper_summary["last50"]
+    last100 = paper_summary["last100"]
+    active_last20 = paper_summary["active_last20"]
+    active_last50 = paper_summary["active_last50"]
+    active_closed_count = paper_summary["active_closed_count"]
+    since_min_lock = paper_summary["since_min_lock_active"]
+    legacy_health = paper_summary["legacy_health"]
+    active_health = paper_summary["active_health"]
+    active_reasons = paper_summary["active_reasons"]
+    live_health, live_reasons, live_metrics = live_summary_stream()
+    paper_summary.clear()
+    paper_health_for_scale = active_health if use_active_only else legacy_health
+    status = promotion_status(
+        paper_health_for_scale,
+        live_health,
+        active_last50 if use_active_only else last50,
+        active_n=active_closed_count if use_active_only else last50.get("n"),
+        min_active_closed=min_active_closed,
+    )
+    reasons = active_reasons + live_reasons
+    if legacy_health == "RED":
+        reasons.append("legacy_health_RED_warning_only")
+    if status != "PROMOTION_ALLOWED_MICRO_ONLY":
+        reasons.append(status)
+    row = {
+        "ts": time.time(),
+        "source": source,
+        "paper_health": paper_health_for_scale,
+        "legacy_health": legacy_health,
+        "paper_legacy_health": legacy_health,
+        "paper_active_health": active_health,
+        "live_health": live_health,
+        "promotion_status": status,
+        "research_health_baseline_ts": baseline_ts,
+        "research_health_min_active_closed": min_active_closed,
+        "research_health_use_active_only_for_live_scale": use_active_only,
+        "last20": last20,
+        "last50": last50,
+        "last100": last100,
+        "active_last20": active_last20,
+        "active_last50": active_last50,
+        "active_closed_count": active_closed_count,
+        "since_min_lock_active": since_min_lock,
+        "live_metrics": live_metrics,
+        "max_live_research_trades": cfg.get("max_live_research_trades"),
+        "reasons": reasons,
+    }
+    if write_summary:
+        write_jsonl(SUMMARY_LOG, row)
+    return row
+
+
+def build_summary_full_load_reference(source="audit_script", write_summary=True):
     cfg = read_json(CONFIG_JSON)
     baseline_ts = fnum(cfg.get("research_health_baseline_ts"), 0.0) or 0.0
     min_active_closed = int(cfg.get("research_health_min_active_closed", 20) or 20)
