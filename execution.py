@@ -3889,6 +3889,142 @@ def _bot_algo_order_for_trade(order: dict, t: dict) -> bool:
     return str(order.get("side", "")).upper() == expected_stop_side
 
 
+def _exchange_stop_trigger_price(order: dict):
+    if not isinstance(order, dict):
+        return None
+    return _safe_float_value(
+        order.get(
+            "triggerPrice",
+            order.get("stopPrice", order.get("price")),
+        ),
+        None,
+    )
+
+
+def _exchange_stop_trigger_tolerance(order: dict) -> float:
+    raw = None
+    if isinstance(order, dict):
+        raw = order.get("triggerPrice", order.get("stopPrice", order.get("price")))
+    text = str(raw or "")
+    if "." not in text:
+        return 1e-9
+    decimals = len(text.split(".", 1)[1])
+    if decimals <= 0:
+        return 1e-9
+    return max(1e-9, 10 ** (-decimals))
+
+
+def _exchange_stop_trigger_matches_trade(order: dict, t: dict) -> bool:
+    trigger = _exchange_stop_trigger_price(order)
+    local_sl = _safe_float_value(t.get("sl"), None)
+    if trigger is None or local_sl is None:
+        return False
+    return abs(trigger - local_sl) <= _exchange_stop_trigger_tolerance(order)
+
+
+def _exchange_stop_quantity(order: dict):
+    if not isinstance(order, dict):
+        return None
+    return _safe_float_value(
+        order.get(
+            "quantity",
+            order.get("origQty", order.get("executedQty")),
+        ),
+        None,
+    )
+
+
+def _exchange_stop_has_ownership_evidence(order: dict, t: dict, require_bot_id: bool = True) -> bool:
+    if not require_bot_id:
+        return True
+    if _has_bot_client_id(order):
+        return True
+    algo_id = order.get("algoId") or order.get("orderId")
+    return (
+        algo_id not in (None, "")
+        and t.get("exchange_sl_id") == algo_id
+        and t.get("owner", "bot") == "bot"
+        and bool(t.get("exchange_position_owner_confirmed"))
+    )
+
+
+def _exchange_stop_protects_trade(order: dict, t: dict, require_bot_id: bool = True) -> bool:
+    if not isinstance(order, dict) or not isinstance(t, dict):
+        return False
+    if str(order.get("symbol") or "").upper() != str(t.get("symbol") or "").upper():
+        return False
+    if not _exchange_stop_has_ownership_evidence(order, t, require_bot_id=require_bot_id):
+        return False
+    expected_stop_side = "SELL" if t.get("side") == "LONG" else "BUY"
+    if str(order.get("side", "")).upper() != expected_stop_side:
+        return False
+    status = str(order.get("algoStatus", order.get("status", "NEW")) or "NEW").upper()
+    if status not in ("NEW", "PARTIALLY_FILLED", "PENDING", "ACCEPTED"):
+        return False
+    if not (_truthy_exchange_flag(order.get("reduceOnly")) or _truthy_exchange_flag(order.get("closePosition"))):
+        return False
+    if not _truthy_exchange_flag(order.get("closePosition")):
+        stop_qty = _exchange_stop_quantity(order)
+        trade_qty = _safe_float_value(t.get("exchange_qty", t.get("qty")), None)
+        if stop_qty is None or trade_qty is None or stop_qty + 1e-12 < trade_qty:
+            return False
+    if not _exchange_stop_trigger_matches_trade(order, t):
+        return False
+    return True
+
+
+def _clear_resolved_exchange_sl_sync_warning(t: dict):
+    changed = False
+    for key in (
+        "exchange_sl_sync_pending",
+        "exchange_sl_sync_error",
+        "exchange_sl_sync_error_ts",
+        "exchange_sl_sync_skipped_reason",
+        "exchange_sl_sync_skipped_ts",
+    ):
+        if key in t:
+            t.pop(key, None)
+            changed = True
+    if int(t.get("sl_sync_fail_count") or 0) != 0:
+        t["sl_sync_fail_count"] = 0
+        changed = True
+    return changed
+
+
+def _confirm_exchange_sl_from_order(t: dict, order: dict, source: str, require_bot_id: bool = True) -> bool:
+    if not _exchange_stop_protects_trade(order, t, require_bot_id=require_bot_id):
+        return False
+    changed = False
+    algo_id = order.get("algoId") or order.get("orderId")
+    if algo_id and t.get("exchange_sl_id") != algo_id:
+        t["exchange_sl_id"] = algo_id
+        changed = True
+    trigger = _exchange_stop_trigger_price(order)
+    if trigger is not None and t.get("exchange_sl_price_confirmed") != trigger:
+        t["exchange_sl_price_confirmed"] = trigger
+        changed = True
+    _ = source
+    if _clear_resolved_exchange_sl_sync_warning(t):
+        changed = True
+    return changed
+
+
+def _confirm_exchange_sl_from_result(t: dict, result: dict, source: str) -> bool:
+    if not isinstance(result, dict):
+        return False
+    raw = result.get("raw")
+    if not isinstance(raw, dict):
+        return False
+    order = dict(raw)
+    if "algoId" not in order and result.get("order_id"):
+        order["algoId"] = result.get("order_id")
+    if "symbol" not in order and t.get("symbol"):
+        order["symbol"] = t.get("symbol")
+    if "side" not in order:
+        order["side"] = "SELL" if t.get("side") == "LONG" else "BUY"
+    return _confirm_exchange_sl_from_order(t, order, source=source, require_bot_id=False)
+
+
 def _apply_live_bot_ownership_recovery(t: dict, evidence: dict) -> bool:
     changed = False
     entry_order = evidence.get("entry_order")
@@ -3919,13 +4055,12 @@ def _apply_live_bot_ownership_recovery(t: dict, evidence: dict) -> bool:
 
     algo_order = evidence.get("algo_order")
     if isinstance(algo_order, dict):
-        algo_id = algo_order.get("algoId")
-        if algo_id and t.get("exchange_sl_id") != algo_id:
-            t["exchange_sl_id"] = algo_id
-            changed = True
-        stop_price = _safe_float_value(algo_order.get("triggerPrice"), 0.0)
-        if stop_price > 0 and t.get("exchange_sl_price_confirmed") != stop_price:
-            t["exchange_sl_price_confirmed"] = stop_price
+        if _confirm_exchange_sl_from_order(
+            t,
+            algo_order,
+            source="ownership_recovery",
+            require_bot_id=True,
+        ):
             changed = True
 
     return changed
@@ -5488,9 +5623,16 @@ def open_trade(t, ctx=None):
 
                         if _existing_sl:
                             t["exchange_sl_id"] = _existing_sl.get("algoId")
+                            _confirmed_existing_sl = _confirm_exchange_sl_from_order(
+                                t,
+                                _existing_sl,
+                                source="stop_rebound",
+                                require_bot_id=True,
+                            )
                             print(
                                 f"[{_exec_mode.upper()}] {symbol} STOP already on exchange "
                                 f"algoId={t['exchange_sl_id']} — rebound, no retry needed"
+                                f"{'' if _confirmed_existing_sl else ' (price confirmation pending)'}"
                             )
                             send_telegram(
                                 f"⚠️ {symbol} STOP rebound from exchange algoId={t['exchange_sl_id']}",
@@ -5548,6 +5690,11 @@ def open_trade(t, ctx=None):
                         )
 
                     t["exchange_sl_id"] = _sl_result.get("order_id")
+                    _confirm_exchange_sl_from_result(
+                        t,
+                        _sl_result,
+                        source="initial_stop_placement",
+                    )
 
                 _sl_synced = t.get("exchange_sl_id") is not None
                 if _exec_mode == "live" and _sl_synced:
@@ -6020,19 +6167,30 @@ def audit_exchange_sl(ctx):
                 _order_data = _tn.query_algo_order(symbol, sl_id)
                 if _order_data is not None:
                     print(f"[SL AUDIT] {symbol} algoId={sl_id} verified active on exchange")
+                    _confirmed_from_order = _confirm_exchange_sl_from_order(
+                        t,
+                        _order_data,
+                        source="sl_audit_query",
+                        require_bot_id=True,
+                    )
                     # FIX 2c: verify exchange stop price matches local t["sl"]
                     _exch_trigger = _order_data.get("triggerPrice")
                     if _exch_trigger is not None:
                         _exch_price = float(_exch_trigger)
                         _local_sl   = t.get("sl", 0)
                         _confirmed  = t.get("exchange_sl_price_confirmed")
-                        if abs(_exch_price - _local_sl) > 1e-9 and _confirmed != _local_sl:
+                        _trigger_tolerance = _exchange_stop_trigger_tolerance(_order_data)
+                        if abs(_exch_price - _local_sl) > _trigger_tolerance and _confirmed != _local_sl:
                             print(
                                 f"[SL AUDIT] {symbol} PRICE MISMATCH "
                                 f"exchange={round(_exch_price, 6)} local={round(_local_sl, 6)} "
                                 f"— scheduling resync"
                             )
                             t["exchange_sl_sync_pending"] = _local_sl
+                    elif not _confirmed_from_order:
+                        print(
+                            f"[SL AUDIT] {symbol} stop active but trigger could not be price-confirmed"
+                        )
                     continue
                 _all_algos = _tn.get_open_algo_orders(symbol) if hasattr(_tn, "get_open_algo_orders") else None
                 if _all_algos is None:
@@ -6047,8 +6205,17 @@ def audit_exchange_sl(ctx):
                 _found_any = next((o for o in _all_algos if o.get("symbol") == symbol), None)
                 if _found_any:
                     t["exchange_sl_id"] = _found_any.get("algoId")
+                    _confirmed_found_any = _confirm_exchange_sl_from_order(
+                        t,
+                        _found_any,
+                        source="sl_audit_rebound",
+                        require_bot_id=True,
+                    )
                     save_open_trades(ctx.trades, ctx.state_file)
-                    print(f"[SL AUDIT] {symbol} stop rebound to algoId={t['exchange_sl_id']}")
+                    print(
+                        f"[SL AUDIT] {symbol} stop rebound to algoId={t['exchange_sl_id']}"
+                        f"{'' if _confirmed_found_any else ' (price confirmation pending)'}"
+                    )
                     send_telegram(
                         f"[SL AUDIT] {symbol} stop rebound to algoId={t['exchange_sl_id']}",
                         prefix=ctx.mode_prefix,
@@ -6177,6 +6344,11 @@ def audit_exchange_sl(ctx):
 
         if result.get("success"):
             t["exchange_sl_id"] = result.get("order_id")
+            _confirm_exchange_sl_from_result(
+                t,
+                result,
+                source="sl_audit_repair",
+            )
             save_open_trades(ctx.trades, ctx.state_file)
             print(f"[SL AUDIT] {symbol} Repair successful algoId={t['exchange_sl_id']}")
             send_telegram(
