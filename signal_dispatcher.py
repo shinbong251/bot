@@ -1098,6 +1098,263 @@ _BTC_SIDE_ENABLE_SHADOW_FIELDS = (
 )
 
 
+_BTC_M5_M15_DECOMP_VERSION = "btc_m5_m15_v2"
+_BTC_M5_M15_DECOMP_LOG = os.path.join("logs", "btc_m5_m15_decomposition_shadow_v2.jsonl")
+_BTC_M5_M15_DIR_ALIASES = {
+    "LONG": "LONG",
+    "BULLISH": "LONG",
+    "UP": "LONG",
+    "SHORT": "SHORT",
+    "BEARISH": "SHORT",
+    "DOWN": "SHORT",
+    "FLAT": "NEUTRAL",
+    "NEUTRAL": "NEUTRAL",
+    "NEUTRAL_OR_CHOP": "NEUTRAL",
+    "CHOP": "NEUTRAL",
+    "UNKNOWN": "NEUTRAL",
+    "": "NEUTRAL",
+}
+
+
+def _btc_m5_m15_normalize_direction(value):
+    """Normalize trade/BTC direction aliases for the V2 decomposition shadow."""
+    text = str(value or "").strip().upper()
+    return _BTC_M5_M15_DIR_ALIASES.get(text, "NEUTRAL")
+
+
+def _btc_m5_m15_safe_abs(value):
+    number = _safe_float(value)
+    return abs(number) if number is not None else None
+
+
+def _btc_m5_m15_relation(signal_dir, btc_dir, missing=False, stale=False):
+    if missing:
+        return "MISSING"
+    if stale:
+        return "STALE"
+    signal_dir = _btc_m5_m15_normalize_direction(signal_dir)
+    btc_dir = _btc_m5_m15_normalize_direction(btc_dir)
+    if btc_dir == "NEUTRAL" or signal_dir == "NEUTRAL":
+        return "NEUTRAL"
+    return "ALIGNED" if btc_dir == signal_dir else "OPPOSED"
+
+
+def _btc_m5_m15_primary_label(m5_relation, m15_relation):
+    if "MISSING" in (m5_relation, m15_relation):
+        return "CONTEXT_MISSING"
+    if "STALE" in (m5_relation, m15_relation):
+        return "CONTEXT_STALE"
+    if m5_relation == "ALIGNED" and m15_relation == "ALIGNED":
+        return "M5_M15_BOTH_ALIGNED"
+    if m5_relation == "ALIGNED" and m15_relation == "OPPOSED":
+        return "M5_ALIGNED_M15_OPPOSED"
+    if m5_relation == "OPPOSED" and m15_relation == "ALIGNED":
+        return "M5_OPPOSED_M15_ALIGNED"
+    if m5_relation == "OPPOSED" and m15_relation == "OPPOSED":
+        return "M5_M15_BOTH_OPPOSED"
+    if m5_relation == "ALIGNED" and m15_relation == "NEUTRAL":
+        return "M5_ALIGNED_M15_NEUTRAL"
+    if m5_relation == "NEUTRAL" and m15_relation == "ALIGNED":
+        return "M5_NEUTRAL_M15_ALIGNED"
+    if m5_relation == "OPPOSED" and m15_relation == "NEUTRAL":
+        return "M5_OPPOSED_M15_NEUTRAL"
+    if m5_relation == "NEUTRAL" and m15_relation == "OPPOSED":
+        return "M5_NEUTRAL_M15_OPPOSED"
+    return "M5_M15_NEUTRAL"
+
+
+def _btc_m5_m15_decomposition_eval(payload):
+    """Pure M5/M15 BTC decomposition evaluator. Reads only the input dict."""
+    payload = payload if isinstance(payload, dict) else {}
+    signal_dir = _btc_m5_m15_normalize_direction(payload.get("side"))
+    btc_m5_dir = _btc_m5_m15_normalize_direction(payload.get("btc_m5_direction"))
+    btc_m15_dir = _btc_m5_m15_normalize_direction(payload.get("btc_m15_direction"))
+    age = _safe_float(payload.get("btc_context_age_sec"))
+    max_age = _safe_float(payload.get("btc_context_max_age_sec"), _btc_mtf_max_age_sec())
+    stale = bool(age is not None and max_age is not None and age > max_age)
+    m5_missing = payload.get("btc_m5_direction") in (None, "") or str(
+        payload.get("btc_m5_direction") or ""
+    ).upper() == "UNKNOWN"
+    m15_missing = payload.get("btc_m15_direction") in (None, "") or str(
+        payload.get("btc_m15_direction") or ""
+    ).upper() == "UNKNOWN"
+    m5_relation = _btc_m5_m15_relation(signal_dir, btc_m5_dir, missing=m5_missing, stale=stale)
+    m15_relation = _btc_m5_m15_relation(signal_dir, btc_m15_dir, missing=m15_missing, stale=stale)
+    h1_relation = _btc_m5_m15_relation(
+        signal_dir,
+        _btc_m5_m15_normalize_direction(payload.get("btc_1h_direction")),
+        missing=payload.get("btc_1h_direction") in (None, ""),
+        stale=False,
+    )
+    return {
+        "btc_m5_direction": btc_m5_dir,
+        "btc_m15_direction": btc_m15_dir,
+        "btc_m5_relation": m5_relation,
+        "btc_m15_relation": m15_relation,
+        "btc_m5_m15_label": _btc_m5_m15_primary_label(m5_relation, m15_relation),
+        "btc_m5_abs_change_pct": _btc_m5_m15_safe_abs(payload.get("btc_m5_change_pct")),
+        "btc_m15_abs_change_pct": _btc_m5_m15_safe_abs(payload.get("btc_m15_change_pct")),
+        "btc_m15_slope_abs": _btc_m5_m15_safe_abs(payload.get("btc_m15_slope")),
+        "btc_m5_strong_move": None,
+        "btc_m15_strong_bias": None,
+        "btc_1h_relation": h1_relation,
+    }
+
+
+def _btc_m5_m15_decomposition_write(row):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(_BTC_M5_M15_DECOMP_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"[BTC M5/M15 DECOMPOSITION SHADOW V2] log failed: {exc}")
+
+
+def _btc_m5_m15_decomposition_shadow(
+    source,
+    execution_mode,
+    action,
+    reject_reason="",
+    side=None,
+    trade=None,
+    btc_ctx=None,
+    v3_summary=None,
+    v2b_fields=None,
+    opened_trade_id=None,
+    entry_type_override=None,
+    now_ts=None,
+    fetcher=None,
+):
+    """Append one BTC M5/M15 decomposition row. Return value is observational only."""
+    try:
+        source = source if isinstance(source, dict) else {}
+        trade = trade if isinstance(trade, dict) else {}
+        v2b_fields = v2b_fields if isinstance(v2b_fields, dict) else {}
+        v3_summary = v3_summary if isinstance(v3_summary, dict) else {}
+        now_ts = now_ts if now_ts is not None else time.time()
+        side = str(side or source.get("side") or trade.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return None
+        entry_type = str(
+            entry_type_override
+            or trade.get("entry_type")
+            or source.get("entry_type")
+            or ""
+        ).upper()
+        if entry_type not in ("CONFIRM", "CONFIRM_SMC_RESEARCH"):
+            return None
+        btc_ctx = btc_ctx if isinstance(btc_ctx, dict) else _btc_independent_context(
+            source,
+            side=side,
+            now_ts=now_ts,
+            fetcher=fetcher,
+        )
+        eval_input = {
+            "side": side,
+            "btc_m5_direction": btc_ctx.get("btc_5m_dir"),
+            "btc_m15_direction": btc_ctx.get("btc_15m_dir"),
+            "btc_1h_direction": btc_ctx.get("btc_1h_dir"),
+            "btc_m5_change_pct": btc_ctx.get("btc_5m_change_pct"),
+            "btc_m15_change_pct": btc_ctx.get("btc_15m_change_pct"),
+            "btc_m15_slope": btc_ctx.get("btc_slope_15m"),
+            "btc_context_age_sec": btc_ctx.get("btc_context_age_sec"),
+            "btc_context_max_age_sec": _btc_mtf_max_age_sec(),
+        }
+        decomp = _btc_m5_m15_decomposition_eval(eval_input)
+        row = {
+            "schema_version": _BTC_M5_M15_DECOMP_VERSION,
+            "logged_at": format_vn_time(now_ts),
+            "logged_at_unix": now_ts,
+            "decision_ts": now_ts,
+            "symbol": source.get("symbol") or trade.get("symbol"),
+            "side": side,
+            "entry_type": entry_type,
+            "signal_key": _first_nonblank(
+                source.get("signal_key"),
+                source.get("candidate_id"),
+                source.get("dedup_key"),
+                trade.get("signal_key"),
+                trade.get("candidate_id"),
+                trade.get("research_dedup_key"),
+                trade.get("dedup_key"),
+            ),
+            "candidate_id": _first_nonblank(source.get("candidate_id"), trade.get("candidate_id")),
+            "source_timestamp": _first_nonblank(
+                source.get("source_timestamp"),
+                source.get("source_row_time"),
+                source.get("timestamp"),
+                source.get("signal_created_ts"),
+                trade.get("signal_created_ts"),
+            ),
+            "execution_mode": execution_mode,
+            "action": action,
+            "reject_reason": reject_reason,
+            "opened_trade_id": _first_nonblank(
+                opened_trade_id,
+                source.get("opened_trade_id"),
+                trade.get("opened_trade_id"),
+                trade.get("id"),
+            ),
+            "entry": _first_nonblank(trade.get("entry"), trade.get("entry_real"), source.get("entry")),
+            "sl": _first_nonblank(trade.get("sl"), trade.get("sl_real"), source.get("sl")),
+            "planned_rr": _first_nonblank(
+                trade.get("planned_rr"),
+                trade.get("rr"),
+                source.get("planned_rr"),
+                source.get("rr"),
+            ),
+            "score": _first_nonblank(trade.get("score"), source.get("score")),
+            "score_v2": _first_nonblank(
+                source.get("score_v2"),
+                source.get("score_v2_current"),
+                v2b_fields.get("score_v2_current"),
+            ),
+            "score_v2_structural_shadow": _first_nonblank(
+                source.get("score_v2_structural_shadow"),
+                v2b_fields.get("score_v2_structural_shadow"),
+            ),
+            "btc_m5_candle_ts": btc_ctx.get("btc_context_source_ts"),
+            "btc_m5_direction": decomp.get("btc_m5_direction"),
+            "btc_m5_relation": decomp.get("btc_m5_relation"),
+            "btc_m5_change_pct": btc_ctx.get("btc_5m_change_pct"),
+            "btc_m5_freshness_secs": btc_ctx.get("btc_context_age_sec"),
+            "btc_m15_candle_ts": btc_ctx.get("btc_context_source_ts"),
+            "btc_m15_direction": decomp.get("btc_m15_direction"),
+            "btc_m15_relation": decomp.get("btc_m15_relation"),
+            "btc_m15_change_pct": btc_ctx.get("btc_15m_change_pct"),
+            "btc_m15_slope": btc_ctx.get("btc_slope_15m"),
+            "btc_m15_freshness_secs": btc_ctx.get("btc_context_age_sec"),
+            "btc_m5_m15_label": decomp.get("btc_m5_m15_label"),
+            "btc_1h_direction": _btc_m5_m15_normalize_direction(btc_ctx.get("btc_1h_dir")),
+            "btc_1h_change_pct": btc_ctx.get("btc_1h_change_pct"),
+            "btc_1h_relation": decomp.get("btc_1h_relation"),
+            "btc_m5_abs_change_pct": decomp.get("btc_m5_abs_change_pct"),
+            "btc_m15_abs_change_pct": decomp.get("btc_m15_abs_change_pct"),
+            "btc_m15_slope_abs": decomp.get("btc_m15_slope_abs"),
+            "btc_m5_strong_move": decomp.get("btc_m5_strong_move"),
+            "btc_m15_strong_bias": decomp.get("btc_m15_strong_bias"),
+            "existing_btc_alignment_label": btc_ctx.get("btc_alignment_independent"),
+            "existing_btc_bias_label": btc_ctx.get("btc_bias_independent"),
+            "btc_context_quality": btc_ctx.get("btc_context_quality"),
+            "btc_context_missing_fields": btc_ctx.get("btc_context_missing_fields"),
+            "v2b_label": v2b_fields.get("v2b_label") or source.get("v2b_label"),
+            "v2b_match": v2b_fields.get("v2b_match") or source.get("v2b_match"),
+            "v2b_reason": v2b_fields.get("v2b_reason") or source.get("v2b_reason"),
+            "smc_pa_v3_total_score": v3_summary.get("smc_pa_v3_total_score"),
+            "smc_pa_v3_score_band": v3_summary.get("smc_pa_v3_score_band"),
+            "smc_pa_v3_missing_components": v3_summary.get("smc_pa_v3_missing_components"),
+            "smc_pa_v3_version": v3_summary.get("smc_pa_v3_version"),
+        }
+        try:
+            _btc_m5_m15_decomposition_write(row)
+        except Exception as write_exc:
+            print(f"[BTC M5/M15 DECOMPOSITION SHADOW V2] log failed: {write_exc}")
+        return row
+    except Exception as exc:
+        print(f"[BTC M5/M15 DECOMPOSITION SHADOW V2] shadow failed: {exc}")
+        return None
+
+
 def _btc_bias_side_enable_eval(side, btc_ctx):
     """Pure side-enable classifier. INDEPENDENT BTC fields only; log-only.
 
@@ -3421,6 +3678,17 @@ def _paper_confirm_entry_context_snapshot(opened):
             if not _paper_confirm_context_resolved(row.get(field))
         ]
         row.update(_paper_confirm_pre_break_low_shadow_safe(row, opened))
+        _btc_m5_m15_decomposition_shadow(
+            opened,
+            execution_mode="paper",
+            action="OPEN",
+            reject_reason="",
+            side=opened.get("side"),
+            trade=opened,
+            opened_trade_id=opened.get("id"),
+            entry_type_override="CONFIRM",
+            now_ts=open_ts,
+        )
         _paper_confirm_entry_context_write(row)
         _paper_confirm_pre_break_low_shadow_snapshot(row)
     except Exception as exc:
@@ -6781,6 +7049,20 @@ def _paper_smc_research_qualified_decision_log(
             v3_summary=smc_pa_v3_summary,
             now_ts=now_ts,
         )
+        _btc_m5_m15_decomposition_shadow(
+            candidate,
+            execution_mode="paper",
+            action=decision,
+            reject_reason=reason,
+            side=candidate.get("side"),
+            trade=None,
+            btc_ctx=btc_instrumentation_row,
+            v3_summary=smc_pa_v3_summary,
+            v2b_fields=fields,
+            opened_trade_id=opened_trade_id,
+            entry_type_override="CONFIRM_SMC_RESEARCH",
+            now_ts=now_ts,
+        )
         with open(_paper_smc_research_qualified_log_path(), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, default=str, sort_keys=True) + "\n")
     except Exception as exc:
@@ -9004,7 +9286,7 @@ def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=Non
         os.makedirs("logs", exist_ok=True)
         with open(_LIVE_SMC_RESEARCH_DECISION_LOG, "a", encoding="utf-8") as _fh:
             _fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        _btc_alignment_instrumentation_shadow(
+        btc_instrumentation_row = _btc_alignment_instrumentation_shadow(
             btc_source,
             execution_mode="live",
             v1_decision=decision,
@@ -9013,6 +9295,19 @@ def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=Non
             trade=trade if isinstance(trade, dict) else None,
             gate_fields=btc_source,
             v2b_fields=btc_source,
+            now_ts=row.get("ts"),
+        )
+        _btc_m5_m15_decomposition_shadow(
+            btc_source,
+            execution_mode="live",
+            action=decision,
+            reject_reason=reason,
+            side=_first_nonblank(row.get("side"), btc_source.get("side")),
+            trade=trade if isinstance(trade, dict) else None,
+            btc_ctx=btc_instrumentation_row,
+            v3_summary=smc_pa_v3_summary,
+            v2b_fields=btc_source,
+            entry_type_override="CONFIRM_SMC_RESEARCH",
             now_ts=row.get("ts"),
         )
     except Exception as _log_ex:

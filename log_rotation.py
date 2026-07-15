@@ -14,6 +14,7 @@ ROTATION_TARGETS = [
     "qualified_latency_waterfall.jsonl",
     "paper_smc_main_gate_shadow.jsonl",
     "structural_context_samples.jsonl",
+    "btc_m5_m15_decomposition_shadow_v2.jsonl",
     "runtime_errors.log",
 ]
 
