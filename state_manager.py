@@ -289,8 +289,8 @@ def canary_config_status(config_path="config.json"):
             errors.append(f"unsupported_candidate_id:{candidate_id}")
         if max_open != 2:
             errors.append(f"canary_max_open_must_be_2:{max_open}")
-        if max_total != 50 or max_total <= 0:
-            errors.append(f"canary_max_total_trades_must_be_50:{max_total}")
+        if max_total not in (50, 75) or max_total <= 0:
+            errors.append(f"canary_max_total_trades_must_be_50_or_75:{max_total}")
         if not bool(cfg.get("live_smc_research_enabled", False)):
             errors.append("live_smc_research_enabled_false")
         if not bool(cfg.get("live_mode", False)):

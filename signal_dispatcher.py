@@ -8252,7 +8252,7 @@ def _live_research_bounded_canary_posture(ctx, live_status, freshness):
     if (
         status.get("candidate_id") != "INCUMBENT_LIVE_CONFIRM"
         or int(status.get("max_open") or -1) != 2
-        or int(status.get("max_total") or -1) != 50
+        or int(status.get("max_total") or -1) not in (50, 75)
         or float(status.get("max_cum_loss_r") or 0) != -8.0
         or int(status.get("max_consecutive_losses") or -1) != 5
     ):
