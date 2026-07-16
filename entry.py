@@ -8689,6 +8689,15 @@ def analyze(symbol, df_map):
     df4h = df_map.get("4h")
     df1d = df_map.get("1d")
 
+    # FOUR_PHASE_BREAKOUT_CONTEXT_SHADOW_V1 (log-only): per-symbol cycle
+    # state update from frames already in scope. Never gates, never
+    # mutates df_map/ctx, return ignored; any failure is swallowed.
+    try:
+        from four_phase_breakout_shadow import update_market_cycle_from_frames
+        update_market_cycle_from_frames(symbol, df1h, df5)
+    except Exception:
+        pass
+
     ctx = build_market_context(df15, df1h)
     allowed = select_mode(ctx["market_state"])
     if DEBUG:
