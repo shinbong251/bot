@@ -24,6 +24,7 @@ from state_manager import (
 )
 from notifier import send_entry, send_exit, send_tp_break, send_testnet_entry, send_live_entry, fmt_price, fmt_pnl, format_vn_time, engine_label, paper_engine_name, format_paper_smc_close
 from helper import check_correlation, check_signal_cooldown, dynamic_giveback, stats, compression_watchlist, signal_state
+from giveback_management_shadow import observe_giveback_trade, finalize_giveback_trade
 from telegram import send_telegram, send_telegram_gated
 import telegram_dedup
 import live_alert_throttle
@@ -68,6 +69,32 @@ _IMMEDIATELY_TRIGGERABLE_ALERT_TTL_SECS = 300.0
 _trade_mgmt_check_log_last = {}
 _trade_mgmt_freshness_state = {}
 _trade_mgmt_stuck_summary_last_ts = 0
+
+
+def _giveback_shadow_trade_snapshot(t, execution_mode):
+    snap = dict(t)
+    snap["execution_mode"] = execution_mode
+    return snap
+
+
+def _observe_giveback_shadow_safe(t, execution_mode, **kwargs):
+    try:
+        observe_giveback_trade(
+            _giveback_shadow_trade_snapshot(t, execution_mode),
+            **kwargs,
+        )
+    except Exception as exc:
+        print(f"[GIVEBACK SHADOW] observe failed {t.get('symbol', 'UNKNOWN')}: {type(exc).__name__}")
+
+
+def _finalize_giveback_shadow_safe(t, execution_mode, **kwargs):
+    try:
+        finalize_giveback_trade(
+            _giveback_shadow_trade_snapshot(t, execution_mode),
+            **kwargs,
+        )
+    except Exception as exc:
+        print(f"[GIVEBACK SHADOW] finalize failed {t.get('symbol', 'UNKNOWN')}: {type(exc).__name__}")
 _open_trade_data_refresh_last_ts = 0
 _paper_quality_router_context_by_symbol = {}
 _paper_quality_router_context_scan_id = None
@@ -4460,6 +4487,13 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
             ctx.stats["be"] = ctx.stats.get("be", 0) + 1
         t["stat_counted"] = True
 
+    _finalize_giveback_shadow_safe(
+        t,
+        getattr(ctx, "execution_mode", None),
+        close_ts=t.get("close_ts") or t.get("close_time"),
+        source=source,
+    )
+
     t["exchange_sl_id"] = None
     t["exchange_sl_sync_pending"] = None
     t["exchange_sl_price_confirmed"] = None
@@ -5707,6 +5741,15 @@ def open_trade(t, ctx=None):
                         for _nt in _trades:
                             normalize_trade_schema(_nt)
                         save_open_trades(_trades, _state_file)
+                    _observe_giveback_shadow_safe(
+                        t,
+                        _exec_mode,
+                        current_price=t.get("entry_real") or t.get("entry"),
+                        observation_ts=time.time(),
+                        actual_management_action="initial_stop_confirmed",
+                        actual_sl_price=t.get("sl"),
+                        source="live_accepted_open",
+                    )
                 if _exec_mode == "live":
                     send_live_entry(t, prefix=_mode_prefix, sl_synced=_sl_synced)
                 else:
@@ -8204,6 +8247,18 @@ def update_trades(fast_mode=False, ctx=None):
                     sl_before=_sl_before_updates,
                     reason="throttled_open_trade_check",
                 )
+
+            if _exec_mode == "live":
+                _giveback_action = "actual_sl_changed" if t.get("sl") != _sl_before_updates else None
+                _observe_giveback_shadow_safe(
+                    t,
+                    _exec_mode,
+                    current_price=p,
+                    observation_ts=time.time(),
+                    actual_management_action=_giveback_action,
+                    actual_sl_price=t.get("sl"),
+                    source="live_management_loop",
+                )
     
             # ===== CLOSE TRADE =====
             
@@ -8326,6 +8381,14 @@ def update_trades(fast_mode=False, ctx=None):
                             f"[LIVE CANARY] close accounting skipped {t.get('symbol')} "
                             f"reason={_canary_close_result.get('reason')}"
                         )
+
+                if _exec_mode == "live":
+                    _finalize_giveback_shadow_safe(
+                        t,
+                        _exec_mode,
+                        close_ts=t.get("close_ts") or t.get("close_time"),
+                        source="live_normal_close",
+                    )
                 
                 if t.get("partial_done") and t["status"] == "OPEN":
                     continue

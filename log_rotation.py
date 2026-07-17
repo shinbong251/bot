@@ -17,6 +17,8 @@ ROTATION_TARGETS = [
     "btc_m5_m15_decomposition_shadow_v2.jsonl",
     "four_phase_breakout_context_shadow_v1.jsonl",
     "smc_pa_score_v3_1_shadow.jsonl",
+    "giveback_management_shadow_v1.jsonl",
+    "giveback_management_close_shadow_v1.jsonl",
     "runtime_errors.log",
 ]
 
