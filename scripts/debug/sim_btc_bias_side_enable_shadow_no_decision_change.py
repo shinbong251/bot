@@ -16,7 +16,6 @@ BOTH shadow writers so nothing touches logs/. It verifies:
   I paper decision fields unchanged (side-enable fields purely additive)
   J live decision fields unchanged (side-enable fields purely additive)
   K PAPER_LOCATION_GATE inputs unchanged (read-only passthrough)
-  L V2B allowlist inputs unchanged (read-only passthrough)
   M SMC_PA_SCORE_V3 inputs unchanged (read-only passthrough, never computed here)
   N no execution/order module or network calls
 """
@@ -236,23 +235,6 @@ def main():
     _check("K location gate passthrough in side-enable log",
            _SIDE_ENABLE_CAPTURED[-1]["paper_location_gate_would_block"] is True
            and _SIDE_ENABLE_CAPTURED[-1]["smc_zone"] == "PREMIUM", _SIDE_ENABLE_CAPTURED[-1])
-
-    # L. V2B allowlist inputs unchanged (read-only passthrough).
-    v2b = {
-        "v2b_label": "CONFIRM_SMC_RESEARCH__DIRECTIONAL_BIAS_CONTEXT",
-        "v2b_match": True,
-        "v2b_reason": "shadow_reason",
-        "v2b_market_bias": "bearish",
-        "v2b_direction_alignment": "aligned",
-    }
-    v2b_before = dict(v2b)
-    r = _run("SHORT", "bear", v2b_fields=v2b)
-    _check("L v2b dict unmutated", v2b == v2b_before, v2b)
-    _check("L v2b passthrough in side-enable log",
-           _SIDE_ENABLE_CAPTURED[-1]["v2b_match"] is True
-           and _SIDE_ENABLE_CAPTURED[-1]["v2b_market_bias"] == "bearish"
-           and _SIDE_ENABLE_CAPTURED[-1]["shadow_label"] == "BTC_SIDE_ENABLE_ALLOW",
-           _SIDE_ENABLE_CAPTURED[-1])
 
     # M. SMC_PA_SCORE_V3 inputs unchanged: side-enable never computes/mutates V3;
     #    V3 fields are passed through read-only when a carrier holds them.

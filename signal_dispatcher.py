@@ -1337,9 +1337,6 @@ def _btc_m5_m15_decomposition_shadow(
             "existing_btc_bias_label": btc_ctx.get("btc_bias_independent"),
             "btc_context_quality": btc_ctx.get("btc_context_quality"),
             "btc_context_missing_fields": btc_ctx.get("btc_context_missing_fields"),
-            "v2b_label": v2b_fields.get("v2b_label") or source.get("v2b_label"),
-            "v2b_match": v2b_fields.get("v2b_match") or source.get("v2b_match"),
-            "v2b_reason": v2b_fields.get("v2b_reason") or source.get("v2b_reason"),
             "smc_pa_v3_total_score": v3_summary.get("smc_pa_v3_total_score"),
             "smc_pa_v3_score_band": v3_summary.get("smc_pa_v3_score_band"),
             "smc_pa_v3_missing_components": v3_summary.get("smc_pa_v3_missing_components"),
@@ -1498,11 +1495,6 @@ def _btc_alignment_instrumentation_shadow(
             "smc_zone": gate_fields.get("smc_zone"),
             "market_regime": gate_fields.get("market_regime"),
             # V2B allowlist context (if available at this call site)
-            "v2b_label": v2b_fields.get("v2b_label"),
-            "v2b_match": v2b_fields.get("v2b_match"),
-            "v2b_reason": v2b_fields.get("v2b_reason"),
-            "v2b_market_bias": v2b_fields.get("v2b_market_bias"),
-            "v2b_direction_alignment": v2b_fields.get("v2b_direction_alignment"),
         }
         row.update(btc_ctx)
 
@@ -1543,11 +1535,6 @@ def _btc_alignment_instrumentation_shadow(
                 "smc_zone": row.get("smc_zone"),
                 "market_regime": row.get("market_regime"),
                 # V2B allowlist context (read-only passthrough, if present)
-                "v2b_label": row.get("v2b_label"),
-                "v2b_match": row.get("v2b_match"),
-                "v2b_reason": row.get("v2b_reason"),
-                "v2b_market_bias": row.get("v2b_market_bias"),
-                "v2b_direction_alignment": row.get("v2b_direction_alignment"),
                 # SMC_PA_SCORE_V3 context (read-only passthrough, if available).
                 # Sourced from whichever carrier holds it; None when the V3
                 # summary has not been merged at this call site. Never computed
@@ -2616,23 +2603,6 @@ def _paper_smc_research_entry_context_snapshot(
                 now_ts=decision_ts,
             )
             entry_context.update({
-                "v2_subgroup": _json_safe_copy(qualified_fields.get("v2_subgroup")),
-                "v2_subgroup_match": bool(qualified_fields.get("v2_subgroup_match")),
-                "v2_reason": _json_safe_copy(qualified_fields.get("v2_reason")),
-                "v2b_label": _json_safe_copy(qualified_fields.get("v2b_label")),
-                "v2b_class": _json_safe_copy(qualified_fields.get("v2b_class")),
-                "v2b_match": bool(qualified_fields.get("v2b_match")),
-                "v2b_reason": _json_safe_copy(qualified_fields.get("v2b_reason")),
-                "v2b_market_bias": _json_safe_copy(qualified_fields.get("v2b_market_bias")),
-                "v2b_direction_alignment": _json_safe_copy(
-                    qualified_fields.get("v2b_direction_alignment")
-                ),
-                "v2b_counter_bias_candidate": bool(
-                    qualified_fields.get("v2b_counter_bias_candidate")
-                ),
-                "v2b_counter_bias_reasons": _json_safe_copy(
-                    qualified_fields.get("v2b_counter_bias_reasons") or []
-                ),
                 "market_regime": _json_safe_copy(qualified_fields.get("market_regime")),
                 "side": _json_safe_copy(candidate.get("side")),
                 "confirm_smc_entry_location_would_block": _json_safe_copy(
@@ -3212,14 +3182,6 @@ def _paper_smc_research_entry_acceptance_shadow_snapshot(opened, qualified_field
             "research_epoch": _meta("research_epoch"),
             "research_cap_target": _meta("research_cap_target"),
             "research_is_post_50": bool(opened.get("research_is_post_50")),
-            "v2_subgroup": _meta("v2_subgroup"),
-            "v2_subgroup_match": (
-                bool(qf.get("v2_subgroup_match")) if "v2_subgroup_match" in qf else None
-            ),
-            "v2_reason": _meta("v2_reason"),
-            "v2b_class": _meta("v2b_class"),
-            "v2b_market_bias": _meta("v2b_market_bias"),
-            "v2b_direction_alignment": _meta("v2b_direction_alignment"),
         }
         research_max_open_target = _meta("research_max_open_target")
         if research_max_open_target is not None:
@@ -3647,9 +3609,6 @@ def _paper_confirm_entry_context_snapshot(opened):
             "entry_location_risk_reasons": _json_safe_copy(
                 qualified_fields.get("confirm_smc_entry_location_risk_reasons") or []
             ),
-            "v2b_market_bias": qualified_fields.get("v2b_market_bias"),
-            "v2b_direction_alignment": qualified_fields.get("v2b_direction_alignment"),
-            "v2b_class": qualified_fields.get("v2b_class"),
         }
         row.update({key: _json_safe_copy(value) for key, value in btc_context.items()})
         coverage_fields = (
@@ -4734,556 +4693,6 @@ def _paper_smc_research_location_gate_blocks(fields):
     )
 
 
-SMC_ENTRY_V2_SHADOW_VERSION = "v0.1_shadow"
-SMC_ENTRY_V2_SHADOW_LOG = os.path.join("logs", "smc_entry_v2_shadow.jsonl")
-SMC_ENTRY_V2B_ALLOWLIST_VERSION = "v0.1_shadow"
-SMC_ENTRY_V2B_ALLOWLIST_LABEL = "SHORT_EXTENDED_SCORE_2_3"
-SMC_ENTRY_V2B_ALLOWLIST_V02_LABEL = "PRE_BREAK_LOW_CHOP_RANGE_SCORE_2_3"
-SMC_ENTRY_V2B_ALLOWLIST_LOG = os.path.join("logs", "smc_entry_v2b_allowlist_shadow.jsonl")
-
-
-def _smc_entry_v2_text(value):
-    if value is None:
-        return ""
-    return str(value).strip().upper()
-
-
-def _smc_entry_v2_float(value):
-    return _paper_smc_research_float(value)
-
-
-def _smc_entry_v2b_score_bucket(value):
-    score = _smc_entry_v2_float(value)
-    if score is None:
-        return "SCORE_UNKNOWN"
-    if score < 1:
-        return "SCORE_LT_1"
-    if score < 2:
-        return "SCORE_1_2"
-    if score < 4:
-        return "SCORE_2_3"
-    return "SCORE_GTE_4"
-
-
-def _smc_entry_v2b_decision_score(fields):
-    fields = fields if isinstance(fields, dict) else {}
-    source = "fields.score_v2_structural_shadow"
-    return source, _smc_entry_v2_float(fields.get("score_v2_structural_shadow"))
-
-
-def _smc_entry_v2b_v02_regime_match(regime, timing_risk_class):
-    regime = _smc_entry_v2_text(regime)
-    timing_risk_class = _smc_entry_v2_text(timing_risk_class)
-    return (
-        timing_risk_class == "CHOP_OR_RANGE_ENTRY"
-        or regime in {
-            "CHOP_NO_TRADE",
-            "RANGE_ENTRY",
-            "RANGE_MEAN_REVERSION",
-            "CHOP_OR_RANGE_ENTRY",
-        }
-    )
-
-
-def _smc_entry_v2b_recompute_mismatch_reason(shadow):
-    if not isinstance(shadow, dict):
-        return "shadow_not_dict"
-    mismatches = []
-    if shadow.get("v0.1_match") != shadow.get("v2b_v01_recomputed_match"):
-        mismatches.append("v0.1_match")
-    if shadow.get("v0.2_match") != shadow.get("v2b_v02_recomputed_match"):
-        mismatches.append("v0.2_match")
-    return "NONE" if not mismatches else ",".join(mismatches)
-
-
-def _smc_entry_v2b_feature_quality(candidate, fields):
-    candidate = candidate if isinstance(candidate, dict) else {}
-    fields = fields if isinstance(fields, dict) else {}
-    exact_keys = (
-        "premium_discount",
-        "dow_trend_context",
-        "poi_type",
-        "poi_location_quality",
-        "entry_poi_alignment",
-        "liquidity_context",
-    )
-    for key in exact_keys:
-        value = _smc_entry_v2_text(_first_nonblank(candidate.get(key), fields.get(key)))
-        if value not in {"", "UNKNOWN", "NONE"}:
-            return "EXACT_FEATURES"
-    return "COARSE_PROXY"
-
-
-def _smc_entry_v2b_allowlist_shadow(candidate, fields=None, trade=None, mode="SHADOW_ONLY"):
-    candidate = candidate if isinstance(candidate, dict) else {}
-    trade = trade if isinstance(trade, dict) else {}
-    fields = fields if isinstance(fields, dict) else _paper_smc_research_qualified_fields(candidate)
-    side = _smc_entry_v2_text(_first_nonblank(candidate.get("side"), trade.get("side")))
-    score_source, score = _smc_entry_v2b_decision_score(fields)
-    score_bucket = _smc_entry_v2b_score_bucket(score)
-    exhaustion = _smc_entry_v2_text(
-        _first_nonblank(
-            fields.get("exhaustion"),
-            fields.get("exhaustion_state"),
-            candidate.get("exhaustion"),
-            candidate.get("exhaustion_state"),
-            candidate.get("exhaustion_cls"),
-            trade.get("exhaustion"),
-        )
-    )
-    entry_location = _smc_entry_v2_text(fields.get("phase"))
-    entry_location_source = "fields.phase"
-    regime = _smc_entry_v2_text(fields.get("market_regime"))
-    timing_risk_class = _smc_entry_v2_text(fields.get("research_entry_timing_risk_class"))
-    if timing_risk_class == "CHOP_OR_RANGE_ENTRY":
-        regime_source = "fields.research_entry_timing_risk_class"
-    else:
-        regime_source = "fields.market_regime"
-    match = side == "SHORT" and exhaustion == "EXTENDED" and score_bucket == "SCORE_2_3"
-    if match:
-        reason = "side=SHORT;exhaustion=EXTENDED;score_bucket=SCORE_2_3"
-    else:
-        misses = []
-        if side != "SHORT":
-            misses.append(f"side={side or 'UNKNOWN'}")
-        if exhaustion != "EXTENDED":
-            misses.append(f"exhaustion={exhaustion or 'UNKNOWN'}")
-        if score_bucket != "SCORE_2_3":
-            misses.append(f"score_bucket={score_bucket}")
-        reason = "not_allowlisted:" + ";".join(misses)
-    v02_match = (
-        entry_location == "PRE_BREAK_LOW"
-        and _smc_entry_v2b_v02_regime_match(regime, timing_risk_class)
-        and score_bucket == "SCORE_2_3"
-    )
-    if v02_match:
-        v02_reason = "entry_location=PRE_BREAK_LOW;regime=CHOP_OR_RANGE_ENTRY;score_bucket=SCORE_2_3"
-    else:
-        v02_misses = []
-        if entry_location != "PRE_BREAK_LOW":
-            v02_misses.append(f"entry_location={entry_location or 'UNKNOWN'}")
-        if not _smc_entry_v2b_v02_regime_match(regime, timing_risk_class):
-            v02_misses.append(
-                f"regime={regime or 'UNKNOWN'};timing_risk_class={timing_risk_class or 'UNKNOWN'}"
-            )
-        if score_bucket != "SCORE_2_3":
-            v02_misses.append(f"score_bucket={score_bucket}")
-        v02_reason = "not_allowlisted:" + ";".join(v02_misses)
-    v01_recomputed_match = side == "SHORT" and exhaustion == "EXTENDED" and score_bucket == "SCORE_2_3"
-    v02_recomputed_match = (
-        entry_location == "PRE_BREAK_LOW"
-        and _smc_entry_v2b_v02_regime_match(regime, timing_risk_class)
-        and score_bucket == "SCORE_2_3"
-    )
-    recompute_match = bool(match) == bool(v01_recomputed_match) and bool(v02_match) == bool(v02_recomputed_match)
-    recompute_mismatch_reason = "NONE" if recompute_match else _smc_entry_v2b_recompute_mismatch_reason({
-        "v0.1_match": bool(match),
-        "v0.2_match": bool(v02_match),
-        "v2b_v01_recomputed_match": bool(v01_recomputed_match),
-        "v2b_v02_recomputed_match": bool(v02_recomputed_match),
-    })
-    return {
-        "smc_entry_v2b_allowlist_label": SMC_ENTRY_V2B_ALLOWLIST_LABEL,
-        "smc_entry_v2b_allowlist_match": bool(match),
-        "smc_entry_v2b_allowlist_reason": reason,
-        "smc_entry_v2b_allowlist_version": SMC_ENTRY_V2B_ALLOWLIST_VERSION,
-        "smc_entry_v2b_v02_label": SMC_ENTRY_V2B_ALLOWLIST_V02_LABEL,
-        "smc_entry_v2b_v02_match": bool(v02_match),
-        "smc_entry_v2b_v02_reason": v02_reason,
-        "smc_entry_v2b_v02_version": "v0.2_shadow",
-        "v0.1_match": bool(match),
-        "v0.2_match": bool(v02_match),
-        "smc_entry_v2b_score_bucket": score_bucket,
-        "smc_entry_v2b_score": score,
-        "v2b_score_source": score_source,
-        "v2b_score_value": score,
-        "v2b_score_bucket": score_bucket,
-        "v2b_entry_location": entry_location,
-        "v2b_entry_location_source": entry_location_source,
-        "v2b_regime": regime,
-        "v2b_timing_risk_class": timing_risk_class,
-        "v2b_regime_source": regime_source,
-        "v2b_exhaustion": exhaustion,
-        "v2b_side": side,
-        "v2b_v01_recomputed_match": bool(v01_recomputed_match),
-        "v2b_v02_recomputed_match": bool(v02_recomputed_match),
-        "v2b_recompute_match": recompute_match,
-        "v2b_recompute_mismatch_reason": recompute_mismatch_reason,
-        "smc_entry_v2b_feature_quality": _smc_entry_v2b_feature_quality(candidate, fields),
-        "smc_entry_v2b_forward_mode": mode,
-    }
-
-
-def _smc_entry_v2b_allowlist_shadow_write(
-    candidate,
-    fields,
-    shadow,
-    execution_mode="shadow_context",
-    v1_decision="",
-    v1_reason="",
-    trade=None,
-    now_ts=None,
-    opened_trade_id=None,
-):
-    try:
-        candidate = candidate if isinstance(candidate, dict) else {}
-        fields = fields if isinstance(fields, dict) else {}
-        shadow = shadow if isinstance(shadow, dict) else {}
-        trade = trade if isinstance(trade, dict) else {}
-        now_ts = time.time() if now_ts is None else now_ts
-        row = {
-            "ts": now_ts,
-            "symbol": candidate.get("symbol") or trade.get("symbol"),
-            "side": candidate.get("side") or trade.get("side"),
-            "lane": _first_nonblank(
-                candidate.get("lane"),
-                candidate.get("entry_type"),
-                trade.get("lane"),
-                trade.get("entry_type"),
-                "CONFIRM_SMC_RESEARCH",
-            ),
-            "signal_ts": _first_nonblank(
-                candidate.get("signal_created_ts"),
-                candidate.get("source_timestamp"),
-                candidate.get("collector_ts"),
-                candidate.get("timestamp"),
-                trade.get("signal_created_ts"),
-            ),
-            "dedup_key": candidate.get("dedup_key") or trade.get("research_dedup_key"),
-            "execution_mode": execution_mode,
-            "opened_trade_id": _first_nonblank(
-                opened_trade_id,
-                candidate.get("opened_trade_id"),
-                trade.get("opened_trade_id"),
-                trade.get("id"),
-            ),
-            "v1_decision": v1_decision,
-            "v1_reason": v1_reason,
-            "score": shadow.get("smc_entry_v2b_score"),
-            "score_bucket": shadow.get("smc_entry_v2b_score_bucket"),
-            "v2b_score_source": shadow.get("v2b_score_source"),
-            "v2b_score_value": shadow.get("v2b_score_value"),
-            "v2b_score_bucket": shadow.get("v2b_score_bucket"),
-            "exhaustion": _first_nonblank(
-                fields.get("exhaustion"),
-                fields.get("exhaustion_state"),
-                candidate.get("exhaustion"),
-                candidate.get("exhaustion_state"),
-                candidate.get("exhaustion_cls"),
-                trade.get("exhaustion"),
-            ),
-            "smc_zone": fields.get("smc_zone"),
-            "market_regime": fields.get("market_regime"),
-            "v2b_regime": shadow.get("v2b_regime"),
-            "v2b_timing_risk_class": shadow.get("v2b_timing_risk_class"),
-            "v2b_regime_source": shadow.get("v2b_regime_source"),
-            "bos_quality": fields.get("bos_quality"),
-            "phase": fields.get("phase"),
-            "entry_location": shadow.get("v2b_entry_location"),
-            "v2b_entry_location": shadow.get("v2b_entry_location"),
-            "v2b_entry_location_source": shadow.get("v2b_entry_location_source"),
-            "rr": _first_nonblank(fields.get("planned_rr"), candidate.get("rr"), trade.get("rr")),
-            "entry": _first_nonblank(candidate.get("entry"), trade.get("entry")),
-            "sl": _first_nonblank(candidate.get("sl"), trade.get("sl")),
-            "tp": _first_nonblank(candidate.get("tp"), trade.get("tp")),
-            "allowlist_match": shadow.get("smc_entry_v2b_allowlist_match"),
-            "allowlist_reason": shadow.get("smc_entry_v2b_allowlist_reason"),
-            "feature_quality": shadow.get("smc_entry_v2b_feature_quality"),
-            "smc_entry_v2b_allowlist_label": shadow.get("smc_entry_v2b_allowlist_label"),
-            "smc_entry_v2b_allowlist_version": shadow.get("smc_entry_v2b_allowlist_version"),
-            "smc_entry_v2b_v02_label": shadow.get("smc_entry_v2b_v02_label"),
-            "smc_entry_v2b_v02_match": shadow.get("smc_entry_v2b_v02_match"),
-            "smc_entry_v2b_v02_reason": shadow.get("smc_entry_v2b_v02_reason"),
-            "smc_entry_v2b_v02_version": shadow.get("smc_entry_v2b_v02_version"),
-            "v0.1_match": shadow.get("v0.1_match"),
-            "v0.2_match": shadow.get("v0.2_match"),
-            "v2b_recompute_match": shadow.get("v2b_recompute_match"),
-            "v2b_recompute_mismatch_reason": shadow.get("v2b_recompute_mismatch_reason"),
-            "smc_entry_v2b_forward_mode": shadow.get("smc_entry_v2b_forward_mode"),
-        }
-        os.makedirs("logs", exist_ok=True)
-        with open(SMC_ENTRY_V2B_ALLOWLIST_LOG, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True) + "\n")
-    except Exception as exc:
-        print(f"[SMC_ENTRY_V2B_ALLOWLIST_SHADOW] log failed: {exc}")
-
-
-def _smc_entry_v2_expected_rr(side, entry, sl, tp):
-    if entry is None or sl is None or tp is None:
-        return None
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return None
-    if side == "LONG":
-        reward = tp - entry
-    elif side == "SHORT":
-        reward = entry - tp
-    else:
-        return None
-    if reward <= 0:
-        return None
-    return round(reward / risk, 4)
-
-
-def _smc_entry_v2_fallback_shadow(candidate, fields, now_ts=None):
-    try:
-        return _paper_smc_research_entry_fallback_shadow_safe(
-            candidate,
-            fields=fields,
-            now_ts=now_ts,
-        )
-    except Exception:
-        return {}
-
-
-def _smc_entry_v2_shadow(candidate, fields=None, v1_decision="", v1_reason="", trade=None, now_ts=None):
-    candidate = candidate if isinstance(candidate, dict) else {}
-    trade = trade if isinstance(trade, dict) else {}
-    fields = fields if isinstance(fields, dict) else _paper_smc_research_qualified_fields(candidate)
-    now_ts = time.time() if now_ts is None else now_ts
-    fallback = _smc_entry_v2_fallback_shadow(candidate, fields, now_ts=now_ts)
-
-    side = _smc_entry_v2_text(_first_nonblank(candidate.get("side"), trade.get("side")))
-    entry = _smc_entry_v2_float(_first_nonblank(candidate.get("entry"), trade.get("entry")))
-    sl = _smc_entry_v2_float(_first_nonblank(candidate.get("sl"), trade.get("sl")))
-    tp = _smc_entry_v2_float(_first_nonblank(candidate.get("tp"), trade.get("tp")))
-    rr = _smc_entry_v2_float(
-        _first_nonblank(fields.get("planned_rr"), candidate.get("rr"), trade.get("rr"))
-    )
-    expected_rr = rr if rr is not None else _smc_entry_v2_expected_rr(side, entry, sl, tp)
-
-    smc_zone = _smc_entry_v2_text(fields.get("smc_zone"))
-    market_regime = _smc_entry_v2_text(fields.get("market_regime"))
-    bos_quality = _smc_entry_v2_text(fields.get("bos_quality"))
-    exhaustion = _smc_entry_v2_text(fields.get("exhaustion"))
-    phase = _smc_entry_v2_text(fields.get("phase"))
-    range_context = _smc_entry_v2_text(fields.get("range_context"))
-    liquidity_sweep = _smc_entry_v2_text(fields.get("liquidity_sweep"))
-    risk_class = _smc_entry_v2_text(fallback.get("research_entry_timing_risk_class"))
-    fallback_reason = fallback.get("research_fallback_reason")
-    stale_signal = bool(
-        isinstance(fallback.get("research_entry_timing_components"), dict)
-        and fallback["research_entry_timing_components"].get("stale_signal")
-    )
-
-    exact_keys = (
-        "premium_discount",
-        "dow_trend_context",
-        "poi_type",
-        "poi_location_quality",
-        "entry_poi_alignment",
-        "liquidity_context",
-    )
-    exact_feature_seen = any(
-        _smc_entry_v2_text(_first_nonblank(candidate.get(key), fields.get(key)))
-        not in {"", "UNKNOWN", "NONE"}
-        for key in exact_keys
-    )
-    feature_quality = "EXACT_FEATURES" if exact_feature_seen else "COARSE_PROXY"
-
-    missing_core = []
-    for key, value in (
-        ("side", side),
-        ("entry", entry),
-        ("sl", sl),
-        ("tp", tp),
-        ("rr", expected_rr),
-    ):
-        if value in (None, ""):
-            missing_core.append(key)
-
-    location_score = 0
-    location_reasons = []
-    if side == "LONG":
-        if smc_zone == "DISCOUNT" or range_context == "RANGE_LOW":
-            location_score += 2
-            location_reasons.append("long_favorable_discount_or_low")
-        if smc_zone == "PREMIUM":
-            location_score -= 3
-            location_reasons.append("long_in_premium")
-        if liquidity_sweep == "SWEEP_LOW":
-            location_score += 1
-            location_reasons.append("long_sweep_low_reclaim_proxy")
-        if liquidity_sweep == "SWEEP_HIGH":
-            location_score -= 1
-            location_reasons.append("long_into_sweep_high_proxy")
-    elif side == "SHORT":
-        if smc_zone == "PREMIUM" or range_context == "RANGE_HIGH":
-            location_score += 2
-            location_reasons.append("short_favorable_premium_or_high")
-        if smc_zone == "DISCOUNT":
-            location_score -= 3
-            location_reasons.append("short_in_discount")
-        if liquidity_sweep == "SWEEP_HIGH":
-            location_score += 1
-            location_reasons.append("short_sweep_high_rejection_proxy")
-        if liquidity_sweep == "SWEEP_LOW":
-            location_score -= 1
-            location_reasons.append("short_into_sweep_low_proxy")
-    else:
-        location_reasons.append("missing_side")
-
-    retest_tokens = ("RETEST", "PULLBACK", "PRE_BREAK", "PREBREAK", "ACCEPT", "RECLAIM")
-    has_retest_proxy = any(token in phase for token in retest_tokens) or risk_class == "PRE_BREAK_ANTICIPATION"
-    if has_retest_proxy:
-        location_score += 1
-        location_reasons.append("retest_or_location_proxy")
-
-    late_chase_score = 0
-    late_reasons = []
-    if market_regime == "CHOP_NO_TRADE":
-        late_chase_score += 3
-        late_reasons.append("chop_no_trade")
-    if market_regime == "EXHAUSTION_REVERSAL":
-        late_chase_score += 3
-        late_reasons.append("exhaustion_reversal")
-    if exhaustion not in ("", "UNKNOWN", "HEALTHY", "NONE", "NO", "FALSE"):
-        late_chase_score += 2
-        late_reasons.append(f"exhaustion={exhaustion}")
-    if bos_quality in {"NO_FOLLOWTHROUGH", "TRAP"}:
-        late_chase_score += 2
-        late_reasons.append(f"bos_quality={bos_quality}")
-    if risk_class in {"BAD_REGIME_ENTRY", "CHOP_OR_RANGE_ENTRY", "STALE_SIGNAL_ENTRY", "NO_FOLLOWTHROUGH_RISK"}:
-        late_chase_score += 2
-        late_reasons.append(f"risk_class={risk_class}")
-    if stale_signal:
-        late_chase_score += 2
-        late_reasons.append("stale_signal")
-
-    structure_score = 0
-    structure_reasons = []
-    if not missing_core:
-        if side == "LONG" and sl < entry < tp:
-            structure_score += 1
-            structure_reasons.append("long_geometry_valid")
-        elif side == "SHORT" and tp < entry < sl:
-            structure_score += 1
-            structure_reasons.append("short_geometry_valid")
-        else:
-            structure_score -= 2
-            structure_reasons.append("invalid_v1_geometry")
-    else:
-        structure_reasons.append(f"missing_core={','.join(missing_core)}")
-    if expected_rr is not None and expected_rr >= 2.0:
-        structure_score += 1
-        structure_reasons.append("rr_ge_2")
-    elif expected_rr is not None:
-        structure_score -= 1
-        structure_reasons.append("rr_below_2")
-
-    if missing_core:
-        status = "UNKNOWN_MISSING_FEATURES"
-        reason = f"missing_core_features={','.join(missing_core)}"
-        compared = "NOT_COMPUTABLE"
-    elif market_regime == "CHOP_NO_TRADE":
-        status = "WOULD_SKIP_CHOP"
-        reason = "market_regime=CHOP_NO_TRADE"
-        compared = "BETTER_LOCATION"
-    elif market_regime == "EXHAUSTION_REVERSAL":
-        status = "WOULD_SKIP_EXHAUSTION"
-        reason = "market_regime=EXHAUSTION_REVERSAL"
-        compared = "BETTER_LOCATION"
-    elif side == "LONG" and smc_zone == "PREMIUM" and late_chase_score >= 2:
-        status = "WOULD_SKIP_BAD_LOCATION"
-        reason = "long_in_premium_with_late_or_weak_context"
-        compared = "BETTER_LOCATION"
-    elif side == "SHORT" and smc_zone == "DISCOUNT" and late_chase_score >= 2:
-        status = "WOULD_SKIP_BAD_LOCATION"
-        reason = "short_in_discount_with_late_or_weak_context"
-        compared = "BETTER_LOCATION"
-    elif late_chase_score >= 4:
-        status = "WOULD_SKIP_LATE_CHASE"
-        reason = ";".join(late_reasons) or "late_chase_proxy"
-        compared = "BETTER_LOCATION"
-    elif structure_score < 1:
-        status = "WOULD_SKIP_NO_STRUCTURE_SL"
-        reason = ";".join(structure_reasons) or "structure_proxy_failed"
-        compared = "NOT_COMPUTABLE"
-    elif expected_rr is None or expected_rr < 2.0:
-        status = "WOULD_SKIP_RR"
-        reason = f"expected_rr={expected_rr}"
-        compared = "NOT_COMPUTABLE"
-    elif location_score >= 2 and has_retest_proxy:
-        status = "WOULD_ENTER"
-        reason = ";".join(location_reasons + structure_reasons)
-        compared = "BETTER_LOCATION" if location_score > 0 else "SAME"
-    else:
-        status = "WAIT_RETEST"
-        reason = "needs_retest_or_location_confirmation"
-        compared = "SAME" if location_score >= 0 else "BETTER_LOCATION"
-
-    return {
-        "smc_entry_v2_shadow_version": SMC_ENTRY_V2_SHADOW_VERSION,
-        "v2_shadow_status": status,
-        "v2_shadow_reason": reason,
-        "v2_location_score": location_score,
-        "v2_late_chase_score": late_chase_score,
-        "v2_structure_score": structure_score,
-        "v2_expected_entry": entry,
-        "v2_structural_sl": sl,
-        "v2_expected_rr": expected_rr,
-        "v2_compared_to_v1": compared,
-        "v2_feature_quality": feature_quality,
-        "v2_location_reasons": location_reasons,
-        "v2_late_chase_reasons": late_reasons,
-        "v2_structure_reasons": structure_reasons,
-        "v1_decision": v1_decision,
-        "v1_reason": v1_reason,
-        "v1_entry": entry,
-        "v1_sl": sl,
-        "v1_rr": rr,
-        "smc_zone": fields.get("smc_zone"),
-        "market_regime": fields.get("market_regime"),
-        "bos_quality": fields.get("bos_quality"),
-        "exhaustion": fields.get("exhaustion"),
-        "research_entry_timing_risk_class": fallback.get("research_entry_timing_risk_class"),
-        "research_fallback_reason": fallback_reason,
-    }
-
-
-def _smc_entry_v2_shadow_write(candidate, fields, shadow, v1_decision="", v1_reason="", now_ts=None):
-    try:
-        candidate = candidate if isinstance(candidate, dict) else {}
-        fields = fields if isinstance(fields, dict) else {}
-        shadow = shadow if isinstance(shadow, dict) else {}
-        now_ts = time.time() if now_ts is None else now_ts
-        row = {
-            "ts": now_ts,
-            "symbol": candidate.get("symbol"),
-            "side": candidate.get("side"),
-            "signal_ts": _first_nonblank(
-                candidate.get("signal_created_ts"),
-                candidate.get("source_timestamp"),
-                candidate.get("collector_ts"),
-                candidate.get("timestamp"),
-            ),
-            "v1_decision": v1_decision,
-            "v1_reason": v1_reason,
-            "v1_entry": shadow.get("v1_entry"),
-            "v1_sl": shadow.get("v1_sl"),
-            "v1_rr": shadow.get("v1_rr"),
-            "smc_zone": fields.get("smc_zone"),
-            "market_regime": fields.get("market_regime"),
-            "bos_quality": fields.get("bos_quality"),
-            "exhaustion": fields.get("exhaustion"),
-            "v2_shadow_status": shadow.get("v2_shadow_status"),
-            "v2_shadow_reason": shadow.get("v2_shadow_reason"),
-            "v2_location_score": shadow.get("v2_location_score"),
-            "v2_late_chase_score": shadow.get("v2_late_chase_score"),
-            "v2_structure_score": shadow.get("v2_structure_score"),
-            "v2_expected_entry": shadow.get("v2_expected_entry"),
-            "v2_structural_sl": shadow.get("v2_structural_sl"),
-            "v2_expected_rr": shadow.get("v2_expected_rr"),
-            "v2_compared_to_v1": shadow.get("v2_compared_to_v1"),
-            "v2_feature_quality": shadow.get("v2_feature_quality"),
-        }
-        os.makedirs("logs", exist_ok=True)
-        with open(SMC_ENTRY_V2_SHADOW_LOG, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_json_safe_copy(row), ensure_ascii=False, default=str, sort_keys=True) + "\n")
-    except Exception as exc:
-        print(f"[SMC_ENTRY_V2_SHADOW] log failed: {exc}")
-
-
 # =====================================================================
 # SMC_PA_SCORE_V3_SHADOW (SHADOW / LOG-ONLY)
 # ---------------------------------------------------------------------
@@ -5856,12 +5265,6 @@ def _smc_pa_score_v3_shadow(
             "paper_location_gate_risk_bucket": source.get(
                 "confirm_smc_entry_location_risk_bucket"
             ),
-            # V2B allowlist context (read-only passthrough, if available)
-            "v2b_label": source.get("v2b_label"),
-            "v2b_match": source.get("v2b_match"),
-            "v2b_reason": source.get("v2b_reason"),
-            "v2b_market_bias": source.get("v2b_market_bias"),
-            "v2b_direction_alignment": source.get("v2b_direction_alignment"),
             # BTC bias side-enable context (read-only passthrough, if available)
             "btc_side_enable_shadow_label": btc_ctx.get("btc_side_enable_shadow_label"),
             "btc_side_enable_shadow_allow": btc_ctx.get("btc_side_enable_shadow_allow"),
@@ -6259,10 +5662,6 @@ def _breakout_acceptance_shadow(
             "paper_location_gate_risk_bucket": source.get(
                 "confirm_smc_entry_location_risk_bucket"
             ),
-            # V2B allowlist context (read-only passthrough, if available)
-            "v2b_label": source.get("v2b_label"),
-            "v2b_match": source.get("v2b_match"),
-            "v2b_reason": source.get("v2b_reason"),
             # Runtime N-bar lifecycle is not tracked in production paths;
             # the audit script reconstructs it offline.
             "lifecycle_tracking": "MISSING_RUNTIME_DEFERRED_TO_AUDIT",
@@ -6302,36 +5701,6 @@ def _paper_smc_research_qualified_opened_total():
     return total
 
 
-_CONFIRM_SMC_RESEARCH_V2_SUBGROUP = "CONFIRM_SMC_RESEARCH__SHORT_TREND_ALIGNED"
-_CONFIRM_SMC_RESEARCH_V2_BAD_REGIMES = {
-    "CHOP_NO_TRADE",
-    "RANGE_MEAN_REVERSION",
-    "EXHAUSTION_REVERSAL",
-}
-
-_CONFIRM_SMC_RESEARCH_V2B_LABEL = "CONFIRM_SMC_RESEARCH__DIRECTIONAL_BIAS_CONTEXT"
-_CONFIRM_SMC_RESEARCH_V2B_BAD_REGIMES = {
-    "CHOP_NO_TRADE",
-    "RANGE_MEAN_REVERSION",
-}
-_CONFIRM_SMC_RESEARCH_V2B_BULLISH_TOKENS = (
-    "BULLISH",
-    "BULL_TREND",
-    "UPTREND",
-    "LONG_BIAS",
-)
-_CONFIRM_SMC_RESEARCH_V2B_BEARISH_TOKENS = (
-    "BEARISH",
-    "BEAR_TREND",
-    "DOWNTREND",
-    "SHORT_BIAS",
-)
-_CONFIRM_SMC_RESEARCH_V2B_NEUTRAL_TOKENS = (
-    "RANGE",
-    "CHOP",
-    "MIXED",
-)
-
 _PAPER_SMC_RESEARCH_EXTENSION_METADATA = {
     "research_epoch": "v1_extend_200",
     "research_cap_target": 200,
@@ -6342,182 +5711,6 @@ _PAPER_SMC_RESEARCH_EXTENSION_METADATA = {
 }
 _PAPER_SMC_RESEARCH_ENTRY_SHADOW_LABEL = "RESEARCH_ENTRY_FALLBACK_SHADOW_V1"
 _PAPER_SMC_RESEARCH_ENTRY_SHADOW_VERSION = "v1"
-
-
-def _paper_smc_research_v2_subgroup_fields(fields, side):
-    side = str(side or "").strip().upper()
-    market_regime = str(fields.get("market_regime") or "").strip().upper()
-    would_block = fields.get("confirm_smc_entry_location_would_block")
-    planned_rr = fields.get("planned_rr")
-    bos_quality = str(fields.get("bos_quality") or "").strip().upper()
-    volume_confirmation = str(fields.get("volume_confirmation") or "").strip().upper()
-
-    reason = None
-    if market_regime in ("", "UNKNOWN"):
-        reason = "missing_regime"
-    elif would_block is None:
-        reason = "missing_would_block"
-    elif side != "SHORT":
-        reason = "not_short"
-    elif market_regime in _CONFIRM_SMC_RESEARCH_V2_BAD_REGIMES:
-        reason = "bad_regime"
-    elif would_block is not False:
-        reason = "would_block_true"
-    elif planned_rr is None or planned_rr < 2:
-        reason = "rr_below_2"
-    elif bos_quality == "WEAK":
-        reason = "bos_weak"
-    elif volume_confirmation == "EXPANSION":
-        reason = "volume_expansion"
-
-    match = reason is None
-    return {
-        "v2_subgroup": _CONFIRM_SMC_RESEARCH_V2_SUBGROUP if match else None,
-        "v2_subgroup_match": match,
-        "v2_reason": reason,
-    }
-
-
-def _paper_smc_research_v2b_market_bias(fields):
-    directional_votes = set()
-    neutral_seen = False
-    for key in ("smc_bias", "trend_direction", "market_regime", "phase"):
-        value = str(fields.get(key) or "").strip().upper()
-        if not value or value == "UNKNOWN":
-            continue
-        if key == "trend_direction" and value == "LONG":
-            directional_votes.add("bullish")
-        if key == "trend_direction" and value == "SHORT":
-            directional_votes.add("bearish")
-        if any(token in value for token in _CONFIRM_SMC_RESEARCH_V2B_BULLISH_TOKENS):
-            directional_votes.add("bullish")
-        if any(token in value for token in _CONFIRM_SMC_RESEARCH_V2B_BEARISH_TOKENS):
-            directional_votes.add("bearish")
-        if any(token in value for token in _CONFIRM_SMC_RESEARCH_V2B_NEUTRAL_TOKENS):
-            neutral_seen = True
-
-    if len(directional_votes) == 1:
-        return next(iter(directional_votes))
-    if len(directional_votes) > 1:
-        return "unknown"
-    if neutral_seen:
-        return "neutral"
-    return "unknown"
-
-
-def _paper_smc_research_v2b_counter_bias_reasons(fields, side):
-    reasons = []
-    market_regime = str(fields.get("market_regime") or "").strip().upper()
-    exhaustion = str(fields.get("exhaustion") or "").strip().upper()
-    bos_quality = str(fields.get("bos_quality") or "").strip().upper()
-    liquidity_context = str(fields.get("liquidity_context") or "").strip().upper()
-    liquidity_sweep = str(fields.get("liquidity_sweep") or "").strip().upper()
-    smc_zone = str(fields.get("smc_zone") or "").strip().upper()
-    phase = str(fields.get("phase") or "").strip().upper()
-
-    if market_regime == "EXHAUSTION_REVERSAL":
-        reasons.append("market_regime_exhaustion_reversal")
-    if "EXHAUSTED" in exhaustion or "REVERSAL" in exhaustion:
-        reasons.append("exhaustion_reversal_context")
-    if bos_quality == "TRAP":
-        reasons.append("bos_trap")
-    liquidity_text = f"{liquidity_context} {liquidity_sweep}"
-    if "SWEEP" in liquidity_text or "STOP_HUNT" in liquidity_text or "STOPHUNT" in liquidity_text:
-        reasons.append("liquidity_sweep_or_stop_hunt")
-    if (side == "LONG" and smc_zone == "DISCOUNT") or (
-        side == "SHORT" and smc_zone == "PREMIUM"
-    ):
-        reasons.append("favorable_reversal_zone")
-    if any(
-        token in phase
-        for token in (
-            "RANGE_EXTREME",
-            "RANGE_LOW",
-            "RANGE_HIGH",
-            "PRE_BREAK",
-            "PREBREAK",
-            "RECLAIM",
-        )
-    ):
-        reasons.append("reversal_phase_context")
-    return reasons
-
-
-def _paper_smc_research_v2b_fields(fields, side):
-    side = str(side or "").strip().upper()
-    planned_rr = fields.get("planned_rr")
-    bos_quality = str(fields.get("bos_quality") or "").strip().upper()
-    volume_confirmation = str(fields.get("volume_confirmation") or "").strip().upper()
-    market_regime = str(fields.get("market_regime") or "").strip().upper()
-    would_block = fields.get("confirm_smc_entry_location_would_block")
-    market_bias = _paper_smc_research_v2b_market_bias(fields)
-    alignment = "unknown"
-    v2b_class = "BIAS_UNKNOWN"
-    match = False
-    reason = "bias_unknown"
-    counter_bias_candidate = False
-    counter_bias_reasons = []
-
-    v1_pass = (
-        planned_rr is not None
-        and planned_rr >= 2
-        and bool(bos_quality)
-        and bos_quality != "WEAK"
-        and bool(volume_confirmation)
-        and volume_confirmation != "EXPANSION"
-    )
-    if not v1_pass:
-        v2b_class = "V1_FILTER_FAIL"
-        reason = "v1_filter_fail"
-    elif market_regime in _CONFIRM_SMC_RESEARCH_V2B_BAD_REGIMES:
-        v2b_class = "BAD_REGIME"
-        alignment = "neutral"
-        reason = "bad_regime"
-    elif would_block is None:
-        v2b_class = "FIELD_MISSING"
-        reason = "missing_would_block"
-    elif side not in {"LONG", "SHORT"}:
-        v2b_class = "FIELD_MISSING"
-        reason = "missing_side"
-    elif market_bias == "unknown":
-        v2b_class = "BIAS_UNKNOWN"
-        reason = "bias_unknown"
-    elif market_bias == "neutral":
-        v2b_class = "BIAS_UNKNOWN"
-        alignment = "neutral"
-        reason = "neutral_bias"
-    else:
-        aligned = (
-            (market_bias == "bearish" and side == "SHORT")
-            or (market_bias == "bullish" and side == "LONG")
-        )
-        if aligned:
-            v2b_class = "BIAS_ALIGNED"
-            alignment = "aligned"
-            match = would_block is False
-            reason = None if match else "would_block_true"
-        else:
-            alignment = "counter_bias"
-            counter_bias_reasons = _paper_smc_research_v2b_counter_bias_reasons(fields, side)
-            counter_bias_candidate = bool(counter_bias_reasons) and would_block is False
-            if counter_bias_candidate:
-                v2b_class = "COUNTER_BIAS_REVERSAL_CANDIDATE"
-                match = True
-                reason = None
-            else:
-                v2b_class = "BIAS_MISALIGNED_WEAK"
-                reason = "would_block_true" if would_block is not False else "no_reversal_context"
-
-    return {
-        "v2b_label": _CONFIRM_SMC_RESEARCH_V2B_LABEL,
-        "v2b_class": v2b_class,
-        "v2b_match": match,
-        "v2b_reason": reason,
-        "v2b_market_bias": market_bias,
-        "v2b_direction_alignment": alignment,
-        "v2b_counter_bias_candidate": counter_bias_candidate,
-        "v2b_counter_bias_reasons": counter_bias_reasons,
-    }
 
 
 def _paper_smc_research_qualified_fields(candidate):
@@ -6557,8 +5750,6 @@ def _paper_smc_research_qualified_fields(candidate):
             }
         )
     )
-    fields.update(_paper_smc_research_v2_subgroup_fields(fields, candidate.get("side")))
-    fields.update(_paper_smc_research_v2b_fields(fields, candidate.get("side")))
     return fields
 
 
@@ -6756,9 +5947,6 @@ def _paper_smc_research_entry_fallback_shadow_snapshot(candidate, opened, fields
             "market_regime": fields.get("market_regime"),
             "phase": fields.get("phase"),
             "smc_bias": fields.get("smc_bias"),
-            "v2b_class": fields.get("v2b_class"),
-            "v2b_market_bias": fields.get("v2b_market_bias"),
-            "v2b_direction_alignment": fields.get("v2b_direction_alignment"),
             "entry_location_would_block": fields.get("confirm_smc_entry_location_would_block"),
             "entry_location_primary_reason": fields.get("confirm_smc_entry_location_primary_reason"),
             "barrier_context": shadow.get("barrier_context"),
@@ -6852,22 +6040,6 @@ def _paper_smc_research_qualified_decision_log(
             fields=fields,
             now_ts=now_ts,
         )
-        v2b_decision_fields = dict(fields)
-        v2b_decision_fields["research_entry_timing_risk_class"] = entry_fallback_shadow.get(
-            "research_entry_timing_risk_class"
-        )
-        smc_entry_v2_shadow = _smc_entry_v2_shadow(
-            candidate,
-            fields=fields,
-            v1_decision=decision,
-            v1_reason=reason,
-            now_ts=now_ts,
-        )
-        smc_entry_v2b_allowlist_shadow = _smc_entry_v2b_allowlist_shadow(
-            candidate,
-            fields=v2b_decision_fields,
-            mode="PAPER_SHADOW_ONLY",
-        )
         row = {
             "event_type": "PAPER_SMC_RESEARCH_QUALIFIED_DECISION",
             "observed_at": format_vn_time(now_ts),
@@ -6888,17 +6060,6 @@ def _paper_smc_research_qualified_decision_log(
             "structural_decision_shadow": fields.get("structural_decision_shadow"),
             "candidate_type": fields.get("candidate_type"),
             "original_research_reason": fields.get("original_research_reason"),
-            "v2_subgroup": fields.get("v2_subgroup"),
-            "v2_subgroup_match": bool(fields.get("v2_subgroup_match")),
-            "v2_reason": fields.get("v2_reason"),
-            "v2b_label": fields.get("v2b_label"),
-            "v2b_class": fields.get("v2b_class"),
-            "v2b_match": bool(fields.get("v2b_match")),
-            "v2b_reason": fields.get("v2b_reason"),
-            "v2b_market_bias": fields.get("v2b_market_bias"),
-            "v2b_direction_alignment": fields.get("v2b_direction_alignment"),
-            "v2b_counter_bias_candidate": bool(fields.get("v2b_counter_bias_candidate")),
-            "v2b_counter_bias_reasons": fields.get("v2b_counter_bias_reasons") or [],
             "qualified": bool(qualified),
             "decision": decision,
             "reason": reason,
@@ -6932,7 +6093,6 @@ def _paper_smc_research_qualified_decision_log(
             for key, value in row.items()
             if value not in ("", None)
             or key in _QUALIFIED_LATENCY_NULL_FIELDS
-            or key in {"v2_subgroup", "v2_reason", "v2b_reason"}
         }
         row.update(bias_context)
         row.update(entry_location_risk)
@@ -6942,73 +6102,11 @@ def _paper_smc_research_qualified_decision_log(
             key: _json_safe_copy(value)
             for key, value in entry_fallback_shadow.items()
         })
-        row.update({
-            key: _json_safe_copy(smc_entry_v2_shadow.get(key))
-            for key in (
-                "smc_entry_v2_shadow_version",
-                "v2_shadow_status",
-                "v2_shadow_reason",
-                "v2_location_score",
-                "v2_late_chase_score",
-                "v2_structure_score",
-                "v2_expected_entry",
-                "v2_structural_sl",
-                "v2_expected_rr",
-                "v2_compared_to_v1",
-                "v2_feature_quality",
-            )
-        })
-        row.update({
-            key: _json_safe_copy(smc_entry_v2b_allowlist_shadow.get(key))
-            for key in (
-                "smc_entry_v2b_allowlist_label",
-                "smc_entry_v2b_allowlist_match",
-                "smc_entry_v2b_allowlist_reason",
-                "smc_entry_v2b_allowlist_version",
-                "smc_entry_v2b_v02_label",
-                "smc_entry_v2b_v02_match",
-                "smc_entry_v2b_v02_reason",
-                "smc_entry_v2b_v02_version",
-                "v0.1_match",
-                "v0.2_match",
-                "smc_entry_v2b_score_bucket",
-                "v2b_score_source",
-                "v2b_score_value",
-                "v2b_score_bucket",
-                "v2b_entry_location",
-                "v2b_entry_location_source",
-                "v2b_regime",
-                "v2b_timing_risk_class",
-                "v2b_regime_source",
-                "v2b_recompute_match",
-                "v2b_recompute_mismatch_reason",
-                "smc_entry_v2b_feature_quality",
-                "smc_entry_v2b_forward_mode",
-            )
-        })
         if isinstance(decision_extra, dict):
             row.update({
                 str(key): _json_safe_copy(value)
                 for key, value in decision_extra.items()
             })
-        _smc_entry_v2_shadow_write(
-            candidate,
-            fields,
-            smc_entry_v2_shadow,
-            v1_decision=decision,
-            v1_reason=reason,
-            now_ts=now_ts,
-        )
-        _smc_entry_v2b_allowlist_shadow_write(
-            candidate,
-            v2b_decision_fields,
-            smc_entry_v2b_allowlist_shadow,
-            execution_mode="paper",
-            v1_decision=decision,
-            v1_reason=reason,
-            now_ts=now_ts,
-            opened_trade_id=opened_trade_id,
-        )
         btc_instrumentation_row = _btc_alignment_instrumentation_shadow(
             candidate,
             execution_mode="paper",
@@ -9455,38 +8553,6 @@ def _dispatch_live_smc_research_lane(ctx):
             fields=location_fields,
             mode="LIVE_SHADOW_ONLY",
         )
-        smc_entry_v2_extra = _smc_entry_v2_shadow(
-            candidate,
-            fields=location_fields,
-            v1_decision="LIVE_SHADOW_ONLY",
-            v1_reason="live_decision_unchanged",
-            trade=trade,
-            now_ts=now_ts,
-        )
-        smc_entry_v2b_allowlist_extra = _smc_entry_v2b_allowlist_shadow(
-            candidate,
-            fields=location_fields,
-            trade=trade,
-            mode="LIVE_SHADOW_ONLY",
-        )
-        _smc_entry_v2_shadow_write(
-            candidate,
-            location_fields,
-            smc_entry_v2_extra,
-            v1_decision="LIVE_SHADOW_ONLY",
-            v1_reason="live_decision_unchanged",
-            now_ts=now_ts,
-        )
-        _smc_entry_v2b_allowlist_shadow_write(
-            candidate,
-            location_fields,
-            smc_entry_v2b_allowlist_extra,
-            execution_mode="live",
-            v1_decision="LIVE_SHADOW_ONLY",
-            v1_reason="live_decision_unchanged",
-            trade=trade,
-            now_ts=now_ts,
-        )
 
         prefilter_ok, prefilter_stage, prefilter_reason, prefilter_detail = _live_smc_research_prefilter(
             candidate,
@@ -9516,8 +8582,6 @@ def _dispatch_live_smc_research_lane(ctx):
                             detail=prefilter_detail,
                         ),
                         **location_gate_extra,
-                        **smc_entry_v2_extra,
-                        **smc_entry_v2b_allowlist_extra,
                     },
                 )
             continue
@@ -9540,8 +8604,6 @@ def _dispatch_live_smc_research_lane(ctx):
                         "prefilter_reason": _canary_reason,
                         "canary_reject_reason": _canary_reason,
                         **location_gate_extra,
-                        **smc_entry_v2_extra,
-                        **smc_entry_v2b_allowlist_extra,
                     },
                 )
                 continue
@@ -9558,8 +8620,6 @@ def _dispatch_live_smc_research_lane(ctx):
                 "funnel_stage": "OPEN_ATTEMPT",
                 **_live_smc_research_score_alignment_extra(trade),
                 **location_gate_extra,
-                **smc_entry_v2_extra,
-                **smc_entry_v2b_allowlist_extra,
             },
         )
 
@@ -9587,8 +8647,6 @@ def _dispatch_live_smc_research_lane(ctx):
                         "funnel_stage": "OPEN_FAILED",
                         **_failure_extra,
                         **location_gate_extra,
-                        **smc_entry_v2_extra,
-                        **smc_entry_v2b_allowlist_extra,
                     },
                 )
             raise
@@ -9601,8 +8659,6 @@ def _dispatch_live_smc_research_lane(ctx):
                 extra={
                     "funnel_stage": "OPEN_ACCEPTED",
                     **location_gate_extra,
-                    **smc_entry_v2_extra,
-                    **smc_entry_v2b_allowlist_extra,
                 },
             )
         else:
@@ -9626,8 +8682,6 @@ def _dispatch_live_smc_research_lane(ctx):
                         "funnel_stage": "OPEN_FAILED",
                         **_failure_extra,
                         **location_gate_extra,
-                        **smc_entry_v2_extra,
-                        **smc_entry_v2b_allowlist_extra,
                     },
                 )
 

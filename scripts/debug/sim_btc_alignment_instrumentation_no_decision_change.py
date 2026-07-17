@@ -15,7 +15,6 @@ and monkeypatches the JSONL writer so nothing touches logs/. It verifies:
   H paper decision fields unchanged (BTC fields purely additive)
   I live decision fields unchanged (BTC fields purely additive)
   J PAPER_LOCATION_GATE inputs unchanged (read-only passthrough)
-  K V2B allowlist inputs unchanged (read-only passthrough)
   L no execution/order module or network calls
 """
 
@@ -211,22 +210,6 @@ def main():
            r["paper_location_gate_would_block"] is True
            and r["trade_location_quality"] == "BAD"
            and r["smc_zone"] == "PREMIUM",
-           r)
-
-    # K. V2B allowlist inputs unchanged (read-only passthrough).
-    v2b = {
-        "v2b_label": "CONFIRM_SMC_RESEARCH__DIRECTIONAL_BIAS_CONTEXT",
-        "v2b_match": True,
-        "v2b_reason": "shadow_reason",
-        "v2b_market_bias": "bearish",
-        "v2b_direction_alignment": "aligned",
-    }
-    v2b_before = dict(v2b)
-    r = _run("SHORT", "bear", v2b_fields=v2b)
-    _check("K v2b dict unmutated", v2b == v2b_before, v2b)
-    _check("K v2b values passed through read-only",
-           r["v2b_label"] == v2b["v2b_label"] and r["v2b_match"] is True
-           and r["v2b_market_bias"] == "bearish",
            r)
 
     # L. No execution/order module import and no network fetch used.

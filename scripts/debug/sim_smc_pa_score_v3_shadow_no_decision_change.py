@@ -14,7 +14,6 @@ any other writer), and verifies:
   G paper decision unchanged (qualified predicate identical pre/post V3)
   H live decision unchanged (live prefilter identical pre/post V3)
   I PAPER_LOCATION_GATE unchanged (same inputs -> same output pre/post V3)
-  J V2B allowlist unchanged (same inputs -> same output pre/post V3)
   K BTC bias side-enable unchanged (same inputs -> same output pre/post V3)
   L no execution/order module calls inside the V3 evaluator/wrapper
 """
@@ -366,17 +365,6 @@ sd._smc_pa_score_v3_shadow(
 gate_after = sd._compute_confirm_smc_entry_location_risk(copy.deepcopy(gate_input))
 check("I PAPER_LOCATION_GATE unchanged", gate_before == gate_after, "")
 
-# ─── Case J: V2B allowlist unchanged ───────────────────────────────────────
-cand_j = fresh_candidate(smc_zone="DISCOUNT", market_regime="RANGE_MEAN_REVERSION")
-fields_j = sd._paper_smc_research_qualified_fields(copy.deepcopy(cand_j))
-v2b_before = sd._smc_entry_v2b_allowlist_shadow(copy.deepcopy(cand_j), fields=copy.deepcopy(fields_j))
-sd._smc_pa_score_v3_shadow(
-    cand_j, fields=fields_j, trade=None, execution_mode="paper",
-    v1_decision="REJECT", v1_reason="rr_below_2", btc_ctx={}, now_ts=NOW,
-)
-v2b_after = sd._smc_entry_v2b_allowlist_shadow(copy.deepcopy(cand_j), fields=copy.deepcopy(fields_j))
-check("J V2B allowlist unchanged", v2b_before == v2b_after, "")
-
 # ─── Case K: BTC side-enable unchanged ─────────────────────────────────────
 side_enable_ctx = {"btc_bias_independent": "BULLISH", "btc_context_quality": "FULL"}
 se_before = sd._btc_bias_side_enable_eval("LONG", dict(side_enable_ctx))
@@ -405,7 +393,7 @@ check("L no execution/order/network calls in V3", not hits, f"hits={hits}")
 required_row_fields = (
     ("ts", "symbol", "side", "signal_ts", "dedup_key", "execution_mode",
      "v1_decision", "v1_reason", "old_score", "entry", "sl", "tp", "rr",
-     "paper_location_gate_would_block", "v2b_label", "btc_bias_independent")
+     "paper_location_gate_would_block", "btc_bias_independent")
     + sd._SMC_PA_V3_SUMMARY_FIELDS
     + sd._SMC_PA_V3_COMPONENT_FIELDS
 )

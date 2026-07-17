@@ -176,10 +176,6 @@ def _install_signal_dispatcher_shadow_stubs(sd, tmp):
     sd._breakout_acceptance_shadow = lambda *args, **kwargs: None
     sd._btc_alignment_instrumentation_shadow = lambda *args, **kwargs: {}
     sd._btc_m5_m15_decomposition_shadow = lambda *args, **kwargs: None
-    sd._smc_entry_v2_shadow = lambda *args, **kwargs: {}
-    sd._smc_entry_v2b_allowlist_shadow = lambda *args, **kwargs: {}
-    sd._smc_entry_v2_shadow_write = lambda *args, **kwargs: None
-    sd._smc_entry_v2b_allowlist_shadow_write = lambda *args, **kwargs: None
     sd._paper_smc_research_entry_fallback_shadow_safe = lambda *args, **kwargs: {}
     try:
         import smc_pa_score_v31_shadow as v31

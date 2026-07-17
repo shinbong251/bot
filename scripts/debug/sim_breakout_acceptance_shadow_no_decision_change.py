@@ -3,7 +3,7 @@
 
 No Binance calls, no orders, no real log/state writes. It imports the
 production helpers, monkeypatches the shadow writer to memory, and booby-traps
-the network fetcher plus the old-score / V3 / BTC-side-enable / V2B /
+the network fetcher plus the old-score / V3 / BTC-side-enable /
 location-gate evaluators so any hidden call fails loudly. It verifies:
 
   A LONG close beyond level + holds 2 bars           => BREAKOUT_ACCEPTED
@@ -18,7 +18,6 @@ location-gate evaluators so any hidden call fails loudly. It verifies:
   J SMC_PA_SCORE_V3 unchanged (never invoked; read-only passthrough only)
   K PAPER_LOCATION_GATE unchanged (never invoked; read-only passthrough only)
   L BTC side-enable unchanged (never invoked; read-only passthrough only)
-  M V2B unchanged (never invoked; read-only passthrough only)
   N no execution/order module calls, no network fetch, no disk writes
 """
 
@@ -100,8 +99,6 @@ def main():
         sd._btc_bias_side_enable_eval = _boom_factory("BTC side-enable evaluator")
     if hasattr(sd, "_compute_confirm_smc_entry_location_risk"):
         sd._compute_confirm_smc_entry_location_risk = _boom_factory("PAPER_LOCATION_GATE risk computer")
-    if hasattr(sd, "_smc_entry_v2b_allowlist_shadow"):
-        sd._smc_entry_v2b_allowlist_shadow = _boom_factory("V2B allowlist shadow")
 
     log_path = os.path.join(REPO_ROOT, "logs", "breakout_acceptance_shadow.jsonl")
     log_stat_before = os.stat(log_path) if os.path.exists(log_path) else None
@@ -204,9 +201,6 @@ def main():
         "confirm_smc_entry_location_would_block": True,
         "confirm_smc_entry_location_primary_reason": "premium_long",
         "confirm_smc_entry_location_risk_bucket": "HIGH",
-        "v2b_label": "CONFIRM_SMC_RESEARCH__DIRECTIONAL_BIAS_CONTEXT",
-        "v2b_match": True,
-        "v2b_reason": "shadow_reason",
     }
     btc_ctx = {
         "btc_bias_independent": "BULLISH",
@@ -294,13 +288,6 @@ def main():
     _check("L BTC side-enable never invoked; passthrough read-only",
            _CAPTURED[-1]["btc_side_enable_shadow_label"] == "BTC_SIDE_ENABLE_ALLOW"
            and _CAPTURED[-1]["btc_side_enable_shadow_allow"] is True,
-           _CAPTURED[-1])
-
-    # M. V2B unchanged: allowlist shadow booby-trapped and never invoked;
-    #    V2B fields appear read-only in the logged row.
-    _check("M V2B never invoked; passthrough read-only",
-           _CAPTURED[-1]["v2b_label"] == "CONFIRM_SMC_RESEARCH__DIRECTIONAL_BIAS_CONTEXT"
-           and _CAPTURED[-1]["v2b_match"] is True,
            _CAPTURED[-1])
 
     # ---- Level wiring provenance (log-only fields, no decision change) ----
