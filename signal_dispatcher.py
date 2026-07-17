@@ -9102,7 +9102,11 @@ def _live_smc_research_min_notional_prefilter(trade):
 
     score = _live_research_micro_float(trade.get("score"), 0.0) or 0.0
     min_score = _live_smc_research_min_open_score()
-    effective_risk_pct = live_risk_per_trade * 0.5 if score < min_score else live_risk_per_trade
+    if score < min_score:
+        from execution import LIVE_RESEARCH_LOW_SCORE_RISK_MULTIPLIER
+        effective_risk_pct = live_risk_per_trade * LIVE_RESEARCH_LOW_SCORE_RISK_MULTIPLIER
+    else:
+        effective_risk_pct = live_risk_per_trade
     risk_amount = execution_balance * effective_risk_pct
     projected_notional = risk_amount / sl_pct if sl_pct > 0 else 0.0
 

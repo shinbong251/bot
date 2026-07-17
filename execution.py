@@ -1697,6 +1697,9 @@ def _live_smc_research_score_filter_bypass(t, exec_mode):
     )
 
 
+LIVE_RESEARCH_LOW_SCORE_RISK_MULTIPLIER = 0.6
+
+
 def _paper_smc_research_key(t):
     key = str(t.get("research_dedup_key") or "").strip()
     if key:
@@ -4916,7 +4919,7 @@ def open_trade(t, ctx=None):
         if _is_paper_smc_research:
             t["risk_percent"] = base_risk * 0.5
         elif _is_live_smc_research_score_bypass:
-            t["risk_percent"] = base_risk * 0.5
+            t["risk_percent"] = base_risk * LIVE_RESEARCH_LOW_SCORE_RISK_MULTIPLIER
             t["score_filter_bypassed_for_research"] = True
             t["research_score"] = score
             t["paper_predicate_aligned"] = True
