@@ -7077,6 +7077,25 @@ def _paper_smc_research_qualified_decision_log(
             entry_type_override="CONFIRM_SMC_RESEARCH",
             now_ts=now_ts,
         )
+        # SMC_PA_SCORE_V3_1_SHADOW (log-only): appends to its own forward
+        # log + freeze state only; never gates and never adds fields to
+        # this decision row; return ignored.
+        try:
+            from smc_pa_score_v31_shadow import log_v31_shadow
+            log_v31_shadow(
+                candidate,
+                fields=fields,
+                trade=None,
+                execution_mode="paper",
+                action=decision,
+                reason=reason,
+                btc_ctx=btc_instrumentation_row,
+                opened_trade_id=opened_trade_id,
+                v3_summary=smc_pa_v3_summary,
+                now_ts=now_ts,
+            )
+        except Exception:
+            pass
         with open(_paper_smc_research_qualified_log_path(), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, default=str, sort_keys=True) + "\n")
     except Exception as exc:
@@ -9303,15 +9322,18 @@ def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=Non
         try:
             from four_phase_breakout_shadow import log_four_phase_snapshot
             _four_phase_trade = trade if isinstance(trade, dict) else {}
+            _four_phase_opened_trade_id = None
+            if decision == "OPEN_ACCEPTED":
+                _four_phase_opened_trade_id = _first_nonblank(
+                    _four_phase_trade.get("id"),
+                    _four_phase_trade.get("trade_id"),
+                    _four_phase_trade.get("client_order_id"),
+                )
             log_four_phase_snapshot(
                 candidate,
                 execution_mode="live",
                 action=decision,
-                opened_trade_id=_first_nonblank(
-                    _four_phase_trade.get("id"),
-                    _four_phase_trade.get("trade_id"),
-                    _four_phase_trade.get("client_order_id"),
-                ),
+                opened_trade_id=_four_phase_opened_trade_id,
                 now_ts=row.get("ts"),
             )
         except Exception:
@@ -9343,6 +9365,33 @@ def _live_smc_research_log(candidate, decision, reason="", trade=None, extra=Non
             entry_type_override="CONFIRM_SMC_RESEARCH",
             now_ts=row.get("ts"),
         )
+        # SMC_PA_SCORE_V3_1_SHADOW (log-only): appends to its own forward
+        # log + freeze state only; never gates and never adds fields to
+        # this decision row; return ignored.
+        try:
+            from smc_pa_score_v31_shadow import log_v31_shadow
+            _v31_trade = trade if isinstance(trade, dict) else {}
+            _v31_opened_trade_id = None
+            if decision == "OPEN_ACCEPTED":
+                _v31_opened_trade_id = _first_nonblank(
+                    _v31_trade.get("id"),
+                    _v31_trade.get("trade_id"),
+                    _v31_trade.get("client_order_id"),
+                )
+            log_v31_shadow(
+                candidate,
+                fields=None,
+                trade=trade if isinstance(trade, dict) else None,
+                execution_mode="live",
+                action=decision,
+                reason=reason,
+                btc_ctx=btc_instrumentation_row,
+                opened_trade_id=_v31_opened_trade_id,
+                v3_summary=smc_pa_v3_summary,
+                now_ts=row.get("ts"),
+            )
+        except Exception:
+            pass
     except Exception as _log_ex:
         print(f"[WARN] _live_smc_research_log failed: {_log_ex}")
 

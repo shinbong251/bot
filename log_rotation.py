@@ -16,6 +16,7 @@ ROTATION_TARGETS = [
     "structural_context_samples.jsonl",
     "btc_m5_m15_decomposition_shadow_v2.jsonl",
     "four_phase_breakout_context_shadow_v1.jsonl",
+    "smc_pa_score_v3_1_shadow.jsonl",
     "runtime_errors.log",
 ]
 

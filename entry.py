@@ -3749,6 +3749,26 @@ def _confirm_reject_acceptance_context(df15, atr=None, bos_level=None):
 
         _reject_candle = df15.iloc[-3]
         _reject_range = df15.iloc[-20:-4]
+        # Log-only alt-side M15 3-bar change for the SMC_PA_SCORE_V3_1
+        # shadow's relative-strength research (same window as the accepted
+        # context: change ends at the close of bar -3 = open of bar -2).
+        _reject_alt_change_pct = None
+        _reject_alt_change_source_ts = None
+        try:
+            _reject_alt_last = _ctx_float(df15["close"].iloc[-3])
+            _reject_alt_ref = _ctx_float(df15["close"].iloc[-6])
+            if (
+                _reject_alt_last is not None
+                and _reject_alt_ref is not None
+                and _reject_alt_ref > 0
+            ):
+                _reject_alt_change_pct = round(
+                    (_reject_alt_last - _reject_alt_ref) / _reject_alt_ref * 100.0, 4
+                )
+                _reject_alt_change_source_ts = _candle_open_ts(df15.iloc[-2])
+        except Exception:
+            _reject_alt_change_pct = None
+            _reject_alt_change_source_ts = None
         return {
             "candle_open": _ctx_float(_reject_candle["open"]),
             "candle_high": _ctx_float(_reject_candle["high"]),
@@ -3759,6 +3779,8 @@ def _confirm_reject_acceptance_context(df15, atr=None, bos_level=None):
             "pre_break_level": _ctx_float(bos_level),
             "nearest_htf_support": _ctx_float(_reject_range["low"].min()),
             "nearest_htf_resistance": _ctx_float(_reject_range["high"].max()),
+            "alt_m15_change_3bar_pct": _reject_alt_change_pct,
+            "alt_m15_change_source_ts": _reject_alt_change_source_ts,
             "context_source": "confirm_reject_level_wiring_v1",
         }
     except Exception:
@@ -7235,6 +7257,28 @@ def confirm_pipeline(symbol, df, cls, df15, df1h, df4h=None, df1d=None):
         _acceptance_htf_bias = "LONG"
     elif _acceptance_ema34 < _acceptance_ema89 and _acceptance_ema_slope < 0:
         _acceptance_htf_bias = "SHORT"
+    # Log-only alt-side M15 3-bar change for the SMC_PA_SCORE_V3_1 shadow's
+    # relative-strength research. Window ends at the close of bar -3 (= the
+    # open of bar -2 = signal_created_ts), matching the BTC change window
+    # (closed candles <= signal_created_ts, same 3-bar lookback). Not
+    # consumed by scoring or execution.
+    _acceptance_alt_change_pct = None
+    _acceptance_alt_change_source_ts = None
+    try:
+        _alt_change_last = float(df15["close"].iloc[-3])
+        _alt_change_ref = float(df15["close"].iloc[-6])
+        if (
+            _alt_change_last == _alt_change_last
+            and _alt_change_ref == _alt_change_ref
+            and _alt_change_ref > 0
+        ):
+            _acceptance_alt_change_pct = round(
+                (_alt_change_last - _alt_change_ref) / _alt_change_ref * 100.0, 4
+            )
+            _acceptance_alt_change_source_ts = _candle_open_ts(df15.iloc[-2])
+    except Exception:
+        _acceptance_alt_change_pct = None
+        _acceptance_alt_change_source_ts = None
     confirm_entry_acceptance_context = {
         "candle_open": _acceptance_candle["open"],
         "candle_high": _acceptance_candle["high"],
@@ -7248,6 +7292,8 @@ def confirm_pipeline(symbol, df, cls, df15, df1h, df4h=None, df1d=None):
         "m15_close": df15["close"].iloc[-2],
         "nearest_htf_support": _acceptance_range["low"].min(),
         "nearest_htf_resistance": _acceptance_range["high"].max(),
+        "alt_m15_change_3bar_pct": _acceptance_alt_change_pct,
+        "alt_m15_change_source_ts": _acceptance_alt_change_source_ts,
     }
     if isinstance(score_breakdown, dict):
         score_breakdown["smc"] = smc_ctx

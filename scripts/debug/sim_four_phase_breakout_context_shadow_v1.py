@@ -159,6 +159,35 @@ def _redirect_module_defaults(tmp):
     fp.FOUR_PHASE_STATE_PATH = os.path.join(tmp, "default_state.json")
 
 
+def _jsonl_rows(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _install_signal_dispatcher_shadow_stubs(sd, tmp):
+    sd._LIVE_SMC_RESEARCH_DECISION_LOG = os.path.join(tmp, "live_smc_research_decisions.jsonl")
+    sd._paper_smc_research_qualified_log_path = (
+        lambda: os.path.join(tmp, "paper_smc_research_qualified_decisions.jsonl")
+    )
+    sd._btc_mtf_context_for_signal = lambda *args, **kwargs: {}
+    sd._smc_pa_score_v3_shadow = lambda *args, **kwargs: {}
+    sd._breakout_acceptance_shadow = lambda *args, **kwargs: None
+    sd._btc_alignment_instrumentation_shadow = lambda *args, **kwargs: {}
+    sd._btc_m5_m15_decomposition_shadow = lambda *args, **kwargs: None
+    sd._smc_entry_v2_shadow = lambda *args, **kwargs: {}
+    sd._smc_entry_v2b_allowlist_shadow = lambda *args, **kwargs: {}
+    sd._smc_entry_v2_shadow_write = lambda *args, **kwargs: None
+    sd._smc_entry_v2b_allowlist_shadow_write = lambda *args, **kwargs: None
+    sd._paper_smc_research_entry_fallback_shadow_safe = lambda *args, **kwargs: {}
+    try:
+        import smc_pa_score_v31_shadow as v31
+        v31.log_v31_shadow = lambda *args, **kwargs: None
+    except Exception:
+        pass
+
+
 def run_cases(tmp):
     _redirect_module_defaults(tmp)
     # ---- 1-4: four phase mappings ----
@@ -424,6 +453,119 @@ def run_cases(tmp):
           and fp.map_four_phase("PREV_WAVE_UP", "BREAK_NONE") == "PHASE_PENDING"
           and fp.map_four_phase("PREV_WAVE_UP", "BREAK_NONE", range_established=False)
           == "RANGE_UNRESOLVED")
+
+    # ---- production dispatcher lifecycle attribution wiring ----
+    import signal_dispatcher as sd
+    _install_signal_dispatcher_shadow_stubs(sd, tmp)
+    fp.FOUR_PHASE_LOG_PATH = os.path.join(tmp, "dispatcher_four_phase_rows.jsonl")
+    candidate = {
+        "symbol": "ATTRUSDT",
+        "side": "LONG",
+        "entry_type": "CONFIRM_SMC_RESEARCH",
+        "dedup_key": "ATTRUSDT|LONG|CONFIRM|1700000000",
+        "source_timestamp": BASE,
+        "candidate_id": "candidate-attr-1",
+    }
+    candidate_trade = {
+        "id": 1700000000123,
+        "trade_id": "candidate-trade-id",
+        "client_order_id": "candidate-client-id",
+        "symbol": "ATTRUSDT",
+        "side": "LONG",
+        "entry": 101.0,
+        "sl": 100.0,
+        "tp": 103.0,
+        "rr": 2.0,
+        "score": 90,
+        "entry_type": "CONFIRM_SMC_RESEARCH",
+    }
+    opened_trade = dict(candidate_trade)
+    opened_trade.update({
+        "id": "opened-authoritative-id",
+        "trade_id": "opened-trade-id",
+        "client_order_id": "BOT-E-ATTRUSDT-1",
+    })
+    for action, trade in (
+        ("PREFILTER_REJECT", candidate_trade),
+        ("SYMBOL_LOCKED", candidate_trade),
+        ("CAP", candidate_trade),
+        ("REJECT", candidate_trade),
+        ("OPEN_ATTEMPT", candidate_trade),
+        ("OPEN_FAILED", candidate_trade),
+        ("OPEN_ACCEPTED", opened_trade),
+    ):
+        sd._live_smc_research_log(candidate, action, reason="simulated", trade=trade)
+    lifecycle_rows = _jsonl_rows(fp.FOUR_PHASE_LOG_PATH)
+    live_by_action = {
+        row.get("action"): row
+        for row in lifecycle_rows
+        if row.get("execution_mode") == "live"
+    }
+    check("live_prefilter_reject_opened_id_null",
+          live_by_action["PREFILTER_REJECT"].get("opened_trade_id") is None,
+          live_by_action["PREFILTER_REJECT"].get("opened_trade_id"))
+    check("live_symbol_locked_opened_id_null",
+          live_by_action["SYMBOL_LOCKED"].get("opened_trade_id") is None,
+          live_by_action["SYMBOL_LOCKED"].get("opened_trade_id"))
+    check("live_cap_reject_opened_id_null",
+          live_by_action["CAP"].get("opened_trade_id") is None
+          and live_by_action["REJECT"].get("opened_trade_id") is None,
+          (live_by_action["CAP"].get("opened_trade_id"), live_by_action["REJECT"].get("opened_trade_id")))
+    check("live_open_attempt_opened_id_null",
+          live_by_action["OPEN_ATTEMPT"].get("opened_trade_id") is None,
+          live_by_action["OPEN_ATTEMPT"].get("opened_trade_id"))
+    check("live_open_failed_without_confirmed_open_opened_id_null",
+          live_by_action["OPEN_FAILED"].get("opened_trade_id") is None,
+          live_by_action["OPEN_FAILED"].get("opened_trade_id"))
+    check("live_open_accepted_opened_id_present",
+          live_by_action["OPEN_ACCEPTED"].get("opened_trade_id") == "opened-authoritative-id",
+          live_by_action["OPEN_ACCEPTED"].get("opened_trade_id"))
+    repeated = [
+        live_by_action[action]
+        for action in ("PREFILTER_REJECT", "OPEN_ATTEMPT", "OPEN_ACCEPTED")
+    ]
+    check("live_lifecycle_dedup_shared_accepted_only_opened_id",
+          len({row.get("dedup_key") for row in repeated}) == 1
+          and [row.get("opened_trade_id") for row in repeated]
+          == [None, None, "opened-authoritative-id"],
+          [row.get("opened_trade_id") for row in repeated])
+    check("live_signal_key_attribution_preserved",
+          all(row.get("signal_key") == candidate["dedup_key"] for row in repeated),
+          [row.get("signal_key") for row in repeated])
+    banned_lifecycle = {"realized_r", "first_hit", "mfe", "mae", "max_favorable_r",
+                        "max_adverse_r", "terminal_status", "final_status", "outcome",
+                        "sl_hit", "tp_hit", "net_r"}
+    check("lifecycle_no_outcome_fields_added",
+          all(not (set(row) & banned_lifecycle) for row in lifecycle_rows),
+          [sorted(set(row) & banned_lifecycle) for row in lifecycle_rows])
+
+    paper_open = fp.assemble_four_phase_snapshot(
+        candidate,
+        None,
+        execution_mode="paper",
+        action="OPEN",
+        opened_trade_id="paper-open-id",
+        now_ts=BASE,
+    )
+    paper_reject = fp.assemble_four_phase_snapshot(
+        candidate,
+        None,
+        execution_mode="paper",
+        action="PREFILTER_REJECT",
+        opened_trade_id=None,
+        now_ts=BASE,
+    )
+    check("paper_open_behavior_unchanged",
+          paper_open.get("opened_trade_id") == "paper-open-id",
+          paper_open.get("opened_trade_id"))
+    check("paper_rejected_rows_opened_id_null",
+          paper_reject.get("opened_trade_id") is None,
+          paper_reject.get("opened_trade_id"))
+    post_src = open(fp.__file__.replace(".pyc", ".py")).read()
+    check("phase_evaluator_state_outputs_unchanged",
+          "def update_market_cycle(" in post_src and "def map_four_phase(" in post_src)
+    check("dispatcher_four_phase_return_ignored",
+          "log_four_phase_snapshot(\n                candidate," in open(sd.__file__).read())
 
 
 def _rss_kb():
