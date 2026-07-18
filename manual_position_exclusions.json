@@ -1,0 +1,85 @@
+{
+  "positions": [
+    {
+      "confirmed_at": "2026-07-18T06:37:19.412034+00:00",
+      "entry_fill_ids": [],
+      "entry_order_ids": [
+        "2584640627",
+        "2585475398"
+      ],
+      "entry_price": 0.0052829999999999995,
+      "expected_qty": 18942.0,
+      "inactive": true,
+      "notes": "User-owned manual position; bot must not reconstruct/manage/account",
+      "ownership": "MANUAL_CONFIRMED",
+      "position_epoch": {
+        "entry_fill_ids": [],
+        "entry_order_ids": [
+          "2584640627",
+          "2585475398"
+        ],
+        "fingerprint": "27b3b2c0b23bf52d7b6cad80d6be9f94c502d6f60fd79fd5b774ab664a3a55c4",
+        "opened_at": "2026-07-18T06:37:19.412034+00:00",
+        "protective_order_ids": [
+          "2590622728",
+          "3000002084925813"
+        ]
+      },
+      "position_epoch_fingerprint": "27b3b2c0b23bf52d7b6cad80d6be9f94c502d6f60fd79fd5b774ab664a3a55c4",
+      "position_epoch_order_ids": [
+        "2584640627",
+        "2585475398",
+        "2590622728",
+        "3000002084925813"
+      ],
+      "position_opened_at": "2026-07-18T06:37:19.412034+00:00",
+      "position_side": "LONG",
+      "protective_order_ids": [
+        "2590622728",
+        "3000002084925813"
+      ],
+      "source": "USER_CONFIRMED",
+      "stale_at": "2026-07-18T10:24:45.327002+00:00",
+      "stale_reason": "position_side_changed_observed",
+      "status": "STALE",
+      "symbol": "VANRYUSDT"
+    },
+    {
+      "confirmed_at": "2026-07-18T10:43:16.876144+00:00",
+      "entry_fill_ids": [],
+      "entry_order_ids": [
+        "2591169091"
+      ],
+      "entry_price": 0.005164999999999999,
+      "expected_qty": 9678.0,
+      "inactive": false,
+      "notes": "User-owned manual SHORT position; bot must not reconstruct/manage/account",
+      "ownership": "MANUAL_CONFIRMED",
+      "position_epoch": {
+        "entry_fill_ids": [],
+        "entry_order_ids": [
+          "2591169091"
+        ],
+        "fingerprint": "146cd142b4e150dbca0dcb96bebba26ba9e7aa34b4fe600268e9429be14dce58",
+        "opened_at": "2026-07-18T09:50:31.806000+00:00",
+        "protective_order_ids": [
+          "2591169888"
+        ]
+      },
+      "position_epoch_fingerprint": "146cd142b4e150dbca0dcb96bebba26ba9e7aa34b4fe600268e9429be14dce58",
+      "position_epoch_order_ids": [
+        "2591169091",
+        "2591169888"
+      ],
+      "position_opened_at": "2026-07-18T09:50:31.806000+00:00",
+      "position_side": "SHORT",
+      "protective_order_ids": [
+        "2591169888"
+      ],
+      "source": "USER_CONFIRMED",
+      "status": "ACTIVE",
+      "symbol": "VANRYUSDT"
+    }
+  ],
+  "schema_version": 1
+}

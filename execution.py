@@ -6832,6 +6832,64 @@ def reconcile_exchange_positions(ctx):
         )
         return
 
+    if ctx.execution_mode == "live":
+        try:
+            from manual_position_exclusions import (
+                append_manual_exclusion_audit,
+                load_manual_registry,
+                mark_manual_exclusion_stale,
+                save_manual_registry,
+            )
+
+            _manual_registry = load_manual_registry()
+            if isinstance(_manual_registry, dict) and not _manual_registry.get("_invalid"):
+                _open_exchange_symbols = {
+                    str(_p.get("symbol") or "").upper()
+                    for _p in (exchange_positions or [])
+                    if _safe_float_value(_p.get("positionAmt"), 0.0) != 0.0
+                }
+                _manual_stale_changed = False
+                for _row in list(_manual_registry.get("positions") or []):
+                    _manual_symbol = str(_row.get("symbol") or "").upper()
+                    if not _manual_symbol or _manual_symbol in _open_exchange_symbols:
+                        continue
+                    if mark_manual_exclusion_stale(
+                        _manual_registry,
+                        _manual_symbol,
+                        _row.get("position_side"),
+                        reason="position_flat",
+                    ):
+                        _manual_stale_changed = True
+                        _stale_result = {
+                            "classification": "EXCLUSION_STALE",
+                            "reason": "position_flat",
+                            "symbol": _manual_symbol,
+                            "position_side": _row.get("position_side"),
+                            "exchange_qty": 0.0,
+                            "entry_price": _row.get("entry_price"),
+                            "registry_record": dict(_row),
+                            "registry_status": "valid",
+                            "data_quality_flags": [],
+                            "reconstruct": False,
+                            "manage": False,
+                            "account": False,
+                            "canary": False,
+                            "startup_backfill": False,
+                            "modify_orders": False,
+                        }
+                        append_manual_exclusion_audit(_stale_result)
+                        print(
+                            f"[RECON] {_manual_symbol} manual exclusion marked STALE "
+                            "reason=position_flat - historical record retained"
+                        )
+                if _manual_stale_changed:
+                    save_manual_registry(_manual_registry)
+        except Exception as _manual_stale_exc:
+            print(
+                "[RECON] manual exclusion stale evaluation ERROR "
+                f"{type(_manual_stale_exc).__name__} - exchange untouched"
+            )
+
     # Reconcile only bot-owned positions against the exchange.
     # Manual positions opened directly on the account are expected to appear
     # as exchange_only entries — they are logged but NEVER quarantined or
@@ -6879,6 +6937,8 @@ def reconcile_exchange_positions(ctx):
     _alert_exchange_only = []
     _alert_bot_orphans = []
     _alert_exchange_only_uncertain = []
+    _alert_manual_confirmed = []
+    _alert_manual_review = []
     _alert_local_only = []
     _alert_discrepancies = []
 
@@ -6925,6 +6985,95 @@ def reconcile_exchange_positions(ctx):
         sym = item["exchange"]["symbol"]
         amt = item["exchange"]["positionAmt"]
         if ctx.execution_mode == "live":
+            try:
+                from manual_position_exclusions import (
+                    EXCLUSION_STALE,
+                    MANUAL_CONFIRMED,
+                    MANUAL_REVIEW_REQUIRED,
+                    REGISTRY_INVALID,
+                    append_manual_exclusion_audit,
+                    load_manual_registry,
+                    resolve_manual_position_exclusion,
+                )
+
+                _open_orders_for_manual = _tn.get_open_orders(sym)
+                _open_algos_for_manual = _tn.get_open_algo_orders(sym)
+                _recent_orders_for_manual = _tn.get_recent_orders(sym, limit=50)
+                if (
+                    _open_orders_for_manual is None
+                    or _open_algos_for_manual is None
+                    or _recent_orders_for_manual is None
+                ):
+                    _manual_result = {
+                        "classification": REGISTRY_INVALID,
+                        "reason": "manual_exclusion_order_query_failed",
+                        "symbol": sym,
+                        "position_side": "LONG" if float(amt) > 0 else "SHORT",
+                        "exchange_qty": amt,
+                        "entry_price": item["exchange"].get("entryPrice") or item["exchange"].get("entry"),
+                        "registry_status": "query_failed",
+                        "data_quality_flags": ["order_query_failed"],
+                        "reconstruct": False,
+                        "manage": False,
+                        "account": False,
+                        "canary": False,
+                        "startup_backfill": False,
+                        "modify_orders": False,
+                    }
+                else:
+                    _manual_result = resolve_manual_position_exclusion(
+                        sym,
+                        position_side="LONG" if float(amt) > 0 else "SHORT",
+                        exchange_qty=amt,
+                        entry_price=item["exchange"].get("entryPrice") or item["exchange"].get("entry"),
+                        open_orders=(
+                            list(_open_orders_for_manual)
+                            + list(_open_algos_for_manual)
+                            + list(_recent_orders_for_manual)
+                        ),
+                        registry=load_manual_registry(),
+                    )
+                _manual_status = _manual_result.get("classification")
+                if _manual_status == MANUAL_CONFIRMED:
+                    append_manual_exclusion_audit(_manual_result)
+                    print(
+                        f"[RECON] {sym} Exchange-only position amt={amt} "
+                        "MANUAL_CONFIRMED by registry - bot reconstruction/accounting/"
+                        "management skipped"
+                    )
+                    _alert_manual_confirmed.append(f"{sym} amt={amt} [MANUAL_CONFIRMED]")
+                    continue
+                if _manual_status in (MANUAL_REVIEW_REQUIRED, EXCLUSION_STALE, REGISTRY_INVALID):
+                    append_manual_exclusion_audit(_manual_result)
+                    _manual_reason = _manual_result.get("reason", "manual_exclusion_review")
+                    if _manual_status == EXCLUSION_STALE:
+                        try:
+                            from manual_position_exclusions import mark_manual_exclusion_stale, save_manual_registry
+
+                            _manual_registry_for_stale = load_manual_registry()
+                            if mark_manual_exclusion_stale(
+                                _manual_registry_for_stale,
+                                sym,
+                                (_manual_result.get("registry_record") or {}).get("position_side"),
+                                reason=_manual_reason,
+                            ):
+                                save_manual_registry(_manual_registry_for_stale)
+                        except Exception as _manual_mark_exc:
+                            print(
+                                f"[RECON] {sym} manual exclusion stale persist ERROR "
+                                f"{type(_manual_mark_exc).__name__} - exchange untouched"
+                            )
+                    print(
+                        f"[RECON] {sym} Exchange-only position amt={amt} manual exclusion "
+                        f"{_manual_status} reason={_manual_reason} - exchange untouched"
+                    )
+                    _alert_manual_review.append(f"{sym} amt={amt} [{_manual_status}] reason={_manual_reason}")
+                    continue
+            except Exception as _manual_exc:
+                print(
+                    f"[RECON] {sym} manual exclusion resolver ERROR "
+                    f"{type(_manual_exc).__name__} - exchange untouched, preserving existing classifier"
+                )
             _bot_evidence = _inspect_exchange_only_live_bot_evidence(item["exchange"], _tn)
             _bot_status = _bot_evidence.get("status")
             _bot_reason = _bot_evidence.get("reason", "")
@@ -6979,6 +7128,8 @@ def reconcile_exchange_positions(ctx):
         _alert_exchange_only
         or _alert_bot_orphans
         or _alert_exchange_only_uncertain
+        or _alert_manual_confirmed
+        or _alert_manual_review
         or _alert_local_only
         or _alert_discrepancies
     )
@@ -6992,6 +7143,16 @@ def reconcile_exchange_positions(ctx):
         if _alert_exchange_only_uncertain:
             _lines.append("\nExchange-only ownership uncertain:")
             for _s in _alert_exchange_only_uncertain:
+                _lines.append(f"  - {_s}")
+            _lines.append("  action=manual_review_required exchange_untouched")
+        if _alert_manual_confirmed:
+            _lines.append("\nExchange-only manual-confirmed:")
+            for _s in _alert_manual_confirmed:
+                _lines.append(f"  - {_s}")
+            _lines.append("  action=manual_confirmed_excluded exchange_untouched")
+        if _alert_manual_review:
+            _lines.append("\nExchange-only manual exclusion review:")
+            for _s in _alert_manual_review:
                 _lines.append(f"  - {_s}")
             _lines.append("  action=manual_review_required exchange_untouched")
         if _alert_exchange_only:
