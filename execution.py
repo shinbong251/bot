@@ -4276,6 +4276,201 @@ def _safe_float_value(value, default=0.0) -> float:
         return default
 
 
+_STARTUP_IDEMPOTENCY_MAX_KEYS = 5000
+_STARTUP_CSV_TAIL_ROWS = 500
+
+
+def _startup_terminal_key_from_trade(t: dict, terminal_close: dict = None) -> str:
+    terminal_close = terminal_close if isinstance(terminal_close, dict) else {}
+    key = terminal_close.get("terminal_key") or t.get("terminal_key") or t.get("startup_backfill_terminal_key")
+    if key:
+        return str(key)
+    if terminal_close.get("close_order_id") or t.get("exchange_close_order_id"):
+        return f"close_order:{terminal_close.get('close_order_id') or t.get('exchange_close_order_id')}"
+    fill_ids = terminal_close.get("terminal_fill_ids") or []
+    if fill_ids:
+        return "terminal_fills:" + ",".join(sorted(map(str, fill_ids)))
+    identity = t.get("exchange_client_id") or t.get("client_order_id") or t.get("id") or ""
+    close_ts = terminal_close.get("close_ts") or t.get("close_ts") or t.get("close_time") or 0
+    return f"identity_ts:{identity}:{round(_safe_float_value(close_ts, 0.0), 3)}"
+
+
+def _bounded_key_rows(rows, now_ts=None):
+    now_ts = _safe_float_value(now_ts, time.time())
+    clean = []
+    seen = set()
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict):
+            key = str(row.get("key") or "")
+            ts = _safe_float_value(row.get("ts"), now_ts)
+        else:
+            key = str(row or "")
+            ts = now_ts
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        clean.append({"key": key, "ts": ts})
+    return clean[-_STARTUP_IDEMPOTENCY_MAX_KEYS:]
+
+
+def _key_in_rows(rows, key):
+    return any(isinstance(row, dict) and row.get("key") == key for row in rows)
+
+
+def _account_state_path_for_ctx(ctx):
+    if getattr(ctx, "account_state_file", None):
+        return ctx.account_state_file
+    mode = getattr(ctx, "execution_mode", None)
+    if mode == "live":
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_account_state.json")
+    if mode == "testnet":
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "testnet_account_state.json")
+    return None
+
+
+def _load_json_dict_safe(path, default=None):
+    default = default if isinstance(default, dict) else {}
+    if not path or not os.path.exists(path):
+        return dict(default)
+    try:
+        if os.path.getsize(path) > 1024 * 1024:
+            return dict(default)
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else dict(default)
+    except Exception:
+        return dict(default)
+
+
+def _apply_startup_ledger_once(ctx, t, terminal_key, pnl, rr_for_math):
+    path = _account_state_path_for_ctx(ctx)
+    if not path:
+        if t.get("balance_updated"):
+            return "already_applied_trade_flag"
+        ctx.account_balance += pnl
+        ctx.equity_peak = max(ctx.equity_peak, ctx.account_balance)
+        ctx.session_pnl_r += rr_for_math
+        t["balance_updated"] = True
+        if hasattr(ctx, "save_account_state"):
+            ctx.save_account_state()
+        return "applied_no_account_state_file"
+
+    from state_manager import atomic_save_json
+    state = _load_json_dict_safe(path, {
+        "account_balance": ctx.account_balance,
+        "equity_peak": getattr(ctx, "equity_peak", ctx.account_balance),
+        "pause_until": getattr(ctx, "pause_until", 0),
+    })
+    keys = _bounded_key_rows(state.get("applied_terminal_keys"))
+    if _key_in_rows(keys, terminal_key):
+        ctx.account_balance = _safe_float_value(state.get("account_balance"), ctx.account_balance)
+        ctx.equity_peak = _safe_float_value(state.get("equity_peak"), getattr(ctx, "equity_peak", ctx.account_balance))
+        t["balance_updated"] = True
+        return "already_applied"
+    balance = _safe_float_value(state.get("account_balance"), ctx.account_balance) + pnl
+    state["account_balance"] = balance
+    state["equity_peak"] = max(_safe_float_value(state.get("equity_peak"), balance), balance)
+    state["pause_until"] = state.get("pause_until", getattr(ctx, "pause_until", 0))
+    keys.append({"key": terminal_key, "ts": time.time()})
+    state["applied_terminal_keys"] = _bounded_key_rows(keys)
+    atomic_save_json(state, path)
+    ctx.account_balance = state["account_balance"]
+    ctx.equity_peak = state["equity_peak"]
+    ctx.session_pnl_r += rr_for_math
+    t["balance_updated"] = True
+    return "applied"
+
+
+def _stats_state_path_for_ctx(ctx):
+    if getattr(ctx, "stats_state_file", None):
+        return ctx.stats_state_file
+    state_file = getattr(ctx, "state_file", None)
+    if state_file:
+        return os.path.splitext(state_file)[0] + "_stats_state.json"
+    return None
+
+
+def _apply_startup_stats_once(ctx, t, terminal_key):
+    path = _stats_state_path_for_ctx(ctx)
+    if not path:
+        if t.get("stat_counted"):
+            return "already_applied_trade_flag"
+        status = t.get("status")
+        if status == "WIN":
+            stats["win"] += 1
+            ctx.stats["win"] = ctx.stats.get("win", 0) + 1
+        elif status == "LOSE":
+            stats["loss"] += 1
+            ctx.stats["loss"] = ctx.stats.get("loss", 0) + 1
+        elif status == "BE":
+            ctx.stats["be"] = ctx.stats.get("be", 0) + 1
+        t["stat_counted"] = True
+        return "applied_no_stats_state_file"
+
+    from state_manager import atomic_save_json
+    state = _load_json_dict_safe(path, {"stats": dict(getattr(ctx, "stats", {}) or {}), "applied_terminal_keys": []})
+    counters = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    keys = _bounded_key_rows(state.get("applied_terminal_keys"))
+    if _key_in_rows(keys, terminal_key):
+        ctx.stats.update(counters)
+        t["stat_counted"] = True
+        return "already_applied"
+    status = t.get("status")
+    if status == "WIN":
+        counters["win"] = counters.get("win", 0) + 1
+        stats["win"] += 1
+    elif status == "LOSE":
+        counters["loss"] = counters.get("loss", 0) + 1
+        stats["loss"] += 1
+    elif status == "BE":
+        counters["be"] = counters.get("be", 0) + 1
+    keys.append({"key": terminal_key, "ts": time.time()})
+    state["stats"] = counters
+    state["applied_terminal_keys"] = _bounded_key_rows(keys)
+    atomic_save_json(state, path)
+    ctx.stats.update(counters)
+    t["stat_counted"] = True
+    return "applied"
+
+
+def _csv_tail_has_terminal_key(csv_path, terminal_key, max_rows=_STARTUP_CSV_TAIL_ROWS):
+    if not csv_path or not os.path.exists(csv_path):
+        return False, "missing_csv"
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+            rows = fh.readlines()
+        if not rows:
+            return False, "empty_csv"
+        header = next(csv.reader([rows[0]]), [])
+        if "terminal_key" not in header:
+            return False, "terminal_key_column_missing"
+        sample = rows[-max_rows:]
+        reader = csv.DictReader(sample, fieldnames=header)
+        for row in reader:
+            if row.get("terminal_key") == terminal_key:
+                return True, "tail_match"
+        return False, "tail_miss"
+    except Exception as exc:
+        return False, f"tail_error:{type(exc).__name__}"
+
+
+def _save_startup_trade_csv_once(t, ctx, terminal_key, prepared_size=None):
+    t["terminal_key"] = terminal_key
+    found, reason = _csv_tail_has_terminal_key(ctx.trades_csv, terminal_key)
+    if found:
+        t["sl_audit_trade_saved"] = True
+        return "already_appended_tail"
+    current_size = os.path.getsize(ctx.trades_csv) if os.path.exists(ctx.trades_csv) else 0
+    if prepared_size is not None and current_size > _safe_float_value(prepared_size, -1):
+        raise RuntimeError(f"csv_tail_miss_after_prepared:{reason}")
+    save_trade(t, ctx.trades_csv)
+    found_after, reason_after = _csv_tail_has_terminal_key(ctx.trades_csv, terminal_key)
+    if not found_after:
+        raise RuntimeError(f"csv_terminal_key_not_verifiable:{reason_after}")
+    t["sl_audit_trade_saved"] = True
+    return "appended"
+
+
 def _safe_numeric_value(value):
     try:
         if value is None:
@@ -4356,7 +4551,14 @@ def _warn_missing_tp_reconstructed_orphan(t: dict):
     t["_missing_tp_reconstructed_orphan_warned"] = True
 
 
-def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchange_sl") -> bool:
+def _finalize_audit_exchange_sl_close(
+    t: dict,
+    ctx,
+    source: str = "audit_exchange_sl",
+    terminal_close: dict = None,
+    exit_type: str = None,
+    close_reason: str = None,
+) -> bool:
     """
     Finalize a bot-owned trade when the exchange confirms its position is already
     closed and the missing SL algo was consumed by a normal stop fill.
@@ -4373,10 +4575,43 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
         save_open_trades(ctx.trades, ctx.state_file)
         return True
 
-    now = time.time()
+    terminal_close = terminal_close if isinstance(terminal_close, dict) else {}
+    now = _safe_float_value(terminal_close.get("close_ts"), time.time())
     entry_real = _safe_float_value(t.get("entry_real") or t.get("entry"), 0.0)
+    if terminal_close.get("entry"):
+        entry_real = _safe_float_value(terminal_close.get("entry"), entry_real)
+        t["entry_real"] = entry_real
+        t["exchange_fill_price"] = entry_real
     sl_init = _safe_float_value(t.get("sl_init"), _safe_float_value(t.get("sl"), 0.0))
+    tx_path = terminal_close.get("transaction_path")
+    tx_key = terminal_close.get("terminal_key")
+    terminal_key = _startup_terminal_key_from_trade(t, terminal_close)
+    t["terminal_key"] = terminal_key
+    tx_steps = terminal_close.get("transaction_steps") if isinstance(terminal_close.get("transaction_steps"), dict) else {}
+    tx_meta = terminal_close.get("transaction_meta") if isinstance(terminal_close.get("transaction_meta"), dict) else {}
+
+    def _tx_done(step: str) -> bool:
+        return bool(tx_path and tx_key and tx_steps.get(step) is True)
+
+    def _mark_tx_step(step: str, **fields) -> None:
+        if not tx_path or not tx_key:
+            return
+        try:
+            from startup_close_backfill import mark_transaction_step
+            tx = mark_transaction_step(tx_path, tx_key, step, **fields)
+            if isinstance(tx, dict):
+                tx_steps.update(tx.get("steps") or {})
+                tx_meta.update(tx)
+        except Exception as _tx_exc:
+            print(
+                f"[SL AUDIT WARNING] {symbol} transaction step mark failed "
+                f"step={step} error={type(_tx_exc).__name__}"
+            )
+            raise
     exchange_fill_price = _safe_float_value(
+        terminal_close.get("exit_price")
+        or terminal_close.get("exit")
+        or
         t.get("exchange_exit_price") or t.get("exchange_close_price"),
         0.0,
     )
@@ -4404,12 +4639,26 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
             f"source={source}"
         )
 
-    t["exit_type"] = "SL"
-    t["close_reason"] = "exchange_sl_filled"
+    t["exit_type"] = exit_type or "SL"
+    t["close_reason"] = close_reason or "exchange_sl_filled"
     t["close_time"] = now
     t["close_ts"] = now
     t["closed_at_unix"] = now
     t["exit_price"] = exit_price
+    if terminal_close.get("close_order_id"):
+        t["exchange_close_order_id"] = terminal_close.get("close_order_id")
+    if terminal_close.get("entry_order_id"):
+        t["exchange_entry_order_id"] = terminal_close.get("entry_order_id")
+    if terminal_close.get("realized_pnl") is not None:
+        t["realized_pnl"] = terminal_close.get("realized_pnl")
+    if terminal_close.get("fees") is not None:
+        t["fees"] = terminal_close.get("fees")
+    if terminal_close.get("rr_source"):
+        t["rr_source"] = terminal_close.get("rr_source")
+    if terminal_close.get("initial_risk_source"):
+        t["initial_risk_source"] = terminal_close.get("initial_risk_source")
+    if terminal_close.get("classification"):
+        t["terminal_source"] = terminal_close.get("classification")
     t["exit_price_source"] = exit_price_source
     t["entry_unconfirmed"] = bool(t.get("entry_price_unconfirmed"))
     t["exit_unconfirmed"] = exit_price_source != "exchange_fill"
@@ -4417,25 +4666,43 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
     t["sl_audit_closed"] = True
     t["sl_audit_close_source"] = source
 
-    risk_init = abs(entry_real - sl_init)
-    if entry_real > 0 and risk_init > 0:
+    risk_init = _safe_float_value(terminal_close.get("initial_risk"), abs(entry_real - sl_init))
+    usd_only_rr_unavailable = (
+        terminal_close.get("rr_source") == "UNAVAILABLE"
+        and terminal_close.get("rr_real") is None
+        and terminal_close.get("realized_pnl") is not None
+    )
+    if terminal_close.get("rr_real") is not None:
+        t["rr_real"] = round(max(min(_safe_float_value(terminal_close.get("rr_real"), 0.0), 10), -10), 2)
+    elif entry_real > 0 and risk_init > 0:
         if t.get("side") == "SHORT":
             rr_real = (entry_real - exit_price) / risk_init
         else:
             rr_real = (exit_price - entry_real) / risk_init
         t["rr_real"] = round(max(min(rr_real, 10), -10), 2)
+    elif usd_only_rr_unavailable:
+        t["rr_real"] = None
     else:
         t["rr_real"] = 0
 
-    if abs(t["rr_real"]) < 0.1:
-        t["status"] = "BE"
-        t["rr_real"] = 0
-    elif t["rr_real"] > 0:
-        t["status"] = "WIN"
+    if t.get("rr_real") is None:
+        realized_pnl_status = _safe_float_value(terminal_close.get("realized_pnl"), 0.0)
+        if abs(realized_pnl_status) < 1e-12:
+            t["status"] = "BE"
+        elif realized_pnl_status > 0:
+            t["status"] = "WIN"
+        else:
+            t["status"] = "LOSE"
     else:
-        t["status"] = "LOSE"
+        if abs(t["rr_real"]) < 0.1:
+            t["status"] = "BE"
+            t["rr_real"] = 0
+        elif t["rr_real"] > 0:
+            t["status"] = "WIN"
+        else:
+            t["status"] = "LOSE"
 
-    if t.get("canary_enabled_at_open") is True:
+    if t.get("canary_enabled_at_open") is True and not _tx_done("canary_done"):
         try:
             _canary_close_result = canary_record_close(t)
             if not (
@@ -4450,10 +4717,14 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
             _canary_reason = f"canary_audit_close_exception:{type(_canary_close_exc).__name__}"
             print(f"[LIVE CANARY] audit close accounting failed {symbol} reason={_canary_reason}")
             canary_latch(_canary_reason)
+        _mark_tx_step("canary_done")
+    elif t.get("canary_enabled_at_open") is not True:
+        _mark_tx_step("canary_done")
 
     open_ts = _safe_float_value(t.get("time"), 0.0)
     t["trade_age_minutes"] = round((now - open_ts) / 60, 1) if open_ts > 0 and now > open_ts else 0
-    t["giveback_r"] = round(max(0.0, t.get("max_profit_r", 0) - t.get("rr_real", 0)), 2)
+    rr_for_math = _safe_float_value(t.get("rr_real"), 0.0)
+    t["giveback_r"] = round(max(0.0, t.get("max_profit_r", 0) - rr_for_math), 2)
     t["trailing_phase_at_exit"] = t.get("trail_phase", 0)
     if t.get("_above_1r_since"):
         t["time_spent_above_1r"] = round(
@@ -4466,17 +4737,42 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
         ctx.cooldown[symbol] = now
         t["cooldown_set"] = True
 
-    if not t.get("balance_updated"):
+    if source == "startup_authoritative_close_backfill":
         bal_at_entry = _safe_float_value(t.get("balance_at_entry"), ctx.account_balance)
-        pnl = bal_at_entry * t.get("risk_percent", RISK_PER_TRADE) * t["rr_real"]
+        if terminal_close.get("realized_pnl") is not None:
+            pnl = _safe_float_value(terminal_close.get("realized_pnl"), 0.0)
+            t["balance_update_source"] = "authoritative_realized_pnl"
+        else:
+            pnl = bal_at_entry * t.get("risk_percent", RISK_PER_TRADE) * rr_for_math
+            t["balance_update_source"] = "risk_r_multiple"
+        ledger_result = _apply_startup_ledger_once(ctx, t, terminal_key, pnl, rr_for_math)
+        _mark_tx_step("ledger_done", ledger_pnl=pnl, ledger_result=ledger_result, balance_update_source=t.get("balance_update_source"))
+    elif _tx_done("ledger_done"):
+        t["balance_updated"] = True
+    elif not t.get("balance_updated"):
+        bal_at_entry = _safe_float_value(t.get("balance_at_entry"), ctx.account_balance)
+        if terminal_close.get("realized_pnl") is not None:
+            pnl = _safe_float_value(terminal_close.get("realized_pnl"), 0.0)
+            t["balance_update_source"] = "authoritative_realized_pnl"
+        else:
+            pnl = bal_at_entry * t.get("risk_percent", RISK_PER_TRADE) * rr_for_math
+            t["balance_update_source"] = "risk_r_multiple"
         ctx.account_balance += pnl
         ctx.equity_peak = max(ctx.equity_peak, ctx.account_balance)
-        ctx.session_pnl_r += t["rr_real"]
+        ctx.session_pnl_r += rr_for_math
         t["balance_updated"] = True
         if hasattr(ctx, "save_account_state"):
             ctx.save_account_state()
+        _mark_tx_step("ledger_done", ledger_pnl=pnl, balance_update_source=t.get("balance_update_source"))
+    else:
+        _mark_tx_step("ledger_done", balance_update_source=t.get("balance_update_source", "already_updated"))
 
-    if not t.get("stat_counted"):
+    if source == "startup_authoritative_close_backfill":
+        stats_result = _apply_startup_stats_once(ctx, t, terminal_key)
+        _mark_tx_step("stats_done", close_status=t.get("status"), stats_result=stats_result)
+    elif _tx_done("stats_done"):
+        t["stat_counted"] = True
+    elif not t.get("stat_counted"):
         if t["status"] == "WIN":
             stats["win"] += 1
             ctx.stats["win"] = ctx.stats.get("win", 0) + 1
@@ -4486,26 +4782,49 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
         elif t["status"] == "BE":
             ctx.stats["be"] = ctx.stats.get("be", 0) + 1
         t["stat_counted"] = True
+        _mark_tx_step("stats_done", close_status=t.get("status"))
+    else:
+        _mark_tx_step("stats_done", close_status=t.get("status"))
 
-    _finalize_giveback_shadow_safe(
-        t,
-        getattr(ctx, "execution_mode", None),
-        close_ts=t.get("close_ts") or t.get("close_time"),
-        source=source,
-    )
+    if not _tx_done("giveback_done"):
+        _finalize_giveback_shadow_safe(
+            t,
+            getattr(ctx, "execution_mode", None),
+            close_ts=t.get("close_ts") or t.get("close_time"),
+            source=source,
+        )
+        _mark_tx_step("giveback_done")
 
     t["exchange_sl_id"] = None
     t["exchange_sl_sync_pending"] = None
     t["exchange_sl_price_confirmed"] = None
     t["orphan_stop_ids"] = []
 
-    if not t.get("sl_audit_trade_saved"):
+    if source == "startup_authoritative_close_backfill":
+        if not _tx_done("csv_prepared"):
+            csv_prepared_size = os.path.getsize(ctx.trades_csv) if os.path.exists(ctx.trades_csv) else 0
+            _mark_tx_step("csv_prepared", csv_prepared_size=csv_prepared_size)
+        csv_result = _save_startup_trade_csv_once(t, ctx, terminal_key, prepared_size=tx_meta.get("csv_prepared_size"))
+        if csv_result == "appended":
+            save_tier_log(t)
+            if t.get("rr_real") is not None:
+                log_false_positive(t)
+            log_wyckoff_outcome(t)
+            history.append(t)
+        _mark_tx_step("csv_done", csv_result=csv_result)
+    elif _tx_done("csv_done"):
+        t["sl_audit_trade_saved"] = True
+    elif not t.get("sl_audit_trade_saved"):
         save_trade(t, ctx.trades_csv)
         save_tier_log(t)
-        log_false_positive(t)
+        if t.get("rr_real") is not None:
+            log_false_positive(t)
         log_wyckoff_outcome(t)
         history.append(t)
         t["sl_audit_trade_saved"] = True
+        _mark_tx_step("csv_done")
+    else:
+        _mark_tx_step("csv_done")
 
     if not t.get("sl_audit_close_alert_sent"):
         _audit_fee_slip = _close_fee_slippage_note(t, getattr(ctx, "execution_mode", None))
@@ -4525,6 +4844,7 @@ def _finalize_audit_exchange_sl_close(t: dict, ctx, source: str = "audit_exchang
 
     t["sl_audit_finalized"] = True
     save_open_trades(ctx.trades, ctx.state_file)
+    _mark_tx_step("local_state_done")
     print(
         f"[SL AUDIT] {symbol} finalized exchange SL close "
         f"exit={round(exit_price, 6)} rr={t.get('rr_real', 0)} "
@@ -6567,6 +6887,35 @@ def reconcile_exchange_positions(ctx):
         print(f"[RECON] {sym} Local position found Exchange position absent - quarantining")
         for t in ctx.trades:
             if t.get("symbol") == sym and t.get("status") == "OPEN":
+                if ctx.execution_mode == "live":
+                    try:
+                        from startup_close_backfill import startup_close_backfill_once
+
+                        _backfill_result = startup_close_backfill_once(
+                            t,
+                            ctx,
+                            _tn,
+                            _finalize_audit_exchange_sl_close,
+                            startup_ts=time.time(),
+                        )
+                        _backfill_status = _backfill_result.get("status")
+                        if _backfill_status in ("FINALIZED", "ALREADY_FINALIZED"):
+                            print(
+                                f"[RECON] {sym} startup authoritative close backfill "
+                                f"{_backfill_status}; quarantine skipped"
+                            )
+                            _state_dirty = True
+                            continue
+                        print(
+                            f"[RECON] {sym} startup authoritative close backfill "
+                            f"not finalized status={_backfill_status} "
+                            f"reason={_backfill_result.get('reason', '')}; preserving quarantine path"
+                        )
+                    except Exception as _backfill_exc:
+                        print(
+                            f"[RECON] {sym} startup authoritative close backfill ERROR "
+                            f"{type(_backfill_exc).__name__}; preserving quarantine path"
+                        )
                 _newly = _quarantine_trade(t, "orphan_local_trade")
                 if _newly:
                     _alert_local_only.append(sym)

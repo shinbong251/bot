@@ -1843,6 +1843,82 @@ def get_recent_orders(symbol: str, limit: int = 50) -> list | None:
     return data
 
 
+def get_user_trades(
+    symbol: str,
+    start_time: int,
+    end_time: int,
+    limit: int = 100,
+) -> dict:
+    """
+    Return a bounded, symbol-scoped /fapi/v1/userTrades window.
+
+    Read-only startup backfill helper. It never paginates beyond the explicit
+    bounded limit and reports incomplete evidence as a structured result.
+    """
+    sym = (symbol or "").upper()
+    try:
+        bounded_limit = max(1, min(int(limit), 100))
+        params = {
+            "symbol": sym,
+            "startTime": int(start_time),
+            "endTime": int(end_time),
+            "limit": bounded_limit,
+        }
+    except (TypeError, ValueError):
+        return {"ok": False, "data": [], "error": "invalid_window_or_limit"}
+
+    print(
+        f"[LIVE QUERY] userTrades {sym} "
+        f"startTime={params['startTime']} endTime={params['endTime']} limit={bounded_limit}"
+    )
+    data = _get_signed("/fapi/v1/userTrades", params)
+    if data is None:
+        return {"ok": False, "data": [], "error": "no_response"}
+    if not isinstance(data, list):
+        return {"ok": False, "data": [], "error": f"unexpected_type:{type(data).__name__}"}
+    return {"ok": True, "data": data, "error": ""}
+
+
+def get_income_history(
+    symbol: str,
+    income_type: str = "REALIZED_PNL",
+    start_time: int = None,
+    end_time: int = None,
+    limit: int = 100,
+) -> dict:
+    """
+    Return a bounded /fapi/v1/income window for one symbol where supported.
+
+    The caller chooses the incomeType and time bounds. No account-wide scan and
+    no pagination is performed from this helper.
+    """
+    sym = (symbol or "").upper()
+    try:
+        bounded_limit = max(1, min(int(limit), 100))
+        params = {
+            "symbol": sym,
+            "incomeType": income_type,
+            "limit": bounded_limit,
+        }
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+    except (TypeError, ValueError):
+        return {"ok": False, "data": [], "error": "invalid_window_or_limit"}
+
+    print(
+        f"[LIVE QUERY] income {sym} type={income_type} "
+        f"startTime={params.get('startTime')} endTime={params.get('endTime')} limit={bounded_limit}"
+    )
+    data = _get_signed("/fapi/v1/income", params)
+    if data is None:
+        return {"ok": False, "data": [], "error": "no_response"}
+    if not isinstance(data, list):
+        return {"ok": False, "data": [], "error": f"unexpected_type:{type(data).__name__}"}
+    return {"ok": True, "data": data, "error": ""}
+
+
 # =====================================================================
 # CANCEL STOP ORDER
 # =====================================================================
